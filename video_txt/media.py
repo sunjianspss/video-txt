@@ -140,10 +140,12 @@ def probe_video_size(video_path: Path, *, ffmpeg_path: str | None = None) -> tup
     return int(match.group(1)), int(match.group(2))
 
 
-def probe_duration(media_path: Path, *, ffmpeg_path: str | None = None) -> float:
-    ffprobe_path = find_ffprobe(ffmpeg_path)
+def probe_duration(
+    media_path: Path, *, ffmpeg_path: str | None = None, ffprobe_path: str | None = None
+) -> float:
+    resolved = ffprobe_path or find_ffprobe(ffmpeg_path)
     output = run_ffprobe(
-        ffprobe_path,
+        resolved,
         [
             "-show_entries",
             "format=duration",

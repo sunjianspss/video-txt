@@ -607,7 +607,7 @@ def build_parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser(
         "run", help="One command: video -> transcript -> translation -> subtitled video."
     )
-    run.add_argument("video", type=Path, help="Path to the source video or audio file.")
+    run.add_argument("video", type=Path, help="Path to the source video file.")
     run.add_argument(
         "--subtitle",
         type=Path,

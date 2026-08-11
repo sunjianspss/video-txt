@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 from pathlib import Path
 
 DEFAULT_SECRETS_FILE = Path("~/.secrets")
@@ -33,6 +34,15 @@ def load_secrets_file(path: Path | None = None, *, override: bool = False) -> li
     secrets_path = (path or DEFAULT_SECRETS_FILE).expanduser()
     if not secrets_path.is_file():
         return []
+
+    if os.name == "posix":
+        mode = secrets_path.stat().st_mode & 0o777
+        if mode & 0o077:
+            print(
+                f"Warning: {secrets_path} is readable by other users (mode {mode:03o}). "
+                f"Tighten it with: chmod 600 {secrets_path}",
+                file=sys.stderr,
+            )
 
     loaded: list[str] = []
     for name, value in parse_secrets_text(secrets_path.read_text(encoding="utf-8")).items():

@@ -538,8 +538,14 @@ def translate_cues(
                 pool.submit(run_batch, batch_number, batch)
                 for batch_number, batch in enumerate(grouped, start=1)
             ]
-            for future in futures:
-                future.result()
+            try:
+                for future in futures:
+                    future.result()
+            except BaseException:
+                # Stop burning API quota on batches that have not started yet.
+                for queued in futures:
+                    queued.cancel()
+                raise
 
     return _apply_translations(cues, translations)
 

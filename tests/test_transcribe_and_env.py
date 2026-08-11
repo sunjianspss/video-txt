@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -107,6 +108,30 @@ def test_load_secrets_file_fills_only_missing_variables(tmp_path, monkeypatch):
 
 def test_load_secrets_file_tolerates_a_missing_file(tmp_path):
     assert load_secrets_file(tmp_path / "nope") == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
+def test_load_secrets_file_warns_about_group_readable_permissions(tmp_path, monkeypatch, capsys):
+    secrets = tmp_path / "secrets"
+    secrets.write_text("export PERM_TEST_KEY=v\n", encoding="utf-8")
+    secrets.chmod(0o644)
+    monkeypatch.setenv("PERM_TEST_KEY", "already-set")
+
+    load_secrets_file(secrets)
+    err = capsys.readouterr().err
+    assert "mode 644" in err
+    assert f"chmod 600 {secrets}" in err
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
+def test_load_secrets_file_stays_quiet_for_owner_only_permissions(tmp_path, monkeypatch, capsys):
+    secrets = tmp_path / "secrets"
+    secrets.write_text("export PERM_TEST_KEY=v\n", encoding="utf-8")
+    secrets.chmod(0o600)
+    monkeypatch.setenv("PERM_TEST_KEY", "already-set")
+
+    load_secrets_file(secrets)
+    assert capsys.readouterr().err == ""
 
 
 def test_resolve_api_key_explains_how_to_set_it(tmp_path, monkeypatch):

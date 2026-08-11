@@ -4,6 +4,7 @@ import hashlib
 import shutil
 import subprocess
 import sys
+import threading
 import wave
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -147,6 +148,7 @@ def synthesize_segments(
 
     print(f"Synthesizing {len(pending)} voice clips with {options.engine} ({options.voice})...")
     done = 0
+    progress_lock = threading.Lock()
 
     def synthesize(job: tuple[str, Path]) -> None:
         nonlocal done
@@ -159,9 +161,11 @@ def synthesize_segments(
             detail = (completed.stderr or completed.stdout or "").strip()
             raise DubError(f"Text-to-speech failed for {text[:40]!r}: {detail}")
         temp_path.replace(path)
-        done += 1
-        if done % 10 == 0 or done == len(pending):
-            print(f"  {done}/{len(pending)} clips done")
+        with progress_lock:
+            done += 1
+            current = done
+        if current % 10 == 0 or current == len(pending):
+            print(f"  {current}/{len(pending)} clips done")
 
     workers = max(1, min(options.concurrency, len(pending)))
     if workers == 1:
@@ -169,15 +173,21 @@ def synthesize_segments(
             synthesize(job)
     else:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            for future in [pool.submit(synthesize, job) for job in pending]:
-                future.result()
+            futures = [pool.submit(synthesize, job) for job in pending]
+            try:
+                for future in futures:
+                    future.result()
+            except BaseException:
+                for queued in futures:
+                    queued.cancel()
+                raise
     return paths
 
 
 def decode_segment(
     segment: Segment, *, ffmpeg_path: str, ffprobe_path: str, options: DubOptions
 ) -> tuple[bytes, float]:
-    natural = probe_media_duration(segment.audio_path, ffprobe_path=ffprobe_path)
+    natural = probe_duration(segment.audio_path, ffprobe_path=ffprobe_path)
     tempo = 1.0
     if segment.slot > 0 and natural > segment.slot:
         tempo = min(natural / segment.slot, max(1.0, options.max_atempo))
@@ -204,23 +214,6 @@ def decode_segment(
     return completed.stdout, tempo
 
 
-def probe_media_duration(path: Path, *, ffprobe_path: str) -> float:
-    output = run_ffprobe(
-        ffprobe_path,
-        [
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(path),
-        ],
-    )
-    try:
-        return float(output.splitlines()[0])
-    except (ValueError, IndexError) as exc:
-        raise DubError(f"Could not read the duration of {path.name}: {output!r}") from exc
-
-
 def build_segments(cues: list[tuple[int, SubtitleCue]], paths: list[Path]) -> list[Segment]:
     segments: list[Segment] = []
     for index, ((_, cue), path) in enumerate(zip(cues, paths, strict=True)):
@@ -234,6 +227,16 @@ def build_segments(cues: list[tuple[int, SubtitleCue]], paths: list[Path]) -> li
     return segments
 
 
+SILENCE_CHUNK_FRAMES = 48_000
+
+
+def write_silence(handle: wave.Wave_write, frames: int) -> None:
+    while frames > 0:
+        chunk = min(frames, SILENCE_CHUNK_FRAMES)
+        handle.writeframes(bytes(chunk * SAMPLE_WIDTH))
+        frames -= chunk
+
+
 def render_audio_track(
     segments: list[Segment],
     options: DubOptions,
@@ -242,40 +245,40 @@ def render_audio_track(
     total_duration: float,
     output_path: Path,
 ) -> list[PlacedSegment]:
+    # Segments are sorted and clips never overlap (later ones get pushed back),
+    # so the track can be streamed to disk instead of assembled in memory.
     ffprobe_path = find_ffprobe(ffmpeg_path)
-    frame_size = SAMPLE_WIDTH
-    total_frames = int(total_duration * options.sample_rate) + options.sample_rate
-    track = bytearray(total_frames * frame_size)
     placed: list[PlacedSegment] = []
-    cursor = 0.0
-
-    for segment in segments:
-        pcm, tempo = decode_segment(
-            segment, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, options=options
-        )
-        duration = len(pcm) / frame_size / options.sample_rate
-        start = max(segment.start, cursor)
-        offset = int(start * options.sample_rate) * frame_size
-        end_offset = offset + len(pcm)
-        if end_offset > len(track):
-            track.extend(bytearray(end_offset - len(track)))
-        track[offset:end_offset] = pcm
-        cursor = start + duration
-        placed.append(
-            PlacedSegment(
-                start=start,
-                duration=duration,
-                tempo=tempo,
-                overflow=max(0.0, duration - segment.slot),
-            )
-        )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with wave.open(str(output_path), "wb") as handle:
         handle.setnchannels(1)
         handle.setsampwidth(SAMPLE_WIDTH)
         handle.setframerate(options.sample_rate)
-        handle.writeframes(bytes(track))
+
+        written_frames = 0
+        for segment in segments:
+            pcm, tempo = decode_segment(
+                segment, ffmpeg_path=ffmpeg_path, ffprobe_path=ffprobe_path, options=options
+            )
+            frames = len(pcm) // SAMPLE_WIDTH
+            duration = frames / options.sample_rate
+            start_seconds = max(segment.start, written_frames / options.sample_rate)
+            start_frame = max(int(start_seconds * options.sample_rate), written_frames)
+            write_silence(handle, start_frame - written_frames)
+            handle.writeframes(pcm)
+            written_frames = start_frame + frames
+            placed.append(
+                PlacedSegment(
+                    start=start_frame / options.sample_rate,
+                    duration=duration,
+                    tempo=tempo,
+                    overflow=max(0.0, duration - segment.slot),
+                )
+            )
+
+        total_frames = int(total_duration * options.sample_rate) + options.sample_rate
+        write_silence(handle, total_frames - written_frames)
     return placed
 
 

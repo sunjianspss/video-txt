@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import wave
 from pathlib import Path
 
+from video_txt import dub as dub_module
 from video_txt.dub import (
     DubOptions,
+    Segment,
     build_dub_mux_command,
     build_segments,
     build_tts_command,
     default_video_output,
+    render_audio_track,
     segment_filename,
 )
-from video_txt.subtitles import parse_srt_text
+from video_txt.subtitles import SubtitleCue, parse_srt_text
 
 TIMED = (
     "1\n00:00:01,000 --> 00:00:03,000\nfirst\n\n"
@@ -75,6 +79,52 @@ def test_segment_filename_is_stable_and_text_sensitive():
     assert first.startswith("cue-00007-")
     assert first.endswith(".mp3")
     assert segment_filename("say", 1, "x", "v", "+0%").endswith(".aiff")
+
+
+def test_render_audio_track_streams_gaps_clips_overlaps_and_tail_padding(tmp_path, monkeypatch):
+    clip_a = b"\x11\x11" * 50  # 0.5 s at 100 Hz
+    clip_b = b"\x22\x22" * 30  # 0.3 s at 100 Hz
+    clips = {Path("/cache/a.mp3"): (clip_a, 1.0), Path("/cache/b.mp3"): (clip_b, 1.2)}
+    monkeypatch.setattr(dub_module, "find_ffprobe", lambda *_args, **_kwargs: "ffprobe")
+    monkeypatch.setattr(
+        dub_module, "decode_segment", lambda segment, **_kwargs: clips[segment.audio_path]
+    )
+
+    segments = [
+        Segment(
+            cue=SubtitleCue("1", "00:00:01,000 --> 00:00:02,000", ["一"]),
+            audio_path=Path("/cache/a.mp3"),
+            start=1.0,
+            slot=1.0,
+        ),
+        # Starts at 1.2 s, but the first clip plays until 1.5 s, so it gets pushed.
+        Segment(
+            cue=SubtitleCue("2", "00:00:01,200 --> 00:00:02,000", ["二"]),
+            audio_path=Path("/cache/b.mp3"),
+            start=1.2,
+            slot=0.8,
+        ),
+    ]
+    output = tmp_path / "track.wav"
+    placed = render_audio_track(
+        segments,
+        make_options(sample_rate=100),
+        ffmpeg_path="ffmpeg",
+        total_duration=3.0,
+        output_path=output,
+    )
+
+    with wave.open(str(output)) as handle:
+        assert handle.getframerate() == 100
+        assert handle.getnframes() == 400  # video length + 1 s of padding
+        data = handle.readframes(400)
+    assert data[:200] == bytes(200)  # silence until 1.0 s
+    assert data[200:300] == clip_a
+    assert data[300:360] == clip_b  # pushed from 1.2 s to 1.5 s
+    assert data[360:] == bytes(len(data) - 360)
+    assert [item.start for item in placed] == [1.0, 1.5]
+    assert placed[0].tempo == 1.0
+    assert placed[1].tempo == 1.2
 
 
 def test_dub_mux_command_replaces_the_audio_track_by_default():
