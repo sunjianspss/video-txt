@@ -57,7 +57,7 @@ from .timeline import (
     split_into_sentences,
     spoken_duration,
 )
-from .translate import default_debug_dir
+from .translate import cleanup_debug_dir, default_debug_dir
 from .voices import (
     DEFAULT_VOICE,
     VoiceChoice,
@@ -447,13 +447,20 @@ def fit_subtitle_to_timeline(
     )
 
     print("Fitting the Chinese lines to the timeline...")
+    fit_debug_dir = default_debug_dir(options.subtitle_input)
     outcome = fit_cues_to_slots(
         items,
         measure=measure,
         options=fit,
         cache=ShortenCache(cache_dir / SHORTEN_CACHE_NAME, namespace=namespace),
-        debug_dir=default_debug_dir(options.subtitle_input),
+        debug_dir=fit_debug_dir,
     )
+    removed_snapshots = cleanup_debug_dir(fit_debug_dir)
+    if removed_snapshots:
+        print(
+            f"  Removed {removed_snapshots} debug snapshot(s); "
+            "every rewrite succeeded after retries."
+        )
 
     if not outcome.shortened:
         print(

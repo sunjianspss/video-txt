@@ -154,6 +154,22 @@ def default_debug_dir(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.stem}.debug")
 
 
+def cleanup_debug_dir(debug_dir: Path) -> int:
+    """Drop raw-response snapshots; after a fully successful run they only
+    describe failures the retries already recovered from."""
+    if not debug_dir.is_dir():
+        return 0
+    removed = 0
+    for path in debug_dir.glob("*-raw-response.txt"):
+        path.unlink(missing_ok=True)
+        removed += 1
+    try:
+        debug_dir.rmdir()
+    except OSError:
+        pass  # the directory holds files we did not write; leave it alone
+    return removed
+
+
 def build_partial_meta(cues: list[SubtitleCue], config: TranslationConfig) -> dict[str, object]:
     fingerprint = hashlib.sha1(serialize_srt(cues).encode("utf-8")).hexdigest()
     return {
@@ -603,15 +619,20 @@ def translate_subtitle_file(
         if resume
         else None
     )
+    auto_debug_dir = default_debug_dir(output_path) if debug_dir is None else None
     translated = translate_cues(
         cues,
         config,
-        debug_dir=debug_dir or default_debug_dir(output_path),
+        debug_dir=debug_dir or auto_debug_dir,
         partial_store=store,
     )
     write_srt(output_path, translated)
     if store is not None:
         store.discard()
+    if auto_debug_dir is not None:
+        removed = cleanup_debug_dir(auto_debug_dir)
+        if removed:
+            print(f"Removed {removed} debug snapshot(s); every batch succeeded after retries.")
     print(f"Wrote translated subtitles to: {output_path}")
     return output_path
 

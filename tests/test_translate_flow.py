@@ -108,6 +108,86 @@ def test_a_failed_batch_leaves_the_finished_ones_on_disk(srt, monkeypatch, tmp_p
     assert resumable == {"1": "译文 line 1", "2": "译文 line 2", "3": "译文 line 3"}
 
 
+def test_success_cleans_up_snapshots_from_batches_that_recovered(srt, monkeypatch, tmp_path):
+    inner = FakeApi()
+    served_garbage = threading.Event()
+
+    def flaky(*, config, messages, json_mode):
+        payload = json.loads(messages[1]["content"])
+        ids = [item["id"] for item in payload["items"]]
+        if "2" in ids and not served_garbage.is_set():
+            served_garbage.set()
+            return {"choices": [{"message": {"content": "not json"}}]}
+        return inner(config=config, messages=messages, json_mode=json_mode)
+
+    monkeypatch.setattr(translate_module, "post_chat_completion", flaky)
+    output = tmp_path / "clip.zh.srt"
+
+    translate_subtitle_file(
+        input_path=srt,
+        output_path=output,
+        config=make_config(retries=1, concurrency=1, backoff_base=0.0),
+    )
+
+    assert parse_srt(output)[1].text == "译文 line 2"
+    assert not (tmp_path / "clip.zh.debug").exists()
+
+
+def test_success_also_clears_snapshots_left_by_an_earlier_run(srt, fake_api, tmp_path):
+    debug_dir = tmp_path / "clip.zh.debug"
+    debug_dir.mkdir()
+    stale = debug_dir / "20260101-000000-0-batch-001-attempt-01-cues-1-raw-response.txt"
+    stale.write_text("stale", encoding="utf-8")
+
+    translate_subtitle_file(
+        input_path=srt, output_path=tmp_path / "clip.zh.srt", config=make_config()
+    )
+
+    assert not debug_dir.exists()
+
+
+def test_a_run_that_ultimately_fails_keeps_the_snapshots(srt, monkeypatch, tmp_path):
+    def always_garbage(*, config, messages, json_mode):
+        return {"choices": [{"message": {"content": "not json"}}]}
+
+    monkeypatch.setattr(translate_module, "post_chat_completion", always_garbage)
+    output = tmp_path / "clip.zh.srt"
+
+    with pytest.raises(translate_module.TranslationError):
+        translate_subtitle_file(
+            input_path=srt,
+            output_path=output,
+            config=make_config(concurrency=1, backoff_base=0.0),
+        )
+
+    assert list((tmp_path / "clip.zh.debug").glob("*-raw-response.txt"))
+
+
+def test_an_explicit_debug_dir_is_not_cleaned_up(srt, monkeypatch, tmp_path):
+    inner = FakeApi()
+    served_garbage = threading.Event()
+
+    def flaky(*, config, messages, json_mode):
+        payload = json.loads(messages[1]["content"])
+        ids = [item["id"] for item in payload["items"]]
+        if "2" in ids and not served_garbage.is_set():
+            served_garbage.set()
+            return {"choices": [{"message": {"content": "not json"}}]}
+        return inner(config=config, messages=messages, json_mode=json_mode)
+
+    monkeypatch.setattr(translate_module, "post_chat_completion", flaky)
+    debug_dir = tmp_path / "kept-debug"
+
+    translate_subtitle_file(
+        input_path=srt,
+        output_path=tmp_path / "clip.zh.srt",
+        config=make_config(retries=1, concurrency=1, backoff_base=0.0),
+        debug_dir=debug_dir,
+    )
+
+    assert list(debug_dir.glob("*-raw-response.txt"))
+
+
 def test_later_batches_carry_earlier_lines_as_context(srt, fake_api, tmp_path):
     translate_subtitle_file(
         input_path=srt,
