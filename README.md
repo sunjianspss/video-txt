@@ -256,11 +256,12 @@ uv run video-txt dub "$V" --provider deepseek --diarize --tts-engine f5-tts
 | `--backend mlx-whisper` | Apple Silicon 走 GPU,需先 `uv sync --extra mlx` |
 | `--model medium` | 换模型,默认 turbo |
 
-拿到字幕后会自动体检两项:同一句话连续重复超过一分钟(Whisper 听不到人声时空转的特征),
-以及指定了 `--language ja` 却几乎没有日文字符。`run` 和 `dub` 一旦发现就停在这里,
-不往下花钱和时间;单独跑 `transcribe` 字幕照样写出来,但退出码是 1——用 `&&` 串起来的下一条
-命令不会跑,想看看问题再决定就分两次跑。复用已有 `.srt` 时同样会查。
-确认只是台词本身重复,加 `--skip-transcript-check` 跳过。
+拿到字幕后会自动体检三项:同一句话连续重复超过一分钟(Whisper 听不到人声时空转的特征),
+指定了 `--language ja` 却几乎没有日文字符,以及字幕只覆盖到视频前一半就没了——最后这种
+基本是转写时文件还没下载完(种子按块乱序落盘,文件看着是全尺寸,其实只有开头能解码)。
+`run` 和 `dub` 一旦发现就停在这里,不往下花钱和时间;单独跑 `transcribe` 字幕照样写出来,
+但退出码是 1——用 `&&` 串起来的下一条命令不会跑,想看看问题再决定就分两次跑。
+复用已有 `.srt` 时同样会查。确认没问题,加 `--skip-transcript-check` 跳过。
 
 ### 硬字幕外观
 
@@ -284,7 +285,7 @@ uv run video-txt run "$V" --provider deepseek --mux-mode hard \
 | `--provider deepseek` | 一次性设好接口地址、key 变量名和默认模型 `deepseek-v4-flash` |
 | `--model` / `--base-url` / `--api-key-env` | 换别的服务时逐项覆盖 |
 | `--concurrency 4` | 并发批数,长视频提速明显;被限流就调小 |
-| `--preserve-term MCP` | 保留不译的术语,默认已含 Claude、Claude Code、Anthropic、MCP |
+| `--preserve-term Kubernetes` | 追加保留不译的术语,可传多次;默认已含 Claude、MCP、OpenAI、token 等 AI 术语,长期增删改 `video_txt/constants.py` 的 `DEFAULT_TERMS` |
 | `--note '保持轻松的教程口吻'` | 追加翻译要求 |
 
 ## 凭据约定

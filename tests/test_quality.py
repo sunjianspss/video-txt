@@ -5,9 +5,15 @@ from pathlib import Path
 import pytest
 
 from video_txt import cli as cli_module
+from video_txt import quality as quality_module
 from video_txt.cli import main
 from video_txt.pipeline import TranscribeStage, ensure_source_subtitle
-from video_txt.quality import check_transcript, stuck_runs, transcript_problems
+from video_txt.quality import (
+    check_transcript,
+    coverage_problem,
+    stuck_runs,
+    transcript_problems,
+)
 from video_txt.subtitles import SubtitleCue, parse_srt_text, seconds_to_srt_time
 from video_txt.transcribe import TranscribeError
 
@@ -79,6 +85,71 @@ def test_a_latin_script_language_cannot_be_checked_this_way():
 def test_a_few_english_lines_among_japanese_are_tolerated():
     mixed = [*cues(JAPANESE), *cues([("OK", 46.0, 47.0)])]
     assert transcript_problems(mixed, language="ja") == []
+
+
+def test_a_transcript_that_stops_early_is_called_out():
+    problem = coverage_problem(cues([("Hello", 0.0, 25.0)]), 2900.0)
+    assert problem is not None
+    assert "stops at 0:00:25" in problem
+    assert "0:48:20" in problem
+    assert "fully downloaded" in problem
+
+
+def test_a_transcript_reaching_past_halfway_is_fine():
+    assert coverage_problem(cues([("Bye", 0.0, 1500.0)]), 2900.0) is None
+
+
+def test_short_clips_are_not_judged_on_coverage():
+    assert coverage_problem(cues([("Hi", 0.0, 5.0)]), 200.0) is None
+
+
+def partial_download_transcript(tmp_path: Path) -> Path:
+    path = tmp_path / "clip.srt"
+    path.write_text("1\n00:00:00,000 --> 00:00:25,000\nHello\n", encoding="utf-8")
+    return path
+
+
+def test_check_transcript_flags_a_half_downloaded_file(tmp_path: Path, monkeypatch):
+    subtitle = partial_download_transcript(tmp_path)
+    monkeypatch.setattr(quality_module, "probe_duration", lambda path: 2900.0)
+
+    report = check_transcript(subtitle, language="en", media_path=tmp_path / "clip.mp4")
+
+    assert report is not None
+    assert "fully downloaded" in report
+    assert "--retranscribe --language en" in report
+    # The wrong-language-guess explanation does not apply to a truncated file.
+    assert "guessed" not in report
+
+
+def test_an_unprobeable_media_file_does_not_block_the_transcript(tmp_path: Path):
+    subtitle = partial_download_transcript(tmp_path)
+    assert check_transcript(subtitle, media_path=tmp_path / "missing.mp4") is None
+
+
+def test_transcribing_a_partial_download_reports_a_failure(tmp_path: Path, monkeypatch, capsys):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"")
+    subtitle = partial_download_transcript(tmp_path)
+    monkeypatch.setattr(cli_module, "run_transcribe", lambda options, dry_run=False: subtitle)
+    monkeypatch.setattr(quality_module, "probe_duration", lambda path: 2900.0)
+
+    assert main(["transcribe", str(video), "-f", "srt", "--language", "en"]) == 1
+    assert "fully downloaded" in capsys.readouterr().err
+
+
+def test_the_pipeline_stops_on_a_partial_download(tmp_path: Path, monkeypatch):
+    subtitle = partial_download_transcript(tmp_path)
+    monkeypatch.setattr(quality_module, "probe_duration", lambda path: 2900.0)
+
+    with pytest.raises(TranscribeError) as stop:
+        ensure_source_subtitle(
+            tmp_path / "clip.mp4",
+            subtitle=subtitle,
+            output_dir=tmp_path,
+            stage=TranscribeStage(),
+        )
+    assert "fully downloaded" in str(stop.value)
 
 
 def test_the_report_says_what_to_do_about_it(tmp_path: Path):

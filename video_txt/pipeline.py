@@ -64,7 +64,7 @@ def ensure_source_subtitle(
         prefix=prefix,
     )
     if not dry_run and not stage.skip_transcript_check:
-        report = check_transcript(source, language=stage.language)
+        report = check_transcript(source, language=stage.language, media_path=video)
         if report:
             raise TranscribeError(f"{report}\nStopping before the steps that cost time.")
     return source

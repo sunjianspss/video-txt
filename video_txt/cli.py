@@ -449,7 +449,7 @@ def command_transcribe(args: argparse.Namespace, parser: argparse.ArgumentParser
     if output_path.suffix.lower() != ".srt" or args.skip_transcript_check:
         return 0
 
-    report = check_transcript(output_path, language=args.language)
+    report = check_transcript(output_path, language=args.language, media_path=input_path)
     if not report:
         return 0
     # The transcript is written either way; the exit code is how a script chained

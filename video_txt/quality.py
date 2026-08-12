@@ -5,6 +5,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
+from .media import MediaError, probe_duration
 from .subtitles import SubtitleCue, SubtitleFormatError, language_suffix, parse_srt
 
 # Whisper decodes in ~30 second windows and emits one line per window, so a model that
@@ -13,6 +14,14 @@ from .subtitles import SubtitleCue, SubtitleFormatError, language_suffix, parse_
 MIN_RUN_LENGTH = 4
 MIN_RUN_SPAN = 60.0
 MAX_REPORTED_RUNS = 3
+
+# A transcript that stops far short of the end of the media means Whisper was fed a
+# truncated file -- most often a download that had not finished when it was read.
+# Half is generous: real dialogue thins out towards the credits, but does not vanish
+# for the entire second half. Short clips are exempt; one long musical stretch could
+# legitimately be most of their runtime.
+MIN_COVERAGE_SHARE = 0.5
+MIN_JUDGED_MEDIA_DURATION = 300.0
 
 # Scripts that are obvious on sight. Latin-script languages cannot be told apart this
 # cheaply, so asking for French and getting English goes unnoticed here.
@@ -99,29 +108,72 @@ def transcript_problems(cues: list[SubtitleCue], *, language: str | None = None)
     return problems
 
 
-def describe_problems(path: Path, problems: list[str], *, language: str | None) -> str:
+def coverage_problem(cues: list[SubtitleCue], media_duration: float) -> str | None:
+    if media_duration < MIN_JUDGED_MEDIA_DURATION:
+        return None
+    ends = [cue.end_seconds for cue in cues if not cue.is_empty]
+    if not ends:
+        return None
+    covered = max(ends)
+    if covered >= media_duration * MIN_COVERAGE_SHARE:
+        return None
+    return (
+        f"the transcript stops at {clock(covered)} but the media runs until "
+        f"{clock(media_duration)} -- was the file fully downloaded before transcribing?"
+    )
+
+
+def probe_media_duration(media_path: Path) -> float | None:
+    """Best effort; a quality check must not fail just because ffprobe could not run."""
+    try:
+        return probe_duration(media_path)
+    except (MediaError, OSError):
+        return None
+
+
+def describe_problems(
+    path: Path, problems: list[str], *, language: str | None, whisper_note: bool = True
+) -> str:
     asked = f" --language {language}" if language else " --language <code>"
-    return "\n".join(
-        [
-            f"This transcript looks broken: {path}",
-            *(f"  * {problem}" for problem in problems),
+    if whisper_note:
+        explanation = [
             "Whisper does that when it stops hearing speech, most often because it guessed",
             "the language wrong -- it only listens to the first 30 seconds, so a musical",
             "intro throws it off. Worth trying:",
             f"  --retranscribe{asked} "
             "--whisper-arg=--condition_on_previous_text --whisper-arg=False",
+        ]
+    else:
+        explanation = [
+            "That usually means the media file was cut short: a download that was still",
+            "running, or an interrupted copy. Once the full file is in place, try:",
+            f"  --retranscribe{asked}",
+        ]
+    return "\n".join(
+        [
+            f"This transcript looks broken: {path}",
+            *(f"  * {problem}" for problem in problems),
+            *explanation,
             "Pass --skip-transcript-check to use this transcript as it is.",
         ]
     )
 
 
-def check_transcript(path: Path, *, language: str | None = None) -> str | None:
+def check_transcript(
+    path: Path, *, language: str | None = None, media_path: Path | None = None
+) -> str | None:
     """Report on an SRT that Whisper may have botched. None means it looks fine."""
     try:
         cues = parse_srt(path)
     except (OSError, SubtitleFormatError):
         return None
     problems = transcript_problems(cues, language=language)
+    whisper_note = bool(problems)
+    duration = probe_media_duration(media_path) if media_path is not None else None
+    if duration is not None:
+        gap = coverage_problem(cues, duration)
+        if gap is not None:
+            problems.append(gap)
     if not problems:
         return None
-    return describe_problems(path, problems, language=language)
+    return describe_problems(path, problems, language=language, whisper_note=whisper_note)
