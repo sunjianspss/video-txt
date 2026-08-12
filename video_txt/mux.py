@@ -77,6 +77,28 @@ def resolve_subtitle_codec(video_output: Path, *, explicit: str | None = None) -
     return codec
 
 
+def subtitle_track_arguments(
+    video_output: Path, *, stream: str, language_code: str, codec: str | None = None
+) -> list[str]:
+    """Carry one input in as a subtitle track, labelled so players can name it."""
+    return [
+        "-map",
+        stream,
+        "-c:s",
+        resolve_subtitle_codec(video_output, explicit=codec),
+        "-metadata:s:s:0",
+        f"language={language_code}",
+    ]
+
+
+def container_arguments(video_output: Path) -> list[str]:
+    """Whatever the output container itself asks for, beyond the streams."""
+    if video_output.suffix.lower() in FASTSTART_CONTAINERS:
+        # Without this the player has to read the whole file before it can start.
+        return ["-movflags", "+faststart"]
+    return []
+
+
 def build_subtitles_filter(
     path: Path,
     *,
@@ -133,7 +155,6 @@ def build_mux_command(
     overwrite_flag = "-y" if options.overwrite else "-n"
 
     if options.mux_mode == "soft":
-        codec = resolve_subtitle_codec(options.video_output, explicit=options.subtitle_codec)
         command = [
             ffmpeg_path,
             overwrite_flag,
@@ -145,21 +166,20 @@ def build_mux_command(
             "0:v:0",
             "-map",
             "0:a?",
-            "-map",
-            "1:0",
+            *subtitle_track_arguments(
+                options.video_output,
+                stream="1:0",
+                language_code=options.language_code,
+                codec=options.subtitle_codec,
+            ),
             "-c:v",
             "copy",
             "-c:a",
             "copy",
-            "-c:s",
-            codec,
-            "-metadata:s:s:0",
-            f"language={options.language_code}",
         ]
         if options.default_subtitle:
             command.extend(["-disposition:s:0", "default"])
-        if options.video_output.suffix.lower() in FASTSTART_CONTAINERS:
-            command.extend(["-movflags", "+faststart"])
+        command.extend(container_arguments(options.video_output))
         command.append(str(options.video_output))
         return command
 
@@ -175,14 +195,21 @@ def build_mux_command(
             box_height=options.box_height,
             box_opacity=options.box_opacity,
         ),
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a?",
+        # The words are in the picture now. Left to pick for itself, ffmpeg also
+        # carries over a subtitle track the source already had, and one the
+        # output container cannot hold takes the whole burn down with it.
+        "-sn",
         "-c:v",
         options.video_codec,
     ]
     if options.video_codec in H26X_CODECS:
         command.extend(["-preset", options.preset, "-crf", str(options.crf), "-pix_fmt", "yuv420p"])
     command.extend(["-c:a", "copy"])
-    if options.video_output.suffix.lower() in FASTSTART_CONTAINERS:
-        command.extend(["-movflags", "+faststart"])
+    command.extend(container_arguments(options.video_output))
     command.append(str(options.video_output))
     return command
 

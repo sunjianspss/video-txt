@@ -2,19 +2,76 @@ from __future__ import annotations
 
 import html
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CHINESE_ALIASES = {
-    "simplified chinese",
-    "chinese",
-    "zh",
-    "zh-cn",
-    "zh_cn",
-    "中文",
-    "简体中文",
+# What a target language is called on disk, and how it is labelled inside a
+# container: a filename suffix plus the ISO 639-2/B code players read.
+LANGUAGES: dict[str, tuple[str, str]] = {
+    "zh": ("zh", "zho"),
+    "zh-cn": ("zh", "zho"),
+    "zh_cn": ("zh", "zho"),
+    "chinese": ("zh", "zho"),
+    "simplified chinese": ("zh", "zho"),
+    "中文": ("zh", "zho"),
+    "简体中文": ("zh", "zho"),
+    "zh-tw": ("zh-hant", "zho"),
+    "zh-hk": ("zh-hant", "zho"),
+    "traditional chinese": ("zh-hant", "zho"),
+    "繁体中文": ("zh-hant", "zho"),
+    "繁體中文": ("zh-hant", "zho"),
+    "en": ("en", "eng"),
+    "en-us": ("en", "eng"),
+    "english": ("en", "eng"),
+    "英语": ("en", "eng"),
+    "英文": ("en", "eng"),
+    "ja": ("ja", "jpn"),
+    "ja-jp": ("ja", "jpn"),
+    "japanese": ("ja", "jpn"),
+    "日语": ("ja", "jpn"),
+    "日文": ("ja", "jpn"),
+    "日本語": ("ja", "jpn"),
+    "ko": ("ko", "kor"),
+    "korean": ("ko", "kor"),
+    "韩语": ("ko", "kor"),
+    "韩文": ("ko", "kor"),
+    "fr": ("fr", "fra"),
+    "french": ("fr", "fra"),
+    "法语": ("fr", "fra"),
+    "de": ("de", "deu"),
+    "german": ("de", "deu"),
+    "德语": ("de", "deu"),
+    "es": ("es", "spa"),
+    "spanish": ("es", "spa"),
+    "西班牙语": ("es", "spa"),
+    "pt": ("pt", "por"),
+    "pt-br": ("pt", "por"),
+    "portuguese": ("pt", "por"),
+    "葡萄牙语": ("pt", "por"),
+    "it": ("it", "ita"),
+    "italian": ("it", "ita"),
+    "意大利语": ("it", "ita"),
+    "ru": ("ru", "rus"),
+    "russian": ("ru", "rus"),
+    "俄语": ("ru", "rus"),
+    "ar": ("ar", "ara"),
+    "arabic": ("ar", "ara"),
+    "阿拉伯语": ("ar", "ara"),
+    "hi": ("hi", "hin"),
+    "hindi": ("hi", "hin"),
+    "印地语": ("hi", "hin"),
+    "id": ("id", "ind"),
+    "indonesian": ("id", "ind"),
+    "印尼语": ("id", "ind"),
+    "vi": ("vi", "vie"),
+    "vietnamese": ("vi", "vie"),
+    "越南语": ("vi", "vie"),
+    "th": ("th", "tha"),
+    "thai": ("th", "tha"),
+    "泰语": ("th", "tha"),
 }
-ENGLISH_ALIASES = {"english", "en", "en-us", "英语", "英文"}
+UNKNOWN_LANGUAGE_CODE = "und"
 
 TIMING_PATTERN = re.compile(
     r"(?P<start>\d+:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(?P<end>\d+:\d{2}:\d{2}[,.]\d{1,3})"
@@ -71,13 +128,40 @@ class SubtitleCue:
         )
 
 
+def is_cjk(char: str) -> bool:
+    return "\u3000" <= char <= "\u9fff" or "\uff00" <= char <= "\uffef"
+
+
+def join_text_parts(parts: list[str]) -> str:
+    """Join fragments the way the language writes them: no space between CJK."""
+    joined = ""
+    for part in parts:
+        if not part:
+            continue
+        if joined and not (is_cjk(joined[-1]) or is_cjk(part[0])):
+            joined += " "
+        joined += part
+    return joined
+
+
+def resolve_language(target_language: str) -> tuple[str, str] | None:
+    """The filename suffix and container code for a language, if we know it."""
+    return LANGUAGES.get(target_language.strip().lower())
+
+
 def language_suffix(target_language: str) -> str:
-    normalized = target_language.strip().lower()
-    if normalized in CHINESE_ALIASES:
-        return "zh"
-    if normalized in ENGLISH_ALIASES:
-        return "en"
-    return "translated"
+    known = resolve_language(target_language)
+    return known[0] if known else "translated"
+
+
+def language_code(target_language: str) -> str:
+    """The code players show in their subtitle menu.
+
+    An unrecognised language is labelled undetermined rather than guessed at, so a
+    track never claims to be a language it is not.
+    """
+    known = resolve_language(target_language)
+    return known[1] if known else UNKNOWN_LANGUAGE_CODE
 
 
 def translated_subtitle_path(source: Path, target_language: str) -> Path:
@@ -164,24 +248,30 @@ def write_srt(path: Path, cues: list[SubtitleCue]) -> Path:
     return path
 
 
-def chunk_cues(cues: list[SubtitleCue], batch_chars: int) -> list[list[SubtitleCue]]:
+def chunk_by_chars[T](
+    items: list[T], batch_chars: int, size_of: Callable[[T], int]
+) -> list[list[T]]:
     limit = max(1, batch_chars)
-    batches: list[list[SubtitleCue]] = []
-    current: list[SubtitleCue] = []
+    batches: list[list[T]] = []
+    current: list[T] = []
     current_chars = 0
 
-    for cue in cues:
-        cue_chars = max(1, len(cue.text))
-        if current and current_chars + cue_chars > limit:
+    for item in items:
+        item_chars = max(1, size_of(item))
+        if current and current_chars + item_chars > limit:
             batches.append(current)
             current = []
             current_chars = 0
-        current.append(cue)
-        current_chars += cue_chars
+        current.append(item)
+        current_chars += item_chars
 
     if current:
         batches.append(current)
     return batches
+
+
+def chunk_cues(cues: list[SubtitleCue], batch_chars: int) -> list[list[SubtitleCue]]:
+    return chunk_by_chars(cues, batch_chars, lambda cue: len(cue.text))
 
 
 def escape_ass_text(value: str) -> str:

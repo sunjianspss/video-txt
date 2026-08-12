@@ -9,7 +9,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -18,6 +18,7 @@ from .constants import (
     DEFAULT_CONCURRENCY,
     DEFAULT_TARGET_LANGUAGE,
 )
+from .parallel import map_in_parallel
 from .subtitles import SubtitleCue, chunk_cues, parse_srt, serialize_srt, write_srt
 
 RETRYABLE_STATUS = {408, 409, 425, 429}
@@ -157,11 +158,17 @@ def build_partial_meta(cues: list[SubtitleCue], config: TranslationConfig) -> di
     fingerprint = hashlib.sha1(serialize_srt(cues).encode("utf-8")).hexdigest()
     return {
         "kind": "video-txt.translation.partial",
-        "version": 1,
+        "version": 2,
         "source_sha1": fingerprint,
         "cue_count": len(cues),
+        "base_url": config.base_url,
         "model": config.model,
         "target_language": config.target_language,
+        "source_language": config.source_language,
+        "preserve_terms": config.preserve_terms,
+        "note": config.note,
+        "batch_chars": config.batch_chars,
+        "context_cues": config.context_cues,
     }
 
 
@@ -322,7 +329,8 @@ def post_chat_completion(
         "temperature": 0,
         "messages": messages,
     }
-    if json_mode.supported:
+    using_json_mode = json_mode.supported
+    if using_json_mode:
         payload["response_format"] = {"type": "json_object"}
 
     request = urllib.request.Request(
@@ -340,7 +348,7 @@ def post_chat_completion(
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        if json_mode.supported and exc.code == 400 and "response_format" in body:
+        if using_json_mode and exc.code == 400 and "response_format" in body:
             json_mode.disable()
             print("API rejected response_format; falling back to plain JSON prompting.")
             return post_chat_completion(config=config, messages=messages, json_mode=json_mode)
@@ -369,17 +377,17 @@ def is_retryable(error: Exception) -> bool:
     return isinstance(error, (ApiNetworkError, ResponseFormatError))
 
 
-def translate_batch(
+def request_items(
     *,
-    batch: list[tuple[str, SubtitleCue]],
+    ids: list[str],
+    build_request: Callable[[list[str]], list[dict[str, str]]],
     config: TranslationConfig,
-    context_before: list[ContextCue],
     json_mode: JsonModeState,
     debug_dir: Path | None,
     batch_number: int | None = None,
 ) -> dict[str, str]:
-    expected_ids = [cue_id for cue_id, _ in batch]
-    messages = build_messages(batch, config=config, context_before=context_before)
+    """Ask the model for one text per id, retrying and splitting until the ids line up."""
+    messages = build_request(ids)
 
     last_error: Exception | None = None
     for attempt in range(1, config.retries + 2):
@@ -389,15 +397,15 @@ def translate_batch(
                 config=config, messages=messages, json_mode=json_mode
             )
             raw_content = extract_message_content(response_data)
-            translations = parse_translation_json(raw_content)
-            missing = [cue_id for cue_id in expected_ids if cue_id not in translations]
-            extra = [cue_id for cue_id in translations if cue_id not in expected_ids]
+            answers = parse_translation_json(raw_content)
+            missing = [item_id for item_id in ids if item_id not in answers]
+            extra = [item_id for item_id in answers if item_id not in ids]
             if missing or extra:
                 raise ResponseFormatError(
                     "Translated batch ids did not match the input. "
                     f"Missing: {missing}; extra: {extra}"
                 )
-            return {cue_id: translations[cue_id] for cue_id in expected_ids}
+            return {item_id: answers[item_id] for item_id in ids}
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             if isinstance(exc, ResponseFormatError) and debug_dir is not None and raw_content:
@@ -405,7 +413,7 @@ def translate_batch(
                     debug_dir=debug_dir,
                     batch_number=batch_number,
                     attempt=attempt,
-                    expected_ids=expected_ids,
+                    expected_ids=ids,
                     raw_content=raw_content,
                     error=exc,
                 )
@@ -416,10 +424,11 @@ def translate_batch(
             if attempt <= config.retries:
                 time.sleep(backoff_delay(attempt, config, exc))
 
-    assert last_error is not None
-    if len(batch) > 1 and isinstance(last_error, ResponseFormatError):
-        midpoint = len(batch) // 2
-        left, right = batch[:midpoint], batch[midpoint:]
+    if last_error is None:
+        raise TranslationError(f"The API returned neither a translation nor an error for {ids}.")
+    if len(ids) > 1 and isinstance(last_error, ResponseFormatError):
+        midpoint = len(ids) // 2
+        left, right = ids[:midpoint], ids[midpoint:]
         print(
             "Batch validation failed; retrying with smaller chunks "
             f"({len(left)} + {len(right)} subtitle blocks)."
@@ -427,10 +436,10 @@ def translate_batch(
         merged: dict[str, str] = {}
         for half in (left, right):
             merged.update(
-                translate_batch(
-                    batch=half,
+                request_items(
+                    ids=half,
+                    build_request=build_request,
                     config=config,
-                    context_before=context_before,
                     json_mode=json_mode,
                     debug_dir=debug_dir,
                     batch_number=batch_number,
@@ -439,6 +448,30 @@ def translate_batch(
         return merged
 
     raise last_error
+
+
+def translate_batch(
+    *,
+    batch: list[tuple[str, SubtitleCue]],
+    config: TranslationConfig,
+    context_before: list[ContextCue],
+    json_mode: JsonModeState,
+    debug_dir: Path | None,
+    batch_number: int | None = None,
+) -> dict[str, str]:
+    cues_by_id = dict(batch)
+    return request_items(
+        ids=[cue_id for cue_id, _ in batch],
+        build_request=lambda ids: build_messages(
+            [(cue_id, cues_by_id[cue_id]) for cue_id in ids],
+            config=config,
+            context_before=context_before,
+        ),
+        config=config,
+        json_mode=json_mode,
+        debug_dir=debug_dir,
+        batch_number=batch_number,
+    )
 
 
 def build_context(
@@ -528,25 +561,11 @@ def translate_cues(
         f"Translating {len(todo)} subtitle blocks in {total} batches "
         f"with {workers} concurrent request{'s' if workers > 1 else ''}..."
     )
-
-    if workers == 1:
-        for batch_number, batch in enumerate(grouped, start=1):
-            run_batch(batch_number, batch)
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(run_batch, batch_number, batch)
-                for batch_number, batch in enumerate(grouped, start=1)
-            ]
-            try:
-                for future in futures:
-                    future.result()
-            except BaseException:
-                # Stop burning API quota on batches that have not started yet.
-                for queued in futures:
-                    queued.cancel()
-                raise
-
+    map_in_parallel(
+        list(enumerate(grouped, start=1)),
+        lambda numbered: run_batch(*numbered),
+        workers=workers,
+    )
     return _apply_translations(cues, translations)
 
 

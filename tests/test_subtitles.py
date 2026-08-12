@@ -7,6 +7,7 @@ from video_txt.subtitles import (
     SubtitleFormatError,
     build_ass_subtitle,
     chunk_cues,
+    language_code,
     language_suffix,
     parse_srt,
     parse_srt_text,
@@ -115,8 +116,23 @@ def test_language_suffix_and_output_path(tmp_path):
     assert language_suffix("Simplified Chinese") == "zh"
     assert language_suffix("中文") == "zh"
     assert language_suffix("English") == "en"
-    assert language_suffix("Japanese") == "translated"
+    assert language_suffix("Japanese") == "ja"
+    assert language_suffix("日本語") == "ja"
+    assert language_suffix("Klingon") == "translated"
     assert translated_subtitle_path(tmp_path / "a.srt", "zh").name == "a.zh.srt"
+    assert translated_subtitle_path(tmp_path / "a.srt", "ja").name == "a.ja.srt"
+
+
+def test_a_subtitle_track_never_claims_a_language_it_is_not():
+    assert language_code("Japanese") == "jpn"
+    assert language_code("繁体中文") == "zho"
+    assert language_code("Simplified Chinese") == "zho"
+    assert language_code("Klingon") == "und"
+
+
+def test_traditional_and_simplified_chinese_land_in_different_files():
+    assert language_suffix("Traditional Chinese") == "zh-hant"
+    assert language_suffix("Simplified Chinese") == "zh"
 
 
 def test_resolve_style_metrics_scales_with_video_height():

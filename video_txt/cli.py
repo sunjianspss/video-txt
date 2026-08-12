@@ -2,24 +2,34 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
-from .constants import (
-    DEFAULT_API_KEY_ENV,
-    DEFAULT_BASE_URL,
-    DEFAULT_BATCH_CHARS,
-    DEFAULT_CONCURRENCY,
-    DEFAULT_LANGUAGE_CODE,
-    DEFAULT_TARGET_LANGUAGE,
-    DEFAULT_TERMS,
+from .arguments import (
+    build_dub_command,
+    build_mux_command,
+    build_run_command,
+    build_transcribe_command,
+    build_translate_command,
 )
-from .dub import DubError, DubOptions, run_dub
-from .dub import default_video_output as default_dub_output
-from .env import DEFAULT_SECRETS_FILE, resolve_api_key
+from .clone import CLONE_ENGINES, CloneError, CloneOptions, is_rate, speed_from_rate
+from .constants import DEFAULT_API_KEY_ENV, DEFAULT_BASE_URL, DEFAULT_TERMS, PROVIDERS
+from .diarize import (
+    DEFAULT_SPEAKER,
+    DiarizeError,
+    DiarizeOptions,
+    SpeakerTurn,
+    ensure_speakers,
+)
+from .dub import DubError, DubOptions, default_dubbed_output, run_dub
+from .env import CredentialError, resolve_api_key, resolve_optional_key
+from .fit import FitOptions
 from .media import MediaError, parse_video_size
-from .mux import HARD_LAYOUTS, MuxError, MuxOptions, default_video_output, run_mux
+from .mux import MuxError, MuxOptions, default_video_output, run_mux
 from .pipeline import (
     TranscribeStage,
     TranslateStage,
@@ -27,242 +37,101 @@ from .pipeline import (
     ensure_translated_subtitle,
     run_pipeline,
 )
-from .subtitles import SubtitleFormatError, translated_subtitle_path
-from .transcribe import BACKENDS, OUTPUT_FORMATS, TranscribeError, TranscribeOptions, run_transcribe
+from .quality import check_transcript
+from .subtitles import SubtitleFormatError, language_code, translated_subtitle_path
+from .transcribe import TranscribeError, TranscribeOptions, run_transcribe
 from .translate import (
     TranslationConfig,
     TranslationError,
     translate_subtitle_file,
 )
+from .voices import DEFAULT_SAY_VOICE, DEFAULT_VOICE, resolve_voice_name
 
-PROVIDERS = {
-    "openai": {
-        "base_url": DEFAULT_BASE_URL,
-        "api_key_env": DEFAULT_API_KEY_ENV,
-        "model": None,
-    },
-    "deepseek": {
-        "base_url": "https://api.deepseek.com",
-        "api_key_env": "DEEPSEEK_API_KEY",
-        "model": "deepseek-v4-flash",
-    },
-}
+SPEAKER_PATTERN = re.compile(r"^\w+$")
 
 
-def add_dry_run(parser: argparse.ArgumentParser, help_text: str) -> None:
-    parser.add_argument("--dry-run", action="store_true", help=help_text)
+def resolved(path: Path | None) -> Path | None:
+    """A path as it was typed, made absolute. None stays None, meaning 'pick a default'."""
+    return path.expanduser().resolve() if path else None
 
 
-def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: str) -> None:
-    group = parser.add_argument_group("translation")
-    group.add_argument(
-        "--provider",
-        choices=sorted(PROVIDERS),
-        help="Preset for base URL, API key variable and model. Defaults to openai.",
-    )
-    group.add_argument(
-        "--model",
-        help="Translation model name. Falls back to the provider default or OPENAI_MODEL.",
-    )
-    group.add_argument("--base-url", help="OpenAI-compatible API base URL.")
-    group.add_argument(
-        "--api-key-env",
-        help=f"Environment variable holding the API key. Defaults to {DEFAULT_API_KEY_ENV}.",
-    )
-    group.add_argument(
-        "--secrets-file",
-        type=Path,
-        default=DEFAULT_SECRETS_FILE,
-        help=(
-            "Shell-style file read when the API key variable is unset. "
-            f"Defaults to {DEFAULT_SECRETS_FILE}."
-        ),
-    )
-    group.add_argument(
-        "--target-language",
-        default=DEFAULT_TARGET_LANGUAGE,
-        help="Target language for translation. Defaults to Simplified Chinese.",
-    )
-    group.add_argument(
-        "--source-language",
-        help="Optional hint for the source language, for example English.",
-    )
-    group.add_argument(
-        "--batch-chars",
-        type=int,
-        default=DEFAULT_BATCH_CHARS,
-        help=f"Approximate text characters per API batch. Defaults to {DEFAULT_BATCH_CHARS}.",
-    )
-    group.add_argument(
-        "--retries",
-        type=int,
-        default=2,
-        help="Retries per batch when a request fails. Defaults to 2.",
-    )
-    group.add_argument(
-        "--concurrency",
-        type=int,
-        default=DEFAULT_CONCURRENCY,
-        help=f"Batches translated in parallel. Defaults to {DEFAULT_CONCURRENCY}.",
-    )
-    group.add_argument(
-        "--context-cues",
-        type=int,
-        default=3,
-        help="Preceding subtitle lines sent as context for tone and terminology. Defaults to 3.",
-    )
-    group.add_argument(
-        "--no-resume",
-        dest="resume",
-        action="store_false",
-        help="Do not reuse or write the .partial.jsonl resume file.",
-    )
-    group.add_argument(
-        debug_flag,
-        dest="debug_dir",
-        type=Path,
-        help="Directory for invalid API response debug files.",
-    )
-    group.add_argument("--note", help="Extra translation note, for example 'keep a casual tone'.")
-    group.add_argument(
-        "--preserve-term",
-        action="append",
-        default=[],
-        help="Term to keep in the original language. Can be passed multiple times.",
+def existing_file(parser: argparse.ArgumentParser, path: Path, label: str) -> Path:
+    full_path = path.expanduser().resolve()
+    if not full_path.is_file():
+        parser.error(f"{label} not found: {full_path}")
+    return full_path
+
+
+def normalize_speaker(name: str) -> str:
+    """pyannote calls them SPEAKER_00; take 0 and 00 to mean the same thing."""
+    label = name.strip()
+    return f"SPEAKER_{int(label):02d}" if label.isdigit() else label
+
+
+def split_assignment(value: str) -> tuple[str, str]:
+    """SPEAKER=value, or a bare value meaning the only speaker there is."""
+    key, separator, rest = value.partition("=")
+    if separator and SPEAKER_PATTERN.match(key.strip()):
+        return normalize_speaker(key), rest.strip()
+    return DEFAULT_SPEAKER, value.strip()
+
+
+def parse_speaker_voices(parser: argparse.ArgumentParser, values: list[str]) -> dict[str, str]:
+    voices: dict[str, str] = {}
+    for value in values:
+        speaker, voice = split_assignment(value)
+        if not speaker or not voice:
+            parser.error(
+                "--speaker-voice expects SPEAKER=VOICE, for example "
+                f"SPEAKER_01=zh-CN-YunxiNeural. Got: {value}"
+            )
+        voices[speaker] = voice
+    return voices
+
+
+def parse_clone_references(parser: argparse.ArgumentParser, values: list[str]) -> dict[str, Path]:
+    references: dict[str, Path] = {}
+    for value in values:
+        speaker, audio = split_assignment(value)
+        if not audio:
+            parser.error(
+                "--clone-reference expects an audio path, optionally prefixed with "
+                f"SPEAKER=. Got: {value}"
+            )
+        references[speaker] = Path(audio)
+    return references
+
+
+def build_diarize_options(args: argparse.Namespace) -> DiarizeOptions:
+    return DiarizeOptions(
+        model=args.diarize_model,
+        token=resolve_optional_key(args.hf_token_env, secrets_file=args.secrets_file),
+        speakers=args.speaker_count,
+        min_speakers=args.min_speakers,
+        max_speakers=args.max_speakers,
+        rediarize=args.rediarize,
     )
 
 
-def add_transcribe_arguments(parser: argparse.ArgumentParser, *, standalone: bool) -> None:
-    group = parser.add_argument_group("transcription")
-    model_flags = ["-m", "--model"] if standalone else ["--whisper-model"]
-    group.add_argument(
-        *model_flags,
-        dest="whisper_model",
-        help="Whisper model. Defaults to turbo for transcription and medium for translation.",
-    )
-    group.add_argument(
-        "--backend",
-        dest="whisper_backend",
-        choices=BACKENDS,
-        default="auto",
-        help="Transcription backend. auto prefers mlx-whisper on Apple Silicon.",
-    )
-    language_flags = ["-l", "--language"] if standalone else ["--language"]
-    group.add_argument(
-        *language_flags,
-        dest="language",
-        help="Spoken language in the media, for example en or Chinese. Defaults to auto-detect.",
-    )
-    group.add_argument(
-        "--device", help="Torch device for the openai-whisper backend, for example cpu."
-    )
-    group.add_argument(
-        "--initial-prompt",
-        help="Prompt that biases spelling of names and jargon, for example 'Claude Code, MCP'.",
-    )
-    group.add_argument(
-        "--whisper-arg",
-        action="append",
-        default=[],
-        dest="whisper_args",
-        help="Extra raw argument passed to the backend. Can be passed multiple times.",
+def build_clone_options(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> CloneOptions | None:
+    if args.tts_engine not in CLONE_ENGINES:
+        return None
+    return CloneOptions(
+        engine=args.tts_engine,
+        model=args.clone_model,
+        python=args.clone_python,
+        repo=args.clone_repo,
+        device=args.clone_device,
+        speed=speed_from_rate(args.rate),
+        references=parse_clone_references(parser, args.clone_references),
     )
 
 
-def add_mux_arguments(parser: argparse.ArgumentParser) -> None:
-    group = parser.add_argument_group("muxing")
-    group.add_argument(
-        "--mux-mode",
-        choices=("soft", "hard"),
-        default="soft",
-        help="soft embeds a toggleable subtitle track; hard burns text into the image.",
-    )
-    group.add_argument(
-        "--language-code",
-        default=DEFAULT_LANGUAGE_CODE,
-        help=(
-            "Language code written into soft subtitle metadata. "
-            f"Defaults to {DEFAULT_LANGUAGE_CODE}."
-        ),
-    )
-    group.add_argument(
-        "--default-subtitle",
-        action="store_true",
-        help="Mark the soft subtitle track as the default stream.",
-    )
-    group.add_argument(
-        "--subtitle-codec",
-        help="Override the soft subtitle encoder. Defaults to the one the output container needs.",
-    )
-    group.add_argument(
-        "--hard-subtitle-layout",
-        choices=HARD_LAYOUTS,
-        default="normal",
-        help=(
-            "Layout for --mux-mode hard: normal sits at the bottom, bottom-box adds a "
-            "translucent band over burned-in original subtitles, top moves text to the top."
-        ),
-    )
-    group.add_argument(
-        "--hard-subtitle-font",
-        default="PingFang SC",
-        help="Font family for hard subtitles. Defaults to PingFang SC.",
-    )
-    group.add_argument(
-        "--hard-subtitle-font-size",
-        type=int,
-        help="Hard subtitle size in pixels. Defaults to about 4.5%% of the video height.",
-    )
-    group.add_argument(
-        "--hard-subtitle-margin-v",
-        type=int,
-        help="Hard subtitle vertical margin in pixels. Defaults to about 5%% of the video height.",
-    )
-    group.add_argument(
-        "--hard-subtitle-box-height",
-        type=float,
-        default=0.22,
-        help="Bottom box height as a fraction of video height for bottom-box. Defaults to 0.22.",
-    )
-    group.add_argument(
-        "--hard-subtitle-box-opacity",
-        type=float,
-        default=0.68,
-        help="Bottom box opacity for bottom-box, from 0 to 1. Defaults to 0.68.",
-    )
-    group.add_argument(
-        "--video-codec",
-        default="libx264",
-        help="Video encoder used when burning hard subtitles. Defaults to libx264.",
-    )
-    group.add_argument(
-        "--crf",
-        type=int,
-        default=20,
-        help="Quality for libx264/libx265, lower is better. Defaults to 20.",
-    )
-    group.add_argument(
-        "--preset",
-        default="medium",
-        help="libx264/libx265 speed preset. Defaults to medium.",
-    )
-    group.add_argument(
-        "--video-size",
-        help="Video resolution as WIDTHxHEIGHT, used when ffprobe cannot detect it.",
-    )
-    group.add_argument(
-        "--ffmpeg",
-        dest="ffmpeg_path",
-        help="Path to the ffmpeg binary. Also read from FFMPEG_PATH.",
-    )
-    group.add_argument(
-        "--overwrite-video",
-        action="store_true",
-        help="Overwrite the output video if it already exists.",
-    )
-
-
-def resolve_provider_settings(args: argparse.Namespace) -> tuple[str, str, str]:
+def resolve_provider_settings(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> tuple[str, str, str]:
     provider = PROVIDERS[args.provider] if args.provider else {}
     base_url = (
         args.base_url
@@ -273,14 +142,29 @@ def resolve_provider_settings(args: argparse.Namespace) -> tuple[str, str, str]:
     api_key_env = args.api_key_env or provider.get("api_key_env") or DEFAULT_API_KEY_ENV
     model = args.model or provider.get("model") or os.environ.get("OPENAI_MODEL")
     if not model:
-        raise SystemExit(
+        parser.error(
             "Missing model name. Pass --model, use --provider deepseek, or set OPENAI_MODEL."
         )
     return base_url, api_key_env, model
 
 
-def build_translation_config(args: argparse.Namespace, *, require_key: bool) -> TranslationConfig:
-    base_url, api_key_env, model = resolve_provider_settings(args)
+def validate_translation_numbers(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Settings the translator would otherwise quietly pull back into range."""
+    if args.batch_chars < 1:
+        parser.error("--batch-chars must be 1 or greater")
+    if args.retries < 0:
+        parser.error("--retries must be 0 or greater")
+    if args.concurrency < 1:
+        parser.error("--concurrency must be 1 or greater")
+    if args.context_cues < 0:
+        parser.error("--context-cues must be 0 or greater")
+
+
+def build_translation_config(
+    args: argparse.Namespace, parser: argparse.ArgumentParser, *, require_key: bool
+) -> TranslationConfig:
+    validate_translation_numbers(parser, args)
+    base_url, api_key_env, model = resolve_provider_settings(args, parser)
     api_key = resolve_api_key(api_key_env, secrets_file=args.secrets_file) if require_key else ""
     return TranslationConfig(
         base_url=base_url,
@@ -291,9 +175,9 @@ def build_translation_config(args: argparse.Namespace, *, require_key: bool) -> 
         preserve_terms=list(dict.fromkeys([*DEFAULT_TERMS, *args.preserve_term])),
         note=args.note,
         batch_chars=args.batch_chars,
-        retries=max(0, args.retries),
-        concurrency=max(1, args.concurrency),
-        context_cues=max(0, args.context_cues),
+        retries=args.retries,
+        concurrency=args.concurrency,
+        context_cues=args.context_cues,
     )
 
 
@@ -309,7 +193,7 @@ def build_mux_options(
         subtitle_input=subtitle,
         video_output=video_output,
         mux_mode=args.mux_mode,
-        language_code=args.language_code,
+        language_code=args.language_code or language_code(args.target_language),
         default_subtitle=args.default_subtitle,
         subtitle_codec=args.subtitle_codec,
         overwrite=args.overwrite_video,
@@ -327,13 +211,71 @@ def build_mux_options(
     )
 
 
+def dub_voicing(args: argparse.Namespace) -> str:
+    """How the dub will be spoken, in the few words the stage banner has room for."""
+    if args.tts_engine in CLONE_ENGINES:
+        return "cloning the original voice"
+    if args.diarize:
+        return "one voice per speaker"
+    return f"voice {resolve_voice_name(args.tts_engine, args.voice)}"
+
+
+def build_dub_options(
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    video: Path,
+    subtitle: Path,
+    source_subtitle: Path,
+    video_output: Path,
+    translation: Callable[[], TranslationConfig],
+    turns: list[SpeakerTurn],
+) -> DubOptions:
+    return DubOptions(
+        video_input=video,
+        subtitle_input=subtitle,
+        video_output=video_output,
+        source_subtitle=source_subtitle,
+        fit=build_fit_options(args, translation=translation),
+        audio_output=resolved(args.audio_output),
+        cache_dir=resolved(args.cache_dir),
+        engine=args.tts_engine,
+        voice=args.voice,
+        voice_unit=args.voice_unit,
+        rate=args.rate,
+        max_atempo=args.max_atempo,
+        keep_bgm=args.keep_bgm,
+        keep_audio=args.keep_dub_audio,
+        prune_cache=args.prune_cache,
+        bgm_volume=args.bgm_volume,
+        soft_subtitle=args.soft_subtitle,
+        language_code=args.language_code or language_code(args.target_language),
+        concurrency=args.tts_concurrency,
+        overwrite=args.overwrite_video,
+        ffmpeg_path=args.ffmpeg_path,
+        turns=turns,
+        speaker_voices=parse_speaker_voices(parser, args.speaker_voices),
+        clone=build_clone_options(args, parser),
+    )
+
+
 def build_translate_stage(
-    args: argparse.Namespace, *, require_key: bool, output_path: Path | None
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    require_key: bool,
+    output_path: Path | None,
 ) -> TranslateStage:
     return TranslateStage(
-        config=build_translation_config(args, require_key=require_key),
+        config=TranslationConfig(
+            base_url="",
+            api_key="",
+            model="",
+            target_language=args.target_language,
+        ),
+        config_loader=lambda: build_translation_config(args, parser, require_key=require_key),
         output_path=output_path,
-        debug_dir=args.debug_dir.expanduser().resolve() if args.debug_dir else None,
+        debug_dir=resolved(args.debug_dir),
         resume=args.resume,
         retranslate=args.retranslate,
     )
@@ -348,7 +290,128 @@ def build_transcribe_stage(args: argparse.Namespace) -> TranscribeStage:
         initial_prompt=args.initial_prompt,
         extra_args=args.whisper_args,
         retranscribe=args.retranscribe,
+        skip_transcript_check=args.skip_transcript_check,
     )
+
+
+def build_fit_options(
+    args: argparse.Namespace, *, translation: Callable[[], TranslationConfig]
+) -> FitOptions | None:
+    if not args.fit_duration:
+        return None
+    return FitOptions(translation=translation(), tempo=args.fit_tempo, rounds=args.fit_rounds)
+
+
+def validate_fit_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if not args.fit_duration:
+        return
+    if args.fit_tempo < 1.0:
+        parser.error("--fit-tempo must be 1.0 or greater")
+    if args.fit_rounds < 1:
+        parser.error("--fit-rounds must be 1 or greater")
+    if args.fit_tempo > args.max_atempo:
+        parser.error(
+            f"--fit-tempo {args.fit_tempo} leaves lines needing more speed-up than "
+            f"--max-atempo {args.max_atempo} can apply, so they would run past their slot. "
+            "Lower --fit-tempo or raise --max-atempo."
+        )
+
+
+def validate_dub_numbers(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Settings the renderer would otherwise quietly pull back into range."""
+    if not is_rate(args.rate):
+        parser.error(f"--rate must be a signed percentage such as +10%. Got: {args.rate}")
+    if args.max_atempo < 1.0:
+        parser.error("--max-atempo must be 1.0 or greater: it can only speed a clip up.")
+    if not 0 <= args.bgm_volume <= 1:
+        parser.error("--bgm-volume must be between 0 and 1")
+    if args.tts_concurrency < 1:
+        parser.error("--tts-concurrency must be 1 or greater")
+
+
+def validate_engine_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Flags addressed to an engine other than the one that will run.
+
+    None of them would reach anything. The run finishes, reports success, and
+    sounds nothing like what was asked for.
+    """
+    if args.tts_engine not in CLONE_ENGINES:
+        used = [
+            flag
+            for flag, value in (
+                ("--clone-model", args.clone_model),
+                ("--clone-reference", args.clone_references),
+                ("--clone-repo", args.clone_repo),
+                ("--clone-python", args.clone_python),
+                ("--clone-device", args.clone_device),
+            )
+            if value
+        ]
+        if used:
+            engines = " or ".join(f"--tts-engine {engine}" for engine in CLONE_ENGINES)
+            parser.error(f"{used[0]} only applies to a cloning engine. Add {engines}.")
+        if args.tts_engine == "say":
+            asked = [
+                ("--voice", args.voice),
+                *(("--speaker-voice", split_assignment(v)[1]) for v in args.speaker_voices),
+            ]
+            # Against the resolved name, not the one that was typed: the default
+            # --voice is an edge-tts name that say already answers to with one of
+            # its own, and nobody who left the flag alone should hear about it.
+            neural = [
+                (flag, name)
+                for flag, name in asked
+                if resolve_voice_name(args.tts_engine, name).endswith("Neural")
+            ]
+            if neural:
+                flag, name = neural[0]
+                parser.error(
+                    f"{flag} {name} is an edge-tts voice, and say has names of its own. "
+                    f"Leave it out for {DEFAULT_SAY_VOICE}, or list them with: say -v '?'"
+                )
+        return
+
+    if args.voice != DEFAULT_VOICE:
+        parser.error(
+            f"--tts-engine {args.tts_engine} clones the voice out of the reference clip, so "
+            "--voice has nothing to name. Choose the clip with --clone-reference instead."
+        )
+    if args.speaker_voices:
+        parser.error(
+            f"--tts-engine {args.tts_engine} gives every speaker the voice cloned from their "
+            "own reference clip, so --speaker-voice has nothing to name."
+        )
+
+
+def validate_voice_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    validate_dub_numbers(parser, args)
+    validate_engine_options(parser, args)
+    if args.speaker_voices and not args.diarize:
+        parser.error("--speaker-voice needs --diarize: without it every line has one speaker.")
+    named_references = [
+        value for value in args.clone_references if split_assignment(value)[0] != DEFAULT_SPEAKER
+    ]
+    if named_references and not args.diarize:
+        parser.error(
+            "--clone-reference SPEAKER=... needs --diarize: without it every line has one "
+            f"speaker, so the name matches nobody. Drop it: --clone-reference "
+            f"{split_assignment(named_references[0])[1]}"
+        )
+
+    counts = {
+        "--speakers": args.speaker_count,
+        "--min-speakers": args.min_speakers,
+        "--max-speakers": args.max_speakers,
+    }
+    for flag, value in counts.items():
+        if value is not None and value < 1:
+            parser.error(f"{flag} must be 1 or greater")
+    if (
+        args.min_speakers is not None
+        and args.max_speakers is not None
+        and args.min_speakers > args.max_speakers
+    ):
+        parser.error("--min-speakers cannot be greater than --max-speakers")
 
 
 def validate_hard_subtitle_options(
@@ -364,16 +427,9 @@ def validate_hard_subtitle_options(
         parser.error("--hard-subtitle-box-opacity must be between 0 and 1")
 
 
-def existing_file(parser: argparse.ArgumentParser, path: Path, label: str) -> Path:
-    resolved = path.expanduser().resolve()
-    if not resolved.is_file():
-        parser.error(f"{label} not found: {resolved}")
-    return resolved
-
-
 def command_transcribe(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     input_path = existing_file(parser, args.input, "Input file")
-    output_dir = (args.output_dir or input_path.parent).expanduser().resolve()
+    output_dir = resolved(args.output_dir) or input_path.parent
     options = TranscribeOptions(
         input_path=input_path,
         output_dir=output_dir,
@@ -387,9 +443,20 @@ def command_transcribe(args: argparse.Namespace, parser: argparse.ArgumentParser
         extra_args=args.whisper_args,
     )
     output_path = run_transcribe(options, dry_run=args.dry_run)
-    if not args.dry_run:
-        print(f"Done: {output_path}")
-    return 0
+    if args.dry_run:
+        return 0
+    print(f"Done: {output_path}")
+    if output_path.suffix.lower() != ".srt" or args.skip_transcript_check:
+        return 0
+
+    report = check_transcript(output_path, language=args.language)
+    if not report:
+        return 0
+    # The transcript is written either way; the exit code is how a script chained
+    # with && finds out not to spend an API bill on it.
+    print()
+    print(report, file=sys.stderr)
+    return 1
 
 
 def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -397,10 +464,8 @@ def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser)
     if input_path.suffix.lower() != ".srt":
         parser.error(f"Expected an .srt file, got: {input_path.name}")
 
-    output_path = (
-        args.output.expanduser().resolve()
-        if args.output
-        else translated_subtitle_path(input_path, args.target_language)
+    output_path = resolved(args.output) or translated_subtitle_path(
+        input_path, args.target_language
     )
     if output_path.exists() and not args.overwrite and not args.dry_run:
         parser.error(f"Output file already exists: {output_path}. Pass --overwrite to replace it.")
@@ -408,8 +473,8 @@ def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser)
     translate_subtitle_file(
         input_path=input_path,
         output_path=output_path,
-        config=build_translation_config(args, require_key=not args.dry_run),
-        debug_dir=args.debug_dir.expanduser().resolve() if args.debug_dir else None,
+        config=build_translation_config(args, parser, require_key=not args.dry_run),
+        debug_dir=resolved(args.debug_dir),
         resume=args.resume,
         dry_run=args.dry_run,
     )
@@ -423,20 +488,16 @@ def command_mux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
     if subtitle.suffix.lower() != ".srt":
         parser.error(f"Expected an .srt subtitle file, got: {subtitle.name}")
 
-    subtitle_output = (
-        args.subtitle_output.expanduser().resolve()
-        if args.subtitle_output
-        else translated_subtitle_path(subtitle, args.target_language)
+    subtitle_output = resolved(args.subtitle_output) or translated_subtitle_path(
+        subtitle, args.target_language
     )
-    video_output = (
-        args.video_output.expanduser().resolve()
-        if args.video_output
-        else default_video_output(
-            video, mux_mode=args.mux_mode, target_language=args.target_language
-        )
+    video_output = resolved(args.video_output) or default_video_output(
+        video, mux_mode=args.mux_mode, target_language=args.target_language
     )
 
-    stage = build_translate_stage(args, require_key=not args.dry_run, output_path=subtitle_output)
+    stage = build_translate_stage(
+        args, parser, require_key=not args.dry_run, output_path=subtitle_output
+    )
     translated = ensure_translated_subtitle(subtitle, stage=stage, dry_run=args.dry_run, label=None)
     options = build_mux_options(args, video=video, subtitle=translated, video_output=video_output)
     output = run_mux(options, dry_run=args.dry_run)
@@ -448,14 +509,10 @@ def command_mux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
 def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     validate_hard_subtitle_options(parser, args)
     video = existing_file(parser, args.video, "Video file")
-    subtitle = args.subtitle.expanduser().resolve() if args.subtitle else None
-    output_dir = (args.output_dir or video.parent).expanduser().resolve()
-    video_output = (
-        args.video_output.expanduser().resolve()
-        if args.video_output
-        else default_video_output(
-            video, mux_mode=args.mux_mode, target_language=args.target_language
-        )
+    subtitle = existing_file(parser, args.subtitle, "Subtitle file") if args.subtitle else None
+    output_dir = resolved(args.output_dir) or video.parent
+    video_output = resolved(args.video_output) or default_video_output(
+        video, mux_mode=args.mux_mode, target_language=args.target_language
     )
 
     output = run_pipeline(
@@ -465,10 +522,9 @@ def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         transcribe_stage=build_transcribe_stage(args),
         translate_stage=build_translate_stage(
             args,
+            parser,
             require_key=not args.dry_run,
-            output_path=args.subtitle_output.expanduser().resolve()
-            if args.subtitle_output
-            else None,
+            output_path=resolved(args.subtitle_output),
         ),
         mux_options_for=lambda translated: build_mux_options(
             args, video=video, subtitle=translated, video_output=video_output
@@ -481,12 +537,26 @@ def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
 
 
 def command_dub(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    validate_fit_options(parser, args)
+    validate_voice_options(parser, args)
     video = existing_file(parser, args.video, "Video file")
-    subtitle = args.subtitle.expanduser().resolve() if args.subtitle else None
-    output_dir = (args.output_dir or video.parent).expanduser().resolve()
-    video_output = (
-        args.video_output.expanduser().resolve() if args.video_output else default_dub_output(video)
+    subtitle = existing_file(parser, args.subtitle, "Subtitle file") if args.subtitle else None
+    output_dir = resolved(args.output_dir) or video.parent
+    video_output = resolved(args.video_output) or default_dubbed_output(
+        video, target_language=args.target_language
     )
+
+    # Diarization comes first because it is the stage most likely to be turned
+    # away for a missing token, and nothing before it is worth paying for twice.
+    stages = 4 if args.diarize else 3
+    turns = []
+    if args.diarize:
+        turns = ensure_speakers(
+            video,
+            options=build_diarize_options(args),
+            dry_run=args.dry_run,
+            label=f"[1/{stages}]",
+        )
 
     source_subtitle = ensure_source_subtitle(
         video,
@@ -494,41 +564,78 @@ def command_dub(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         output_dir=output_dir,
         stage=build_transcribe_stage(args),
         dry_run=args.dry_run,
+        label=f"[{stages - 2}/{stages}]",
+    )
+    translate_stage = build_translate_stage(
+        args,
+        parser,
+        require_key=not args.dry_run,
+        output_path=resolved(args.subtitle_output),
     )
     translated = ensure_translated_subtitle(
         source_subtitle,
-        stage=build_translate_stage(
-            args,
-            require_key=not args.dry_run,
-            output_path=args.subtitle_output.expanduser().resolve()
-            if args.subtitle_output
-            else None,
-        ),
+        stage=translate_stage,
         dry_run=args.dry_run,
+        label=f"[{stages - 1}/{stages}]",
     )
 
-    print(f"[3/3] Dub: {args.tts_engine} voice {args.voice}")
-    options = DubOptions(
-        video_input=video,
-        subtitle_input=translated,
+    print(f"[{stages}/{stages}] Dub: {args.tts_engine} {dub_voicing(args)}")
+    options = build_dub_options(
+        args,
+        parser,
+        video=video,
+        subtitle=translated,
+        source_subtitle=source_subtitle,
         video_output=video_output,
-        audio_output=args.audio_output.expanduser().resolve() if args.audio_output else None,
-        cache_dir=args.cache_dir.expanduser().resolve() if args.cache_dir else None,
-        engine=args.tts_engine,
-        voice=args.voice,
-        rate=args.rate,
-        max_atempo=args.max_atempo,
-        keep_bgm=args.keep_bgm,
-        bgm_volume=args.bgm_volume,
-        soft_subtitle=args.soft_subtitle,
-        concurrency=max(1, args.tts_concurrency),
-        overwrite=args.overwrite_video,
-        ffmpeg_path=args.ffmpeg_path,
+        translation=translate_stage.require_config,
+        turns=turns,
     )
     output = run_dub(options, dry_run=args.dry_run)
     if not args.dry_run:
         print(f"Done: {output}")
     return 0
+
+
+@dataclass(frozen=True)
+class Command:
+    name: str
+    help: str
+    add_arguments: Callable[[argparse.ArgumentParser], None]
+    handler: Callable[[argparse.Namespace, argparse.ArgumentParser], int]
+
+
+COMMANDS = (
+    Command(
+        "transcribe",
+        "Convert audio or video into text with Whisper.",
+        build_transcribe_command,
+        command_transcribe,
+    ),
+    Command(
+        "translate",
+        "Translate an .srt subtitle file with an OpenAI-compatible API.",
+        build_translate_command,
+        command_translate,
+    ),
+    Command(
+        "mux",
+        "Translate an .srt file and mux it back into a video.",
+        build_mux_command,
+        command_mux,
+    ),
+    Command(
+        "run",
+        "One command: video -> transcript -> translation -> subtitled video.",
+        build_run_command,
+        command_run,
+    ),
+    Command(
+        "dub",
+        "One command: video -> Chinese voice-over video.",
+        build_dub_command,
+        command_dub,
+    ),
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -538,206 +645,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"video-txt {__version__}")
     subparsers = parser.add_subparsers(dest="command", required=True)
-
-    transcribe = subparsers.add_parser(
-        "transcribe", help="Convert audio or video into text with Whisper."
-    )
-    transcribe.add_argument("input", type=Path, help="Path to a local audio or video file.")
-    transcribe.add_argument(
-        "-o",
-        "--output-dir",
-        type=Path,
-        help="Directory for generated files. Defaults to the input file's folder.",
-    )
-    transcribe.add_argument(
-        "--mode",
-        choices=("transcribe", "translate"),
-        default="transcribe",
-        help="Whisper mode. translate means X->English, matching Whisper's built-in behavior.",
-    )
-    transcribe.add_argument(
-        "-f",
-        "--format",
-        choices=OUTPUT_FORMATS,
-        default="txt",
-        help="Output file format. Defaults to txt.",
-    )
-    add_transcribe_arguments(transcribe, standalone=True)
-    add_dry_run(transcribe, "Print the transcription command without running it.")
-    transcribe.set_defaults(handler=command_transcribe)
-
-    translate = subparsers.add_parser(
-        "translate", help="Translate an .srt subtitle file with an OpenAI-compatible API."
-    )
-    translate.add_argument("input", type=Path, help="Path to the source .srt file.")
-    translate.add_argument(
-        "-o", "--output", type=Path, help="Output .srt path. Defaults to '<input>.zh.srt'."
-    )
-    translate.add_argument(
-        "--overwrite", action="store_true", help="Overwrite the output file if it exists."
-    )
-    add_translation_arguments(translate, debug_flag="--debug-dir")
-    add_dry_run(translate, "Print the resolved configuration without calling the API.")
-    translate.set_defaults(handler=command_translate)
-
-    mux = subparsers.add_parser("mux", help="Translate an .srt file and mux it back into a video.")
-    mux.add_argument("video", type=Path, help="Path to the source video file.")
-    mux.add_argument("subtitle", type=Path, help="Path to the source .srt subtitle file.")
-    mux.add_argument(
-        "-o",
-        "--video-output",
-        type=Path,
-        help="Output video path. Defaults to '<video>.zh-subbed.mp4'.",
-    )
-    mux.add_argument(
-        "--subtitle-output",
-        type=Path,
-        help="Translated subtitle path. Defaults to '<subtitle>.zh.srt'.",
-    )
-    mux.add_argument(
-        "--retranslate",
-        action="store_true",
-        help="Translate again even if the translated subtitle already exists.",
-    )
-    add_translation_arguments(mux, debug_flag="--translation-debug-dir")
-    add_mux_arguments(mux)
-    add_dry_run(mux, "Print the translation plan and ffmpeg command without running them.")
-    mux.set_defaults(handler=command_mux)
-
-    run = subparsers.add_parser(
-        "run", help="One command: video -> transcript -> translation -> subtitled video."
-    )
-    run.add_argument("video", type=Path, help="Path to the source video file.")
-    run.add_argument(
-        "--subtitle",
-        type=Path,
-        help="Existing source-language .srt. Skips the transcription step.",
-    )
-    run.add_argument(
-        "--subtitle-output",
-        type=Path,
-        help="Translated subtitle path. Defaults to '<video>.zh.srt'.",
-    )
-    run.add_argument(
-        "-o",
-        "--video-output",
-        type=Path,
-        help="Output video path. Defaults to '<video>.zh-subbed.mp4'.",
-    )
-    run.add_argument(
-        "--output-dir",
-        type=Path,
-        help="Directory for intermediate subtitle files. Defaults to the video's folder.",
-    )
-    run.add_argument(
-        "--retranscribe", action="store_true", help="Transcribe again even if an .srt exists."
-    )
-    run.add_argument(
-        "--retranslate", action="store_true", help="Translate again even if a translation exists."
-    )
-    add_transcribe_arguments(run, standalone=False)
-    add_translation_arguments(run, debug_flag="--translation-debug-dir")
-    add_mux_arguments(run)
-    add_dry_run(
-        run, "Print every stage's plan without transcribing, calling the API or running ffmpeg."
-    )
-    run.set_defaults(handler=command_run)
-
-    dub = subparsers.add_parser("dub", help="One command: video -> Chinese voice-over video.")
-    dub.add_argument("video", type=Path, help="Path to the source video file.")
-    dub.add_argument(
-        "--subtitle",
-        type=Path,
-        help="Existing source-language .srt. Skips the transcription step.",
-    )
-    dub.add_argument(
-        "--subtitle-output",
-        type=Path,
-        help="Translated subtitle path. Defaults to '<video>.zh.srt'.",
-    )
-    dub.add_argument(
-        "-o",
-        "--video-output",
-        type=Path,
-        help="Output video path. Defaults to '<video>.zh-dubbed.mp4'.",
-    )
-    dub.add_argument(
-        "--output-dir",
-        type=Path,
-        help="Directory for intermediate subtitle files. Defaults to the video's folder.",
-    )
-    dub.add_argument(
-        "--retranscribe", action="store_true", help="Transcribe again even if an .srt exists."
-    )
-    dub.add_argument(
-        "--retranslate", action="store_true", help="Translate again even if a translation exists."
-    )
-    voice_group = dub.add_argument_group("voice-over")
-    voice_group.add_argument(
-        "--tts-engine",
-        choices=("edge-tts", "say"),
-        default="edge-tts",
-        help="Speech engine. edge-tts sounds natural and is free; say works offline on macOS.",
-    )
-    voice_group.add_argument(
-        "--voice",
-        default="zh-CN-XiaoxiaoNeural",
-        help="Voice name, for example zh-CN-XiaoxiaoNeural or zh-CN-YunxiNeural.",
-    )
-    voice_group.add_argument(
-        "--rate", default="+0%", help="edge-tts speaking rate, for example +10%%. Defaults to +0%%."
-    )
-    voice_group.add_argument(
-        "--max-atempo",
-        type=float,
-        default=1.35,
-        help="Largest speed-up used to fit a line into its slot. Defaults to 1.35.",
-    )
-    voice_group.add_argument(
-        "--keep-bgm",
-        action="store_true",
-        help="Mix the original audio in quietly instead of replacing it.",
-    )
-    voice_group.add_argument(
-        "--bgm-volume",
-        type=float,
-        default=0.15,
-        help="Original audio volume when --keep-bgm is set. Defaults to 0.15.",
-    )
-    voice_group.add_argument(
-        "--soft-subtitle",
-        action="store_true",
-        help="Also embed the Chinese subtitles as a toggleable track.",
-    )
-    voice_group.add_argument(
-        "--tts-concurrency",
-        type=int,
-        default=4,
-        help="Voice clips synthesized in parallel. Defaults to 4.",
-    )
-    voice_group.add_argument(
-        "--cache-dir",
-        type=Path,
-        help="Directory for cached voice clips. Defaults to '<video>.dub-cache'.",
-    )
-    voice_group.add_argument(
-        "--audio-output", type=Path, help="Path for the rendered Chinese audio track."
-    )
-    voice_group.add_argument(
-        "--ffmpeg",
-        dest="ffmpeg_path",
-        help="Path to the ffmpeg binary. Also read from FFMPEG_PATH.",
-    )
-    voice_group.add_argument(
-        "--overwrite-video",
-        action="store_true",
-        help="Overwrite the output video if it already exists.",
-    )
-    add_transcribe_arguments(dub, standalone=False)
-    add_translation_arguments(dub, debug_flag="--translation-debug-dir")
-    add_dry_run(dub, "Print every stage's plan without synthesizing speech or running ffmpeg.")
-    dub.set_defaults(handler=command_dub)
-
+    for command in COMMANDS:
+        subparser = subparsers.add_parser(command.name, help=command.help)
+        command.add_arguments(subparser)
+        subparser.set_defaults(handler=command.handler)
     return parser
 
 
@@ -747,6 +658,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.handler(args, parser)
     except (
+        CloneError,
+        CredentialError,
+        DiarizeError,
         DubError,
         MediaError,
         MuxError,

@@ -5,8 +5,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .mux import MuxOptions, run_mux
+from .quality import check_transcript
 from .subtitles import translated_subtitle_path
-from .transcribe import TranscribeOptions, run_transcribe
+from .transcribe import TranscribeError, TranscribeOptions, run_transcribe
 from .translate import TranslationConfig, translate_subtitle_file
 
 
@@ -19,15 +20,25 @@ class TranscribeStage:
     initial_prompt: str | None = None
     extra_args: list[str] = field(default_factory=list)
     retranscribe: bool = False
+    skip_transcript_check: bool = False
 
 
 @dataclass
 class TranslateStage:
     config: TranslationConfig
+    config_loader: Callable[[], TranslationConfig] | None = None
     output_path: Path | None = None
     debug_dir: Path | None = None
     resume: bool = True
     retranslate: bool = False
+
+    def require_config(self) -> TranslationConfig:
+        """Load API settings only when this stage actually has work to do."""
+        if self.config_loader is not None:
+            config = self.config_loader()
+            self.config = config
+            self.config_loader = None
+        return self.config
 
 
 def stage_prefix(label: str | None) -> str:
@@ -44,9 +55,33 @@ def ensure_source_subtitle(
     label: str | None = "[1/3]",
 ) -> Path:
     prefix = stage_prefix(label)
+    source = resolve_source_subtitle(
+        video,
+        subtitle=subtitle,
+        output_dir=output_dir,
+        stage=stage,
+        dry_run=dry_run,
+        prefix=prefix,
+    )
+    if not dry_run and not stage.skip_transcript_check:
+        report = check_transcript(source, language=stage.language)
+        if report:
+            raise TranscribeError(f"{report}\nStopping before the steps that cost time.")
+    return source
+
+
+def resolve_source_subtitle(
+    video: Path,
+    *,
+    subtitle: Path | None,
+    output_dir: Path,
+    stage: TranscribeStage,
+    dry_run: bool,
+    prefix: str,
+) -> Path:
     if subtitle is not None:
         if not subtitle.is_file():
-            raise SystemExit(f"Subtitle file not found: {subtitle}")
+            raise TranscribeError(f"Subtitle file not found: {subtitle}")
         print(f"{prefix}Source subtitle: reuse {subtitle}")
         return subtitle
 
@@ -97,7 +132,7 @@ def ensure_translated_subtitle(
     return translate_subtitle_file(
         input_path=source_subtitle,
         output_path=output_path,
-        config=stage.config,
+        config=stage.require_config(),
         debug_dir=stage.debug_dir,
         resume=stage.resume,
         dry_run=dry_run,

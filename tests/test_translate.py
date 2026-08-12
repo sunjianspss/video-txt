@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import io
 import json
+import urllib.error
 
 import pytest
 
+from video_txt import translate as translate_module
 from video_txt.subtitles import SubtitleCue, parse_srt_text
 from video_txt.translate import (
     ApiHttpError,
     ApiNetworkError,
     ContextCue,
+    JsonModeState,
     PartialStore,
     ResponseFormatError,
     TranslationConfig,
@@ -21,6 +25,7 @@ from video_txt.translate import (
     is_retryable,
     parse_translation_json,
     partial_path_for,
+    post_chat_completion,
     strip_code_fence,
 )
 
@@ -146,6 +151,67 @@ def test_partial_path_and_meta_shape(tmp_path):
     )
     assert meta["cue_count"] == 1
     assert meta["model"] == "test-model"
+
+
+@pytest.mark.parametrize(
+    ("setting", "changed"),
+    [
+        ("base_url", "https://other.example.test"),
+        ("source_language", "Japanese"),
+        ("preserve_terms", ["MCP"]),
+        ("note", "keep it formal"),
+        ("batch_chars", 100),
+        ("context_cues", 0),
+    ],
+)
+def test_partial_meta_changes_with_every_output_affecting_setting(setting, changed):
+    cues = parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\none")
+
+    original = build_partial_meta(cues, make_config())
+    modified = build_partial_meta(cues, make_config(**{setting: changed}))
+
+    assert modified != original
+
+
+def test_json_mode_rejection_falls_back_even_if_another_request_disabled_the_shared_state(
+    monkeypatch,
+):
+    """Every request that carried response_format must handle its own rejection."""
+    state = JsonModeState()
+    payloads: list[dict] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"choices": [{"message": {"content": "ok"}}]}'
+
+    def fake_urlopen(request, **_kwargs):
+        payload = json.loads(request.data)
+        payloads.append(payload)
+        if "response_format" in payload:
+            # Simulate a sibling request receiving the same 400 first.
+            state.disable()
+            raise urllib.error.HTTPError(
+                request.full_url,
+                400,
+                "unsupported",
+                {},
+                io.BytesIO(b"response_format is not supported"),
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+
+    response = post_chat_completion(config=make_config(), messages=[], json_mode=state)
+
+    assert response["choices"][0]["message"]["content"] == "ok"
+    assert "response_format" in payloads[0]
+    assert "response_format" not in payloads[1]
 
 
 def test_apply_translations_keeps_empty_cues_and_requires_the_rest():

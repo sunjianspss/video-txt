@@ -98,6 +98,20 @@ def test_hard_mux_command_carries_encoder_settings():
     assert command[command.index("-c:a") + 1] == "copy"
 
 
+def test_hard_mux_command_picks_its_streams_rather_than_letting_ffmpeg_choose():
+    """A source subtitle track ffmpeg selects for itself fails a burn it has no part in."""
+    command = build_mux_command(
+        make_options(mux_mode="hard"),
+        ffmpeg_path="/bin/ffmpeg",
+        subtitle_for_mux=Path("/v/clip.zh.normal.ass"),
+    )
+    assert [command[index + 1] for index, arg in enumerate(command) if arg == "-map"] == [
+        "0:v:0",
+        "0:a?",
+    ]
+    assert "-sn" in command
+
+
 def test_hard_mux_command_skips_crf_for_other_encoders():
     command = build_mux_command(
         make_options(mux_mode="hard", video_codec="hevc_videotoolbox"),

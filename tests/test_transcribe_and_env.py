@@ -6,7 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from video_txt.env import load_secrets_file, parse_secrets_text, resolve_api_key
+from video_txt.env import (
+    CredentialError,
+    parse_secrets_text,
+    read_secrets_file,
+    resolve_api_key,
+    resolve_optional_key,
+)
 from video_txt.transcribe import (
     TranscribeError,
     TranscribeOptions,
@@ -94,47 +100,60 @@ def test_parse_secrets_text_handles_export_quotes_and_comments():
     }
 
 
-def test_load_secrets_file_fills_only_missing_variables(tmp_path, monkeypatch):
+def test_the_shell_wins_over_the_secrets_file(tmp_path, monkeypatch):
     secrets = tmp_path / "secrets"
     secrets.write_text("export A_KEY=from-file\nexport B_KEY=from-file\n", encoding="utf-8")
+    secrets.chmod(0o600)
     monkeypatch.setenv("A_KEY", "from-shell")
     monkeypatch.delenv("B_KEY", raising=False)
 
-    loaded = load_secrets_file(secrets)
-    assert loaded == ["B_KEY"]
     assert resolve_api_key("A_KEY", secrets_file=secrets) == "from-shell"
     assert resolve_api_key("B_KEY", secrets_file=secrets) == "from-file"
 
 
-def test_load_secrets_file_tolerates_a_missing_file(tmp_path):
-    assert load_secrets_file(tmp_path / "nope") == []
+def test_a_key_that_was_read_is_not_handed_to_every_subprocess(tmp_path, monkeypatch):
+    """Only the lookup that asked for a key gets it; ffmpeg and whisper do not."""
+    secrets = tmp_path / "secrets"
+    secrets.write_text("export WANTED_KEY=v\nexport UNRELATED_KEY=v\n", encoding="utf-8")
+    secrets.chmod(0o600)
+    monkeypatch.delenv("WANTED_KEY", raising=False)
+    monkeypatch.delenv("UNRELATED_KEY", raising=False)
+
+    assert resolve_api_key("WANTED_KEY", secrets_file=secrets) == "v"
+    assert "WANTED_KEY" not in os.environ
+    assert "UNRELATED_KEY" not in os.environ
+
+
+def test_read_secrets_file_tolerates_a_missing_file(tmp_path):
+    assert read_secrets_file(tmp_path / "nope") == {}
+
+
+def test_an_optional_key_that_is_nowhere_comes_back_empty(tmp_path, monkeypatch):
+    monkeypatch.delenv("HF_TOKEN", raising=False)
+    assert resolve_optional_key("HF_TOKEN", secrets_file=tmp_path / "nope") == ""
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
-def test_load_secrets_file_warns_about_group_readable_permissions(tmp_path, monkeypatch, capsys):
+def test_read_secrets_file_refuses_group_readable_permissions(tmp_path):
     secrets = tmp_path / "secrets"
     secrets.write_text("export PERM_TEST_KEY=v\n", encoding="utf-8")
     secrets.chmod(0o644)
-    monkeypatch.setenv("PERM_TEST_KEY", "already-set")
 
-    load_secrets_file(secrets)
-    err = capsys.readouterr().err
-    assert "mode 644" in err
-    assert f"chmod 600 {secrets}" in err
+    with pytest.raises(CredentialError, match=r"mode 644.*chmod 600"):
+        read_secrets_file(secrets)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
-def test_load_secrets_file_stays_quiet_for_owner_only_permissions(tmp_path, monkeypatch, capsys):
+def test_read_secrets_file_stays_quiet_for_owner_only_permissions(tmp_path, capsys):
     secrets = tmp_path / "secrets"
     secrets.write_text("export PERM_TEST_KEY=v\n", encoding="utf-8")
     secrets.chmod(0o600)
-    monkeypatch.setenv("PERM_TEST_KEY", "already-set")
 
-    load_secrets_file(secrets)
+    read_secrets_file(secrets)
     assert capsys.readouterr().err == ""
 
 
 def test_resolve_api_key_explains_how_to_set_it(tmp_path, monkeypatch):
     monkeypatch.delenv("MISSING_KEY", raising=False)
-    with pytest.raises(SystemExit, match="export MISSING_KEY"):
+    with pytest.raises(CredentialError, match="export MISSING_KEY"):
         resolve_api_key("MISSING_KEY", secrets_file=tmp_path / "nope")
