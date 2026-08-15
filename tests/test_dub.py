@@ -19,9 +19,12 @@ from video_txt.dub import (
     default_audio_output,
     default_dubbed_output,
     fit_subtitle_to_timeline,
+    has_speakable_text,
     measure_units,
     partial_clip_path,
     report_cache,
+    respeak_overruns,
+    respoken_rate,
     run_dub,
     segment_filename,
     source_texts_by_position,
@@ -149,9 +152,9 @@ def test_a_line_said_twice_is_synthesized_once(tmp_path, monkeypatch):
     """Two workers racing to write the one clip they share would clobber each other."""
     asked: list[list[str]] = []
 
-    def fake_online(pending, _options):
-        asked.append([text for text, _, _ in pending])
-        for _, _, path in pending:
+    def fake_online(pending, _options, **_kwargs):
+        asked.append([text for text, _, _, _ in pending])
+        for _, _, path, _ in pending:
             path.write_bytes(b"mp3")
 
     monkeypatch.setattr(dub_module, "synthesize_online", fake_online)
@@ -340,6 +343,7 @@ def dub_with_fakes(monkeypatch, tmp_path, **overrides) -> Path:
         "synthesize_segments",
         lambda lines, *_args, **_kwargs: [Path(f"/cache/{position}.mp3") for position, _ in lines],
     )
+    monkeypatch.setattr(dub_module, "probe_durations", lambda paths, **_kwargs: [0.5] * len(paths))
     monkeypatch.setattr(dub_module, "probe_duration", lambda *_args, **_kwargs: 10.0)
     monkeypatch.setattr(dub_module, "render_audio_track", fake_render)
     monkeypatch.setattr(
@@ -371,6 +375,56 @@ def test_a_voice_track_the_caller_named_is_never_removed(monkeypatch, tmp_path):
     assert dub_with_fakes(monkeypatch, tmp_path, audio_output=chosen).is_file()
 
 
+def test_has_speakable_text_tells_words_from_held_pauses():
+    assert has_speakable_text("你好。")
+    assert has_speakable_text("OK!")
+    assert has_speakable_text("42")
+    assert not has_speakable_text("……")
+    assert not has_speakable_text("...")
+    assert not has_speakable_text("♪ ♪")
+    assert not has_speakable_text("- ?!")
+
+
+def test_lines_with_no_words_keep_their_subtitle_but_get_no_voice_clip(
+    monkeypatch, tmp_path, capsys
+):
+    """Real subtitles mark pauses with '...' and songs with musical notes.
+    edge-tts answers those with a NoAudioReceived error, which must not bring
+    down a run that has hundreds of good lines behind it."""
+    spoken: list[str] = []
+
+    def fake_synthesize(lines, *_args, **_kwargs):
+        spoken.extend(text for _, text in lines)
+        return [Path(f"/cache/{position}.mp3") for position, _ in lines]
+
+    def fake_render(segments, *, output_path, **_kwargs):
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(b"wav")
+        return [PlacedSegment(start=0.0, duration=1.0, tempo=1.0, overflow=0.0) for _ in segments]
+
+    subtitle = tmp_path / "clip.zh.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n第一句。\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\n……\n\n"
+        "3\n00:00:04,000 --> 00:00:05,000\n♪ ♪\n\n"
+        "4\n00:00:06,000 --> 00:00:07,000\n第二句。\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(dub_module, "find_ffmpeg", lambda **_kwargs: "ffmpeg")
+    monkeypatch.setattr(dub_module, "synthesize_segments", fake_synthesize)
+    monkeypatch.setattr(dub_module, "probe_durations", lambda paths, **_kwargs: [0.5] * len(paths))
+    monkeypatch.setattr(dub_module, "probe_duration", lambda *_args, **_kwargs: 10.0)
+    monkeypatch.setattr(dub_module, "render_audio_track", fake_render)
+    monkeypatch.setattr(
+        dub_module.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0)
+    )
+
+    run_dub(make_options(subtitle_input=subtitle, video_output=tmp_path / "clip.zh-dubbed.mp4"))
+
+    assert spoken == ["第一句。", "第二句。"]
+    assert "Leaving 2 line(s) with no words unvoiced" in capsys.readouterr().out
+
+
 def test_a_folder_named_for_the_output_is_made_before_ffmpeg_needs_it(monkeypatch, tmp_path):
     """Rendering the voice track elsewhere leaves nobody else to create the folder,
     and ffmpeg only reports it as 'No such file or directory' once the work is done."""
@@ -384,6 +438,125 @@ def test_a_folder_named_for_the_output_is_made_before_ffmpeg_needs_it(monkeypatc
     )
 
     assert destination.is_dir()
+
+
+def test_respoken_rate_leaves_fitting_and_barely_overrunning_clips_alone():
+    assert respoken_rate(1.0, 2.0, base_rate="+0%") is None
+    assert respoken_rate(2.05, 2.0, base_rate="+0%") is None
+    assert respoken_rate(1.0, 0.0, base_rate="+0%") is None
+
+
+def test_respoken_rate_rounds_up_to_the_next_step():
+    """Up, because a clip a hair under its slot fits and one a hair over is stretched.
+    The steps keep a rerun's rates identical, so it lands on the same cached clips."""
+    assert respoken_rate(2.21, 2.0, base_rate="+0%") == "+15%"
+    assert respoken_rate(2.3, 2.0, base_rate="+0%") == "+15%"
+
+
+def test_respoken_rate_multiplies_the_rate_the_clip_was_already_spoken_at():
+    # At +10% the clip is still 1.2x too long: 1.1 * 1.2 = 1.32, next step up 1.35.
+    assert respoken_rate(2.4, 2.0, base_rate="+10%") == "+35%"
+
+
+def test_respoken_rate_stops_where_fast_speech_stops_sounding_like_speech():
+    assert respoken_rate(10.0, 2.0, base_rate="+0%") == "+60%"
+    # Already spoken at the cap, so there is nothing faster to ask for.
+    assert respoken_rate(10.0, 2.0, base_rate="+60%") is None
+
+
+def test_respeak_speaks_only_the_overrunning_clips_again(tmp_path, monkeypatch):
+    asked: list[tuple[list[str], list[str] | None]] = []
+
+    def fake_synthesize(lines, _options, _cache_dir, *, rates=None, **_kwargs):
+        asked.append(([text for _, text in lines], rates))
+        return [
+            Path(f"/cache/{position}-at-{rate}.mp3")
+            for (position, _), rate in zip(lines, rates, strict=True)
+        ]
+
+    monkeypatch.setattr(dub_module, "synthesize_segments", fake_synthesize)
+    monkeypatch.setattr(
+        dub_module, "probe_durations", lambda paths, **_kwargs: [5.0, 0.5, 0.5][: len(paths)]
+    )
+    cues = numbered(TIMED)
+    paths = [Path(f"/cache/{position}.mp3") for position, _ in cues]
+
+    respoken, count = respeak_overruns(
+        cues, paths, make_options(), tmp_path, plan=None, ffmpeg_path="ffmpeg"
+    )
+
+    # The first line has 3.95 s of room and takes 5.0 s: 1.27x, spoken again at +30%.
+    assert count == 1
+    assert asked == [(["first"], ["+30%"])]
+    assert respoken[0].name == "1-at-+30%.mp3"
+    assert respoken[1:] == paths[1:]
+
+
+def test_cloned_clips_turn_their_respeak_rate_into_a_speed(monkeypatch, tmp_path):
+    captured: dict[str, list] = {}
+
+    def fake_clips(jobs, *, options, cache_dir):
+        captured["jobs"] = jobs
+
+    monkeypatch.setattr(dub_module, "synthesize_clips", fake_clips)
+    reference = Reference(speaker="", audio=Path("/ref.wav"))
+    voice = VoiceChoice(name="main@model", reference=reference)
+    options = make_options(engine="index-tts", clone=CloneOptions(engine="index-tts", model="/m"))
+
+    dub_module.synthesize_locally(
+        [
+            ("你好", voice, tmp_path / "a.wav", "+30%"),
+            ("再见", voice, tmp_path / "b.wav", "+0%"),
+        ],
+        options,
+        cache_dir=tmp_path,
+    )
+
+    assert [job.speed for job in captured["jobs"]] == [pytest.approx(1.3), pytest.approx(1.0)]
+
+
+def test_clips_respoken_at_different_rates_go_to_the_engine_as_one_batch(tmp_path, monkeypatch):
+    """A cloning model takes tens of seconds to load, so the re-speak must not
+    split into one worker run per rate. Every job carries its own rate instead."""
+    calls: list[list[tuple[str, str]]] = []
+
+    def fake_synthesize(lines, _options, _cache_dir, *, rates=None, **_kwargs):
+        calls.append([(text, rate) for (_, text), rate in zip(lines, rates, strict=True)])
+        return [
+            Path(f"/cache/{position}-at-{rate}.mp3")
+            for (position, _), rate in zip(lines, rates, strict=True)
+        ]
+
+    monkeypatch.setattr(dub_module, "synthesize_segments", fake_synthesize)
+    monkeypatch.setattr(
+        dub_module, "probe_durations", lambda paths, **_kwargs: [5.0, 7.0, 0.5][: len(paths)]
+    )
+    cues = numbered(TIMED)
+    paths = [Path(f"/cache/{position}.mp3") for position, _ in cues]
+
+    _, count = respeak_overruns(
+        cues, paths, make_options(), tmp_path, plan=None, ffmpeg_path="ffmpeg"
+    )
+
+    # 5.0 s into 3.95 s of room is 1.27x -> +30%; 7.0 s into 4.95 s is 1.42x -> +45%.
+    assert count == 2
+    assert len(calls) == 1
+    assert [rate for _, rate in calls[0]] == ["+30%", "+45%"]
+
+
+def test_a_dub_with_nothing_overrunning_synthesizes_nothing_twice(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        dub_module,
+        "synthesize_segments",
+        lambda *_args, **_kwargs: pytest.fail("every clip already fits its slot"),
+    )
+    monkeypatch.setattr(dub_module, "probe_durations", lambda paths, **_kwargs: [0.5] * len(paths))
+    cues = numbered(TIMED)
+    paths = [Path(f"/cache/{position}.mp3") for position, _ in cues]
+
+    assert respeak_overruns(
+        cues, paths, make_options(), tmp_path, plan=None, ffmpeg_path="ffmpeg"
+    ) == (paths, 0)
 
 
 def stocked_cache(tmp_path) -> tuple[Path, Path]:
@@ -543,6 +716,28 @@ def test_dub_mux_command_replaces_the_audio_track_by_default():
     assert command[command.index("-movflags") + 1] == "+faststart"
 
 
+def test_every_dub_comes_out_equally_loud():
+    """The engines level their clips differently; the mix is where that gets evened out."""
+    replaced = build_dub_mux_command(
+        make_options(),
+        ffmpeg_path="/bin/ffmpeg",
+        audio_path=Path("/videos/clip.dub.wav"),
+        keep_bgm=False,
+    )
+    mixed = build_dub_mux_command(
+        make_options(),
+        ffmpeg_path="/bin/ffmpeg",
+        audio_path=Path("/videos/clip.dub.wav"),
+        keep_bgm=True,
+    )
+
+    assert replaced[replaced.index("-filter:a") + 1].startswith("loudnorm=")
+    assert "loudnorm=" in mixed[mixed.index("-filter_complex") + 1]
+    # loudnorm works at 192 kHz internally; unpinned, that reaches the encoder.
+    for command in (replaced, mixed):
+        assert command[command.index("-ar") + 1] == "48000"
+
+
 def test_dub_mux_command_mixes_the_original_audio_when_keeping_bgm():
     command = build_dub_mux_command(
         make_options(bgm_volume=0.2),
@@ -551,9 +746,44 @@ def test_dub_mux_command_mixes_the_original_audio_when_keeping_bgm():
         keep_bgm=True,
     )
     graph = command[command.index("-filter_complex") + 1]
-    assert "volume=0.200" in graph
-    assert "amix=inputs=2:duration=first:normalize=0[aout]" in graph
+    assert graph.startswith("[0:a]volume=0.200")
+    assert "amix=inputs=2:duration=first:normalize=0[mix]" in graph
     assert "[aout]" in command
+
+
+def test_the_whole_original_mix_defaults_to_quiet_and_a_separated_one_to_full_volume():
+    """The original mix still has its speech in it; a separated background does not."""
+    whole = build_dub_mux_command(
+        make_options(),
+        ffmpeg_path="/bin/ffmpeg",
+        audio_path=Path("/videos/clip.dub.wav"),
+        keep_bgm=True,
+    )
+    separated = build_dub_mux_command(
+        make_options(separate_bgm=True),
+        ffmpeg_path="/bin/ffmpeg",
+        audio_path=Path("/videos/clip.dub.wav"),
+        keep_bgm=True,
+        bgm_path=Path("/videos/clip.dub-cache/bgm/no_vocals.flac"),
+    )
+
+    assert whole[whole.index("-filter_complex") + 1].startswith("[0:a]volume=0.150")
+    graph = separated[separated.index("-filter_complex") + 1]
+    assert graph.startswith("[2:a]volume=1.000")
+    assert "/videos/clip.dub-cache/bgm/no_vocals.flac" in separated
+
+
+def test_the_subtitle_track_moves_over_when_a_background_file_is_added():
+    command = build_dub_mux_command(
+        make_options(soft_subtitle=True),
+        ffmpeg_path="/bin/ffmpeg",
+        audio_path=Path("/videos/clip.dub.wav"),
+        keep_bgm=True,
+        bgm_path=Path("/videos/bgm.flac"),
+    )
+    assert command.count("-i") == 4
+    assert "3:0" in command
+    assert "2:0" not in command
 
 
 def test_dub_mux_command_can_add_the_subtitle_track():

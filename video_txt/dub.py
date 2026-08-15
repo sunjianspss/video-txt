@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
+import re
 import shutil
 import subprocess
 import sys
@@ -26,6 +28,7 @@ from .clone import (
     CloneOptions,
     build_references,
     resolve_model,
+    speed_from_rate,
     synthesize_clips,
 )
 from .constants import DEFAULT_LANGUAGE_CODE, DEFAULT_TARGET_LANGUAGE
@@ -45,9 +48,11 @@ from .media import (
 )
 from .mux import container_arguments, subtitle_track_arguments
 from .parallel import map_in_parallel
+from .separate import ensure_instrumental, require_demucs, separated_bgm_path
 from .subtitles import SubtitleCue, language_suffix, parse_srt, write_srt
 from .timeline import (
     build_segments,
+    compute_slots,
     group_cues_into_sentences,
     merge_cues,
     render_audio_track,
@@ -73,6 +78,28 @@ CLIP_PREFIX = "clip-"
 CLIP_SUFFIXES = (".mp3", ".aiff", ".wav")
 PARTIAL_SUFFIX = ".part"
 
+# Engines that can be asked for a faster reading of one line. The others fall
+# back to stretching the waveform, which is what the re-speak exists to avoid.
+# edge-tts takes a rate flag; the cloning engines take a speed multiplier per
+# clip (IndexTTS spells it duration_factor, natively duration-controlled).
+RESPEAK_ENGINES = ("edge-tts", *CLONE_ENGINES)
+# A stretch this small is inaudible; a new clip would buy nothing.
+RESPEAK_TOLERANCE = 1.05
+# Rates come in these steps so a rerun lands on the same cached clips.
+RESPEAK_STEP = 0.05
+# Faster than this stops sounding like speech; atempo covers what is left.
+MAX_RESPEAK_SPEED = 1.6
+
+# EBU R128 for online speech: every dub comes out equally loud, however the
+# engine levelled its clips.
+LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
+# loudnorm works internally at 192 kHz and would hand that to the encoder.
+OUTPUT_SAMPLE_RATE = "48000"
+# The whole original mix has to sit far under the dub or its speech fights the
+# new one; a separated background has no speech left and keeps its own balance.
+DEFAULT_BGM_VOLUME = 0.15
+DEFAULT_SEPARATED_BGM_VOLUME = 1.0
+
 
 class DubError(RuntimeError):
     pass
@@ -92,9 +119,10 @@ class DubOptions:
     rate: str = "+0%"
     max_atempo: float = 1.35
     keep_bgm: bool = False
+    separate_bgm: bool = False
     keep_audio: bool = False
     prune_cache: bool = False
-    bgm_volume: float = 0.15
+    bgm_volume: float | None = None
     soft_subtitle: bool = False
     language_code: str = DEFAULT_LANGUAGE_CODE
     concurrency: int = 4
@@ -153,6 +181,7 @@ def build_tts_command(
     text: str,
     output_path: Path,
     voice: str | None = None,
+    rate: str | None = None,
 ) -> list[str]:
     name = resolve_voice_name(options.engine, voice or options.voice)
     # A translated line may well open with a dash. Both engines would read that
@@ -163,7 +192,7 @@ def build_tts_command(
         *launcher,
         "--voice",
         name,
-        f"--rate={options.rate}",
+        f"--rate={rate or options.rate}",
         f"--text={text}",
         "--write-media",
         str(output_path),
@@ -192,6 +221,17 @@ def is_clip(path: Path) -> bool:
     return path.name.removesuffix(PARTIAL_SUFFIX).endswith(CLIP_SUFFIXES)
 
 
+def has_speakable_text(text: str) -> bool:
+    """Whether a TTS engine can make any sound out of this line.
+
+    Real subtitles carry lines with no words in them -- "..." for a pause,
+    musical notes around a song. edge-tts answers those with a NoAudioReceived
+    error that would stop the whole run. Such a line still shows on screen as a
+    subtitle; it just must not become a voice clip.
+    """
+    return re.search(r"\w", text) is not None
+
+
 def segment_filename(engine: str, text: str, voice: str, rate: str) -> str:
     """Name a clip after what is in it, and nothing else.
 
@@ -205,33 +245,43 @@ def segment_filename(engine: str, text: str, voice: str, rate: str) -> str:
 
 
 def synthesize_locally(
-    pending: list[tuple[str, VoiceChoice, Path]], options: DubOptions, *, cache_dir: Path
+    pending: list[tuple[str, VoiceChoice, Path, str]], options: DubOptions, *, cache_dir: Path
 ) -> None:
-    """Hand the batch to a cloning model, which is loaded once for all of it."""
+    """Hand the batch to a cloning model, which is loaded once for all of it.
+
+    All of it includes the re-spoken clips: every job carries its own speed, so
+    mixed rates cost one model load, not one per rate."""
     if options.clone is None:
         raise DubError(f"--tts-engine {options.engine} needs voice cloning options.")
-    unreferenced = [voice.name for _, voice, _ in pending if voice.reference is None]
+    unreferenced = [voice.name for _, voice, _, _ in pending if voice.reference is None]
     if unreferenced:
         raise DubError(f"No reference clip to clone {unreferenced[0]} from.")
     jobs = [
-        CloneJob(text=text, output=path, reference=voice.reference)
-        for text, voice, path in pending
+        CloneJob(text=text, output=path, reference=voice.reference, speed=speed_from_rate(rate))
+        for text, voice, path, rate in pending
         if voice.reference is not None
     ]
     synthesize_clips(jobs, options=options.clone, cache_dir=cache_dir)
 
 
-def synthesize_online(pending: list[tuple[str, VoiceChoice, Path]], options: DubOptions) -> None:
+def synthesize_online(
+    pending: list[tuple[str, VoiceChoice, Path, str]], options: DubOptions
+) -> None:
     launcher = tts_launcher(options.engine)
     done = 0
     progress_lock = threading.Lock()
 
-    def synthesize(job: tuple[str, VoiceChoice, Path]) -> None:
+    def synthesize(job: tuple[str, VoiceChoice, Path, str]) -> None:
         nonlocal done
-        text, voice, path = job
+        text, voice, path, rate = job
         temp_path = partial_clip_path(path)
         command = build_tts_command(
-            options, launcher=launcher, text=text, output_path=temp_path, voice=voice.name
+            options,
+            launcher=launcher,
+            text=text,
+            output_path=temp_path,
+            voice=voice.name,
+            rate=rate,
         )
         completed = subprocess.run(command, capture_output=True, text=True)
         if completed.returncode != 0 or not temp_path.is_file():
@@ -254,24 +304,27 @@ def synthesize_segments(
     cache_dir: Path,
     *,
     plan: VoicePlan | None = None,
+    rate: str | None = None,
+    rates: list[str] | None = None,
 ) -> list[Path]:
     speaking = plan or VoicePlan(
         default=VoiceChoice(name=resolve_voice_name(options.engine, options.voice))
     )
+    line_rates = rates or [rate or options.rate] * len(lines)
     cache_dir.mkdir(parents=True, exist_ok=True)
     voices = [speaking.for_position(position) for position, _ in lines]
     paths = [
-        cache_dir / segment_filename(options.engine, text, voice.identity, options.rate)
-        for (_, text), voice in zip(lines, voices, strict=True)
+        cache_dir / segment_filename(options.engine, text, voice.identity, line_rate)
+        for (_, text), voice, line_rate in zip(lines, voices, line_rates, strict=True)
     ]
 
     # Keyed by path so a line said twice is synthesized once: two workers racing
     # to write the one clip they now share would clobber each other.
-    wanted: dict[Path, tuple[str, VoiceChoice, Path]] = {}
-    for (_, text), voice, path in zip(lines, voices, paths, strict=True):
+    wanted: dict[Path, tuple[str, VoiceChoice, Path, str]] = {}
+    for (_, text), voice, path, line_rate in zip(lines, voices, paths, line_rates, strict=True):
         if path.is_file() and path.stat().st_size > 0:
             continue
-        wanted.setdefault(path, (text, voice, path))
+        wanted.setdefault(path, (text, voice, path, line_rate))
 
     pending = list(wanted.values())
     cached = sum(1 for path in paths if path not in wanted)
@@ -280,7 +333,7 @@ def synthesize_segments(
     if not pending:
         return paths
 
-    listed = ", ".join(sorted({voice.name for _, voice, _ in pending}))
+    listed = ", ".join(sorted({voice.name for _, voice, _, _ in pending}))
     print(f"Synthesizing {len(pending)} voice clips with {options.engine} ({listed})...")
     if options.engine in CLONE_ENGINES:
         synthesize_locally(pending, options, cache_dir=cache_dir)
@@ -297,6 +350,60 @@ def probe_durations(
         lambda path: spoken_duration(path, ffmpeg_path=ffmpeg_path, sample_rate=sample_rate),
         workers=workers,
     )
+
+
+def respoken_rate(natural: float, slot: float, *, base_rate: str) -> str | None:
+    """The rate to say an overrunning clip again at, or None to leave it alone.
+
+    The clip was spoken at base_rate and still needs natural/slot more speed, so
+    the two multiply. The result is rounded up to the next step — up, because a
+    clip that lands a hair short of its slot fits, and one a hair over is back
+    to being stretched.
+    """
+    if slot <= 0 or natural <= slot * RESPEAK_TOLERANCE:
+        return None
+    needed = speed_from_rate(base_rate) * (natural / slot)
+    total = min(math.ceil(needed / RESPEAK_STEP - 1e-9) * RESPEAK_STEP, MAX_RESPEAK_SPEED)
+    if total <= speed_from_rate(base_rate) + 1e-9:
+        return None
+    return f"{round((total - 1.0) * 100):+d}%"
+
+
+def respeak_overruns(
+    cues: list[tuple[int, SubtitleCue]],
+    paths: list[Path],
+    options: DubOptions,
+    cache_dir: Path,
+    *,
+    plan: VoicePlan | None,
+    ffmpeg_path: str,
+) -> tuple[list[Path], int]:
+    """Have the engine say the clips that overrun their slot again, faster.
+
+    A clip that does not fit gets sped up one way or the other. Asked to speak
+    faster, the engine delivers naturally quick speech; stretching the recorded
+    waveform afterwards is where the mechanical sound comes from. So atempo is
+    kept for the leftovers the rate cap puts out of reach.
+    """
+    slots = compute_slots(cues)
+    durations = probe_durations(
+        paths, ffmpeg_path=ffmpeg_path, sample_rate=options.sample_rate, workers=options.concurrency
+    )
+    needed: dict[int, str] = {}
+    for index, (natural, slot) in enumerate(zip(durations, slots, strict=True)):
+        rate = respoken_rate(natural, slot, base_rate=options.rate)
+        if rate is not None:
+            needed[index] = rate
+    if not needed:
+        return paths, 0
+
+    print(f"Speaking {len(needed)} overrunning clip(s) again at a faster rate...")
+    lines = [(cues[index][0], cues[index][1].text) for index in needed]
+    faster = synthesize_segments(lines, options, cache_dir, plan=plan, rates=list(needed.values()))
+    respoken = list(paths)
+    for index, path in zip(needed, faster, strict=True):
+        respoken[index] = path
+    return respoken, len(needed)
 
 
 def reference_lines(options: DubOptions) -> list[tuple[int, SubtitleCue]]:
@@ -526,6 +633,19 @@ def has_audio_stream(video: Path, *, ffprobe_path: str) -> bool:
     return bool(output.strip())
 
 
+def resolved_bgm_volume(options: DubOptions, *, separated: bool) -> float:
+    """How loud the background plays, when the flag was left to its default.
+
+    The two backgrounds need very different defaults: the whole original mix
+    still has its speech in it and must sit far under the dub, while a
+    separated background is the original balance minus the voice and can keep
+    the volume its producer already chose.
+    """
+    if options.bgm_volume is not None:
+        return min(max(options.bgm_volume, 0.0), 1.0)
+    return DEFAULT_SEPARATED_BGM_VOLUME if separated else DEFAULT_BGM_VOLUME
+
+
 def build_dub_mux_command(
     options: DubOptions,
     *,
@@ -533,6 +653,7 @@ def build_dub_mux_command(
     audio_path: Path,
     keep_bgm: bool,
     subtitle_path: Path | None = None,
+    bgm_path: Path | None = None,
 ) -> list[str]:
     command = [
         ffmpeg_path,
@@ -542,16 +663,20 @@ def build_dub_mux_command(
         "-i",
         str(audio_path),
     ]
+    if bgm_path is not None:
+        command.extend(["-i", str(bgm_path)])
     if options.soft_subtitle:
         command.extend(["-i", str(subtitle_path or options.subtitle_input)])
 
     if keep_bgm:
-        volume = min(max(options.bgm_volume, 0.0), 1.0)
+        background = "2:a" if bgm_path is not None else "0:a"
+        volume = resolved_bgm_volume(options, separated=bgm_path is not None)
         command.extend(
             [
                 "-filter_complex",
-                f"[0:a]volume={volume:.3f}[bg];[1:a]volume=1.0[vo];"
-                "[bg][vo]amix=inputs=2:duration=first:normalize=0[aout]",
+                f"[{background}]volume={volume:.3f}[bg];[1:a]volume=1.0[vo];"
+                "[bg][vo]amix=inputs=2:duration=first:normalize=0[mix];"
+                f"[mix]{LOUDNORM_FILTER}[aout]",
                 "-map",
                 "0:v:0",
                 "-map",
@@ -559,16 +684,21 @@ def build_dub_mux_command(
             ]
         )
     else:
-        command.extend(["-map", "0:v:0", "-map", "1:a:0"])
+        command.extend(["-map", "0:v:0", "-map", "1:a:0", "-filter:a", LOUDNORM_FILTER])
 
     if options.soft_subtitle:
+        subtitle_input = 3 if bgm_path is not None else 2
         command.extend(
             subtitle_track_arguments(
-                options.video_output, stream="2:0", language_code=options.language_code
+                options.video_output,
+                stream=f"{subtitle_input}:0",
+                language_code=options.language_code,
             )
         )
 
-    command.extend(["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest"])
+    command.extend(
+        ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-ar", OUTPUT_SAMPLE_RATE, "-shortest"]
+    )
     command.extend(container_arguments(options.video_output))
     command.append(str(options.video_output))
     return command
@@ -597,6 +727,10 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
             print("Voice clips: one per sentence, merged from the subtitle lines")
         else:
             print("Voice clips: one per subtitle line")
+        if options.engine in RESPEAK_ENGINES:
+            print("Overrunning clips: spoken again at a faster rate before any stretching")
+        if options.separate_bgm:
+            print(f"Background: original audio minus its voices, cached at {cache_dir / 'bgm'}")
         cloning = options.engine in CLONE_ENGINES
         if cloning:
             clone = options.clone or CloneOptions(engine=options.engine)
@@ -628,7 +762,8 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
                     options,
                     ffmpeg_path=ffmpeg_path,
                     audio_path=audio_output,
-                    keep_bgm=options.keep_bgm,
+                    keep_bgm=options.keep_bgm or options.separate_bgm,
+                    bgm_path=separated_bgm_path(cache_dir) if options.separate_bgm else None,
                 )
             )
         )
@@ -642,12 +777,20 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
     # Before any of the work, so a folder that has to be made is not discovered
     # by ffmpeg at the very end of a run that has already synthesized everything.
     options.video_output.parent.mkdir(parents=True, exist_ok=True)
+    if options.separate_bgm:
+        # The separation itself can wait, but a missing dependency must not
+        # surface after minutes of synthesis have already been paid for.
+        require_demucs()
 
     cues = [
         (position, cue)
         for position, cue in enumerate(parse_srt(options.subtitle_input), start=1)
         if not cue.is_empty
     ]
+    unvoiced = sum(1 for _, cue in cues if not has_speakable_text(cue.text))
+    if unvoiced:
+        print(f"Leaving {unvoiced} line(s) with no words unvoiced, e.g. '...' held pauses.")
+        cues = [(position, cue) for position, cue in cues if has_speakable_text(cue.text)]
     if not cues:
         raise DubError(f"No spoken lines found in {options.subtitle_input}")
 
@@ -674,9 +817,14 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
             print(f"Speaking {len(units)} sentences merged from {len(cues)} subtitle lines.")
             cues = units
 
-    paths = synthesize_segments(
+    base_paths = synthesize_segments(
         [(position, cue.text) for position, cue in cues], options, cache_dir, plan=plan
     )
+    paths, respoken = base_paths, 0
+    if options.engine in RESPEAK_ENGINES:
+        paths, respoken = respeak_overruns(
+            cues, base_paths, options, cache_dir, plan=plan, ffmpeg_path=ffmpeg_path
+        )
     segments = build_segments(cues, paths)
     total_duration = probe_duration(options.video_input, ffmpeg_path=ffmpeg_path)
 
@@ -689,14 +837,21 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
         total_duration=total_duration,
         output_path=audio_output,
     )
-    report(placed, segments)
+    report(placed, segments, respoken=respoken)
 
-    keep_bgm = options.keep_bgm
+    keep_bgm = options.keep_bgm or options.separate_bgm
     if keep_bgm and not has_audio_stream(
         options.video_input, ffprobe_path=find_ffprobe(ffmpeg_path)
     ):
-        print("Source video has no audio track, so --keep-bgm has nothing to mix.", file=sys.stderr)
+        flag = "--separate-bgm" if options.separate_bgm else "--keep-bgm"
+        print(f"Source video has no audio track, so {flag} has nothing to mix.", file=sys.stderr)
         keep_bgm = False
+
+    bgm_path = None
+    if options.separate_bgm and keep_bgm:
+        bgm_path = ensure_instrumental(
+            options.video_input, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
+        )
 
     print("Muxing the dubbed voice track into the video...")
     command = build_dub_mux_command(
@@ -705,6 +860,7 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
         audio_path=audio_output,
         keep_bgm=keep_bgm,
         subtitle_path=subtitle_for_mux,
+        bgm_path=bgm_path,
     )
     completed = subprocess.run(command)
     if completed.returncode != 0:
@@ -718,5 +874,7 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
         if size:
             print(f"Removed the {size / 1_048_576:.0f} MB intermediate voice track.")
 
-    report_cache(cache_dir, paths, prune=options.prune_cache)
+    # The base-rate clips a re-speak replaced still time the next run's
+    # measurements, so they count as used and survive --prune-cache.
+    report_cache(cache_dir, [*base_paths, *paths], prune=options.prune_cache)
     return options.video_output

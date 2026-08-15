@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import subprocess
 import wave
+from array import array
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from .subtitles import SubtitleCue, join_text_parts, seconds_to_srt_time
 SAMPLE_WIDTH = 2
 SILENCE_FLOOR = "-45dB"
 SILENCE_CHUNK_FRAMES = 48_000
+EDGE_FADE_SECONDS = 0.008
 
 VOICE_UNITS = ("sentence", "line")
 SENTENCE_ENDINGS = tuple("。！？!?…")
@@ -217,6 +219,26 @@ def spoken_duration(audio_path: Path, *, ffmpeg_path: str, sample_rate: int) -> 
     return len(audio) / (sample_rate * SAMPLE_WIDTH)
 
 
+def soften_edges(pcm: bytes, *, sample_rate: int) -> bytes:
+    """A linear ramp over the first and last few milliseconds of a clip.
+
+    The silence trim cuts wherever the level crosses the floor, which can land
+    mid-waveform; laid onto digital silence that edge plays back as a click.
+    The ramp is too short to hear as a fade.
+    """
+    frames = len(pcm) // SAMPLE_WIDTH
+    ramp = min(int(sample_rate * EDGE_FADE_SECONDS), frames // 2)
+    if ramp <= 0:
+        return pcm
+    samples = array("h")
+    samples.frombytes(pcm)
+    for index in range(ramp):
+        gain = index / ramp
+        samples[index] = int(samples[index] * gain)
+        samples[-1 - index] = int(samples[-1 - index] * gain)
+    return samples.tobytes()
+
+
 def decode_segment(
     segment: Segment, *, ffmpeg_path: str, sample_rate: int, max_atempo: float
 ) -> tuple[bytes, float]:
@@ -227,11 +249,11 @@ def decode_segment(
 
     natural = len(audio) / (sample_rate * SAMPLE_WIDTH)
     if segment.slot <= 0 or natural <= segment.slot:
-        return audio, 1.0
+        return soften_edges(audio, sample_rate=sample_rate), 1.0
 
     tempo = min(natural / segment.slot, max(1.0, max_atempo))
     if tempo <= 1.001:
-        return audio, 1.0
+        return soften_edges(audio, sample_rate=sample_rate), 1.0
 
     stretched = run_audio_filter(
         [
@@ -255,7 +277,7 @@ def decode_segment(
         source=audio,
         label=segment.audio_path.name,
     )
-    return stretched, tempo
+    return soften_edges(stretched, sample_rate=sample_rate), tempo
 
 
 def write_silence(handle: wave.Wave_write, frames: int) -> None:
@@ -313,7 +335,7 @@ def render_audio_track(
     return placed
 
 
-def report(placed: list[PlacedSegment], segments: list[Segment]) -> None:
+def report(placed: list[PlacedSegment], segments: list[Segment], *, respoken: int = 0) -> None:
     stretched = sum(1 for item in placed if item.tempo > 1.001)
     overflowing = [item for item in placed if item.overflow > 0.05]
     drift = max(
@@ -322,7 +344,9 @@ def report(placed: list[PlacedSegment], segments: list[Segment]) -> None:
     )
 
     print(f"Voice clips: {len(placed)}")
-    print(f"Speed-adjusted to fit: {stretched}")
+    if respoken:
+        print(f"Spoken again at a faster rate to fit: {respoken}")
+    print(f"Stretched to fit: {stretched}")
     if overflowing:
         worst = max(item.overflow for item in overflowing)
         print(

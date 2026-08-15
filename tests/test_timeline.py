@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import wave
+from array import array
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ from video_txt.timeline import (
     decode_segment,
     group_cues_into_sentences,
     render_audio_track,
+    soften_edges,
     speaking_budgets,
     spoken_duration,
 )
@@ -199,6 +201,26 @@ def test_decode_segment_measures_the_audio_it_produced_not_the_file(monkeypatch)
     _, tempo = decode_one(slot=1.0)
 
     assert tempo == 1.0
+
+
+def test_soften_edges_ramps_the_clip_ends_without_touching_the_middle():
+    """The silence trim cuts mid-waveform; laid onto digital silence that is a click."""
+    pcm = b"\x00\x40" * 100  # 100 samples of one constant positive value
+    softened = array("h")
+    softened.frombytes(soften_edges(pcm, sample_rate=1000))  # 8-sample ramp
+
+    original = array("h")
+    original.frombytes(pcm)
+    assert len(softened) == len(original)
+    assert softened[0] == 0 and softened[-1] == 0
+    assert 0 < softened[4] < original[4]
+    assert softened[50] == original[50]
+
+
+def test_soften_edges_survives_clips_shorter_than_the_ramp():
+    assert soften_edges(b"", sample_rate=48000) == b""
+    tiny = soften_edges(b"\x00\x40" * 2, sample_rate=48000)
+    assert len(tiny) == 4
 
 
 def test_render_audio_track_streams_gaps_clips_overlaps_and_tail_padding(tmp_path, monkeypatch):

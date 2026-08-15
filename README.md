@@ -44,6 +44,7 @@ uv run video-txt run '/绝对路径/你的视频.mp4' --provider deepseek --mux-
 
 ```bash
 uv sync --extra dub       # 中文配音(edge-tts)
+uv sync --extra separate  # 配音时保留背景音乐和环境声(Demucs 人声分离)
 uv sync --extra mlx       # Apple Silicon GPU 转写,比 CPU 快数倍,另下 1.5G 权重
 uv sync --extra diarize   # 多说话人分离(pyannote)
 uv sync --extra clone     # 原声克隆(F5-TTS)
@@ -135,31 +136,35 @@ uv run video-txt dub "$V" --provider deepseek
 ```
 
 和字幕流程一样先转写、再翻译,然后合成中文语音、按字幕时间轴对齐、混进视频,
-输出 `你的视频.zh-dubbed.mp4`。这个视频之前做过字幕的话,`.srt` 和 `.zh.srt` 直接复用。
+输出 `你的视频.zh-dubbed.mp4`。这个视频之前做过字幕的话,`.srt` 和 `.zh.srt` 直接复用——
+但注意 `dub` 的翻译是按**口语**要求的(念得顺,不是字幕体),想把老的字幕翻译换成口语版,
+加 `--retranslate` 重翻一次。
 
-两个默认值先记住:**默认整轨替换原声**(想保留原声当背景音加 `--keep-bgm`),
+两个默认值先记住:**默认整轨替换原声**(保留背景声的两种方式见下面「常用调整」),
 默认音色是 `zh-CN-XiaoxiaoNeural` 女声。
 
-跑完的报告看这三行:
+跑完的报告看这四行:
 
 | 报告行 | 含义 | 怎么算正常 |
 | --- | --- | --- |
-| `Speed-adjusted to fit` | 有多少句被加速过 | 占比不高就没问题 |
-| `Still longer than their subtitle slot` | 加速到上限仍然超时的句子 | 最好是 0,有几句也听不太出来 |
+| `Spoken again at a faster rate to fit` | 塞不下的句子,自动用更快的语速重说了一遍 | 自动发生,占比不高就没问题 |
+| `Stretched to fit` | 重说后仍差一点,靠拉伸波形补齐的句子 | 越少越好,有几句也听不太出来 |
+| `Still longer than their subtitle slot` | 拉伸到上限仍然超时的句子 | 最好是 0 |
 | `Largest timeline drift` | 整条时间轴最大偏移 | 2 秒以内基本无感,超过会自动提示 |
 
-中文念出来往往比英文长,塞不进原来的时间格子就得加速。漂移大了**优先加 `--rate +10%`,
-别急着调 `--max-atempo`**:前者是让 TTS 一开始就说得快一点,后者是事后把已经录好的波形拉伸,
-机械感主要来自后者。
+中文念出来往往比英文长,塞不进原来的时间格子就得加速。超时的句子会**自动换更快的 TTS
+语速重新合成**——真人式的快语速,不是机械感来源的波形拉伸;拉伸只兜重说仍不够的残余。
+所以一般不用再为漂移手动调参,`--rate +10%` 只在整体都偏慢时才需要。
 
 ### 常用调整
 
 | 想要 | 加这个参数 |
 | --- | --- |
-| 保留原声垫底 | `--keep-bgm`,原声压到 15%,太轻用 `--bgm-volume 0.25` 调 |
+| 只留音乐和环境声(推荐) | `--separate-bgm`,先 `uv sync --extra separate`。Demucs 把原声里的人声抠掉,音乐、掌声、环境声全音量保留,不跟配音打架。首次要下模型、分离要几分钟,结果缓存后重跑秒过 |
+| 保留完整原声垫底 | `--keep-bgm`,整条原声(含原人声)压到 15%,太轻用 `--bgm-volume 0.25` 调 |
 | 换音色 | `--voice zh-CN-YunxiNeural` |
 | 整体语速 | `--rate +10%` 或 `--rate -10%` |
-| 漂移大了想压住 | 先 `--rate +10%`;仍不够再 `--max-atempo 1.6`,默认 1.35 |
+| 漂移大了想压住 | 超时句子已自动重说,一般不用管;真要压再 `--max-atempo 1.6`,默认 1.35 |
 | 让模型把读不完的句子改短 | `--fit-duration`,会改动译文,最后手段 |
 | 顺便挂一条可开关的中文字幕轨 | `--soft-subtitle` |
 | 留下单独的人声音轨 | `--keep-dub-audio`,默认混流后就删 |
@@ -199,25 +204,38 @@ uv run video-txt dub "$V" --provider deepseek --diarize
 
 ### 原声克隆:保留原讲者的声音
 
-`--tts-engine f5-tts` 从原视频里剪一小段这个人的声音当参考,用他自己的音色念中文。
-配上 `--diarize` 就是每个人克隆自己。
+克隆引擎从原视频里剪一小段说话人的声音当参考,用他自己的音色念中文。
+配上 `--diarize` 就是每个人克隆自己——剧集配音里每个角色保持自己的声线。
+
+推荐 **IndexTTS-2**:情感表现力是三个克隆引擎里最强的,而且超时句子的加速走的是模型自己的
+时长控制(说得快,不是事后压缩),几乎听不出赶。它锁死自己的 Python 和 torch 版本,
+所以装在自己的目录里,不进本项目的虚拟环境:
 
 ```bash
-uv sync --extra clone
-uv run video-txt dub "$V" --provider deepseek --diarize --tts-engine f5-tts
+git clone https://github.com/index-tts/index-tts.git ~/tools/index-tts
+cd ~/tools/index-tts && uv sync                # 独立环境,自带 Python 3.11
+uvx --from huggingface-hub hf download IndexTeam/IndexTTS-2.5 --local-dir checkpoints
+
+uv run video-txt dub "$V" --provider deepseek --tts-engine index-tts \
+  --clone-repo ~/tools/index-tts
 ```
+
+`--clone-repo` 指向那个目录就够了:里面的 `.venv` 和 `checkpoints` 都会自动找到。
 
 - 参考音频自动从源语言字幕里剪(3–12 秒连续说话),存进 `你的视频.dub-cache/reference/`。
   想自己指定用 `--clone-reference my.wav`,旁边放一个 `my.txt` 写清楚这段音频说了什么。
-- **慢,而且没法并发。** 先 `--dry-run` 看清楚要合成多少段再开跑,别拿长视频试手。
-- CosyVoice 没上 PyPI,要自己装:`--tts-engine cosyvoice --clone-model <模型目录>
-  --clone-repo <源码目录>`,依赖冲突时用 `--clone-python` 指定它自己虚拟环境的解释器。
+- **慢,而且没法并发。** 本地推理,一集剧大约是实时的三分之一到一半;
+  先 `--dry-run` 看清楚要合成多少段再开跑,别拿长视频试手。
+- 另外两个引擎:`--tts-engine f5-tts` 最省事(`uv sync --extra clone` 装进本项目环境,
+  权重自动下载);CosyVoice 跟 IndexTTS 一样要自己 clone,
+  再加 `--clone-model <模型目录>`,依赖冲突时用 `--clone-python` 指定解释器。
 - 克隆的是真人的声音,用在原讲者没授权的地方之前先想清楚。
 
 ### 缓存
 
 每句语音按内容哈希缓存在 `你的视频.dub-cache/`,重跑只补缺的句子。改 `--keep-bgm`、`--soft-subtitle`
 这类不影响语音本身的参数几乎不花时间;换 `--voice` 或 `--rate` 会让缓存整体失效,等于重新合成一遍。
+`--separate-bgm` 分离出来的背景轨也在这里(`bgm/no_vocals.flac`),`--prune-cache` 不会动它。
 
 哈希只认内容、音色和语速,不认句子的位置:手改译文里的某一句、或者在中间插一句,后面的句子照样
 命中缓存;整片重复的台词(片头片尾语这类)也只合成一次。

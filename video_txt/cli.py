@@ -38,7 +38,13 @@ from .pipeline import (
     run_pipeline,
 )
 from .quality import check_transcript
-from .subtitles import SubtitleFormatError, language_code, translated_subtitle_path
+from .separate import SeparateError
+from .subtitles import (
+    SubtitleFormatError,
+    language_code,
+    language_suffix,
+    translated_subtitle_path,
+)
 from .transcribe import TranscribeError, TranscribeOptions, run_transcribe
 from .translate import (
     TranslationConfig,
@@ -125,6 +131,7 @@ def build_clone_options(
         repo=args.clone_repo,
         device=args.clone_device,
         speed=speed_from_rate(args.rate),
+        lang=language_suffix(args.target_language),
         references=parse_clone_references(parser, args.clone_references),
     )
 
@@ -161,7 +168,11 @@ def validate_translation_numbers(parser: argparse.ArgumentParser, args: argparse
 
 
 def build_translation_config(
-    args: argparse.Namespace, parser: argparse.ArgumentParser, *, require_key: bool
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    require_key: bool,
+    spoken: bool = False,
 ) -> TranslationConfig:
     validate_translation_numbers(parser, args)
     base_url, api_key_env, model = resolve_provider_settings(args, parser)
@@ -174,6 +185,7 @@ def build_translation_config(
         source_language=args.source_language,
         preserve_terms=list(dict.fromkeys([*DEFAULT_TERMS, *args.preserve_term])),
         note=args.note,
+        spoken=spoken,
         batch_chars=args.batch_chars,
         retries=args.retries,
         concurrency=args.concurrency,
@@ -245,6 +257,7 @@ def build_dub_options(
         rate=args.rate,
         max_atempo=args.max_atempo,
         keep_bgm=args.keep_bgm,
+        separate_bgm=args.separate_bgm,
         keep_audio=args.keep_dub_audio,
         prune_cache=args.prune_cache,
         bgm_volume=args.bgm_volume,
@@ -265,6 +278,7 @@ def build_translate_stage(
     *,
     require_key: bool,
     output_path: Path | None,
+    spoken: bool = False,
 ) -> TranslateStage:
     return TranslateStage(
         config=TranslationConfig(
@@ -273,7 +287,9 @@ def build_translate_stage(
             model="",
             target_language=args.target_language,
         ),
-        config_loader=lambda: build_translation_config(args, parser, require_key=require_key),
+        config_loader=lambda: build_translation_config(
+            args, parser, require_key=require_key, spoken=spoken
+        ),
         output_path=output_path,
         debug_dir=resolved(args.debug_dir),
         resume=args.resume,
@@ -323,7 +339,7 @@ def validate_dub_numbers(parser: argparse.ArgumentParser, args: argparse.Namespa
         parser.error(f"--rate must be a signed percentage such as +10%. Got: {args.rate}")
     if args.max_atempo < 1.0:
         parser.error("--max-atempo must be 1.0 or greater: it can only speed a clip up.")
-    if not 0 <= args.bgm_volume <= 1:
+    if args.bgm_volume is not None and not 0 <= args.bgm_volume <= 1:
         parser.error("--bgm-volume must be between 0 and 1")
     if args.tts_concurrency < 1:
         parser.error("--tts-concurrency must be 1 or greater")
@@ -571,6 +587,9 @@ def command_dub(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         parser,
         require_key=not args.dry_run,
         output_path=resolved(args.subtitle_output),
+        # The lines are going to be spoken, so they should read like speech.
+        # An already-translated subtitle is reused as is: --retranslate redoes it.
+        spoken=True,
     )
     translated = ensure_translated_subtitle(
         source_subtitle,
@@ -664,6 +683,7 @@ def main(argv: list[str] | None = None) -> int:
         DubError,
         MediaError,
         MuxError,
+        SeparateError,
         SubtitleFormatError,
         TranscribeError,
         TranslationError,

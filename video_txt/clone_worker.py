@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -21,6 +22,11 @@ PROMPT_SAMPLE_RATE = 16000
 
 class WorkerError(RuntimeError):
     pass
+
+
+def job_speed(job: dict, fallback: float) -> float:
+    """This clip's speed multiplier: its own re-speak speed, or the run's."""
+    return float(job.get("speed") or fallback)
 
 
 class F5Engine:
@@ -53,7 +59,7 @@ class F5Engine:
             ref_text=job["reference_text"],
             gen_text=job["text"],
             file_wave=str(output),
-            speed=self.speed,
+            speed=job_speed(job, self.speed),
             show_info=lambda *_args, **_kwargs: None,
         )
 
@@ -114,7 +120,7 @@ class CosyVoiceEngine:
                 job["reference_text"],
                 self.prompt(job["reference_audio"]),
                 stream=False,
-                speed=self.speed,
+                speed=job_speed(job, self.speed),
             )
         ]
         if not pieces:
@@ -124,12 +130,90 @@ class CosyVoiceEngine:
         )
 
 
-def build_engine(manifest: dict) -> F5Engine | CosyVoiceEngine:
+class IndexTTSEngine:
+    """https://github.com/index-tts/index-tts — cloned and installed by hand.
+
+    Its checkpoints ship an IndexTTS-2.5 loader (infer_v2_5) in newer checkouts
+    and an IndexTTS-2 one (infer_v2) in older ones; both spell the class
+    IndexTTS2 and take the same reference-plus-text call, so the constructor
+    keeps whichever import worked and reads the signatures for the rest.
+    """
+
+    def __init__(self, manifest: dict) -> None:
+        IndexTTS2 = self.import_model()
+        model_dir = Path(manifest["model"])
+        config = model_dir / "config.yaml"
+        if not config.is_file():
+            raise WorkerError(
+                f"IndexTTS weights not found in {model_dir}.\n"
+                "Download them into the checkout:\n"
+                f"  uvx --from huggingface-hub hf download IndexTeam/IndexTTS-2.5 "
+                f"--local-dir {model_dir}"
+            )
+
+        arguments: dict = {"cfg_path": str(config), "model_dir": str(model_dir)}
+        parameters = inspect.signature(IndexTTS2.__init__).parameters
+        # Half precision is what both loaders recommend; they name it differently.
+        if "use_bf16" in parameters:
+            arguments["use_bf16"] = True
+        elif "use_fp16" in parameters:
+            arguments["use_fp16"] = True
+        if manifest.get("device") and "device" in parameters:
+            arguments["device"] = manifest["device"]
+        self.model = IndexTTS2(**arguments)
+        self.infer_parameters = inspect.signature(self.model.infer).parameters
+        self.lang = manifest.get("lang")
+        self.speed = float(manifest.get("speed") or 1.0)
+
+    @staticmethod
+    def import_model() -> type:
+        try:
+            from indextts.infer_v2_5 import IndexTTS2
+        except ImportError:
+            try:
+                from indextts.infer_v2 import IndexTTS2
+            except ImportError as exc:
+                raise WorkerError(
+                    "Missing dependency: indextts.\n"
+                    "Clone https://github.com/index-tts/index-tts and run 'uv sync' "
+                    "inside it, then point at the checkout with --clone-repo "
+                    "/path/to/index-tts. Its own .venv is picked up automatically."
+                ) from exc
+        return IndexTTS2
+
+    def synthesize(self, job: dict, output: Path) -> None:
+        arguments: dict = {
+            "spk_audio_prompt": job["reference_audio"],
+            "text": job["text"],
+            "output_path": str(output),
+        }
+        if "verbose" in self.infer_parameters:
+            arguments["verbose"] = False
+        # IndexTTS-2.5 requires the language; the IndexTTS-2 loader has no
+        # such parameter and reads everything as Chinese or English.
+        if "lang" in self.infer_parameters:
+            if not self.lang:
+                raise WorkerError(
+                    "IndexTTS-2.5 speaks zh, en, ja and es, and the target "
+                    "language is none of those."
+                )
+            arguments["lang"] = self.lang
+        speed = job_speed(job, self.speed)
+        if "duration_factor" in self.infer_parameters and abs(speed - 1.0) > 1e-6:
+            # duration_factor above 1.0 slows the speech down, so a speed
+            # multiplier maps to its reciprocal.
+            arguments["duration_factor"] = min(max(1.0 / speed, 0.5), 2.0)
+        self.model.infer(**arguments)
+
+
+def build_engine(manifest: dict) -> F5Engine | CosyVoiceEngine | IndexTTSEngine:
     engine = manifest["engine"]
     if engine == "f5-tts":
         return F5Engine(manifest)
     if engine == "cosyvoice":
         return CosyVoiceEngine(manifest)
+    if engine == "index-tts":
+        return IndexTTSEngine(manifest)
     raise WorkerError(f"Unknown cloning engine: {engine}")
 
 
@@ -154,6 +238,10 @@ def check_references(jobs: list[dict], *, engine: str) -> None:
 
 
 def run(manifest: dict) -> None:
+    # Torch on Apple Silicon: a few ops in these models are not implemented on
+    # MPS yet; falling back to the CPU for those beats not running at all.
+    # Must be set before torch is imported, which build_engine does.
+    os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
     for entry in manifest.get("sys_path", []):
         if entry not in sys.path:
             sys.path.insert(0, entry)

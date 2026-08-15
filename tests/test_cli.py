@@ -275,6 +275,36 @@ def test_dub_duration_fit_is_off_unless_asked_for():
     assert (args.fit_duration, args.fit_tempo, args.fit_rounds) == (True, 1.4, 3)
 
 
+def test_dub_dry_run_reports_the_separated_background(project, capsys):
+    video, subtitle = project
+    (subtitle.parent / "clip.zh.srt").write_text(SAMPLE, encoding="utf-8")
+    argv = ["dub", str(video), "--provider", "deepseek", "--separate-bgm", "--dry-run"]
+
+    assert main(argv) == 0
+
+    out = capsys.readouterr().out
+    assert "minus its voices" in out
+    assert "no_vocals.flac" in out  # mixed from the cached track, not from 0:a
+
+
+def test_dub_asks_for_a_spoken_translation_and_run_does_not(project, monkeypatch):
+    """The dub's lines are read aloud, so only they should be written like speech."""
+    video, subtitle = project
+    (subtitle.parent / "clip.zh.srt").write_text(SAMPLE, encoding="utf-8")
+    asked: list[bool] = []
+    original = cli_module.build_translate_stage
+
+    def spy(args, parser, **kwargs):
+        asked.append(kwargs.get("spoken", False))
+        return original(args, parser, **kwargs)
+
+    monkeypatch.setattr(cli_module, "build_translate_stage", spy)
+
+    assert main(["dub", str(video), "--provider", "deepseek", "--dry-run"]) == 0
+    assert main(["run", str(video), "--provider", "deepseek", "--dry-run"]) == 0
+    assert asked == [True, False]
+
+
 def test_dub_dry_run_reports_the_duration_fit(project, capsys):
     video, subtitle = project
     (subtitle.parent / "clip.zh.srt").write_text(SAMPLE, encoding="utf-8")
@@ -366,6 +396,17 @@ def test_cosyvoice_says_which_flag_it_is_missing(diarized, capsys):
     assert main([*argv, "--dry-run"]) == 1
 
     assert "--clone-model" in capsys.readouterr().err
+
+
+def test_the_cloning_engine_is_told_the_language_in_two_letters(project):
+    """The container subtitle code is three letters (zho); the IndexTTS lang
+    map wants the two-letter family (zh). Mixing them up cost a model load."""
+    video, _ = project
+    args = parse(["dub", str(video), "--tts-engine", "index-tts"])
+
+    options = cli_module.build_clone_options(args, build_parser())
+
+    assert options.lang == "zh"
 
 
 def test_a_voice_per_speaker_needs_diarization(project, capsys):

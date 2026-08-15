@@ -12,6 +12,9 @@ dependencies = [
 dub = [
     "edge-tts>=7.0.0",
 ]
+separate = [
+    "demucs>=4.0.1",
+]
 clone = [
     "f5-tts>=1.0.0",
 ]

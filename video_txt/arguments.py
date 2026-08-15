@@ -330,7 +330,8 @@ def add_voice_arguments(parser: argparse.ArgumentParser) -> None:
         default="edge-tts",
         help=(
             "Speech engine. edge-tts sounds natural and is free; say works offline "
-            "on macOS; cosyvoice and f5-tts clone the original speaker locally."
+            "on macOS; index-tts, cosyvoice and f5-tts clone the original speaker "
+            "locally, index-tts being the most expressive of the three."
         ),
     )
     group.add_argument(
@@ -379,10 +380,21 @@ def add_voice_arguments(parser: argparse.ArgumentParser) -> None:
         help="Mix the original audio in quietly instead of replacing it.",
     )
     group.add_argument(
+        "--separate-bgm",
+        action="store_true",
+        help=(
+            "Remove the voices from the original audio with Demucs and lay the dub over "
+            "what is left, so music and room tone stay at full volume with no speech "
+            "underneath. Needs 'uv sync --extra separate'; implies --keep-bgm."
+        ),
+    )
+    group.add_argument(
         "--bgm-volume",
         type=float,
-        default=0.15,
-        help="Original audio volume when --keep-bgm is set. Defaults to 0.15.",
+        help=(
+            "Background volume in the mix. Defaults to 0.15 for --keep-bgm "
+            "and 1.0 for --separate-bgm."
+        ),
     )
     group.add_argument(
         "--keep-dub-audio",
@@ -429,8 +441,9 @@ def add_clone_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--clone-model",
         help=(
-            "Model for --tts-engine cosyvoice or f5-tts. CosyVoice needs the "
-            "directory it was downloaded to; F5-TTS defaults to F5TTS_v1_Base."
+            "Model for the cloning engines. CosyVoice needs the directory it was "
+            "downloaded to; F5-TTS defaults to F5TTS_v1_Base; IndexTTS defaults "
+            "to the checkpoints directory inside --clone-repo."
         ),
     )
     group.add_argument(
@@ -447,11 +460,14 @@ def add_clone_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--clone-repo",
         type=Path,
-        help="Checkout to import the model from, for example a cloned CosyVoice.",
+        help="Checkout to import the model from, for example a cloned index-tts or CosyVoice.",
     )
     group.add_argument(
         "--clone-python",
-        help="Interpreter that has the cloning model installed. Defaults to this one.",
+        help=(
+            "Interpreter that has the cloning model installed. Defaults to the "
+            ".venv inside --clone-repo when there is one, else to this one."
+        ),
     )
     group.add_argument(
         "--clone-device", help="Torch device for the cloning model, for example mps or cuda."

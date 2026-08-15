@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import random
@@ -57,6 +58,8 @@ class TranslationConfig:
     source_language: str | None = None
     preserve_terms: list[str] = field(default_factory=list)
     note: str | None = None
+    # The lines are written to be spoken by a voice, not read off the screen.
+    spoken: bool = False
     batch_chars: int = DEFAULT_BATCH_CHARS
     retries: int = 2
     concurrency: int = DEFAULT_CONCURRENCY
@@ -163,10 +166,9 @@ def cleanup_debug_dir(debug_dir: Path) -> int:
     for path in debug_dir.glob("*-raw-response.txt"):
         path.unlink(missing_ok=True)
         removed += 1
-    try:
+    # A directory that will not empty holds files we did not write; leave it alone.
+    with contextlib.suppress(OSError):
         debug_dir.rmdir()
-    except OSError:
-        pass  # the directory holds files we did not write; leave it alone
     return removed
 
 
@@ -183,6 +185,7 @@ def build_partial_meta(cues: list[SubtitleCue], config: TranslationConfig) -> di
         "source_language": config.source_language,
         "preserve_terms": config.preserve_terms,
         "note": config.note,
+        "spoken": config.spoken,
         "batch_chars": config.batch_chars,
         "context_cues": config.context_cues,
     }
@@ -199,19 +202,37 @@ def build_messages(
         "Return JSON only. Do not add Markdown fences or commentary."
     )
 
+    rules = [
+        "Keep the same number of subtitle items.",
+        "Keep each item's id exactly the same as the input.",
+        "Translate only the text field.",
+        "Preserve internal line breaks when they help readability.",
+        "Do not merge or split subtitle items.",
+        "Keep terminology consistent across the batch.",
+        "context_before is only for continuity: never translate or return those lines.",
+    ]
+    if config.spoken:
+        # Two rules, not one: asking for spoken phrasing and for spoken spelling in
+        # the same sentence reliably gets the phrasing and drops the spelling.
+        rules.append(
+            "The translation will be read aloud by a voice-over, not shown as text: "
+            "use natural spoken phrasing a narrator would actually say, and prefer "
+            "short clauses over bookish wording."
+        )
+        rules.append(
+            "Spell out whatever a voice cannot pronounce as written. Percent signs, "
+            "currency amounts, maths symbols, units of measure and section labels "
+            "become the words the target language says them as, so '30%' and '3(b)' "
+            "must not survive as digits and punctuation. Initialisms that are "
+            "normally said letter by letter, and anything in preserve_terms, stay "
+            "exactly as they are."
+        )
+
     payload: dict[str, object] = {
         "task": "Translate subtitle text",
         "target_language": config.target_language,
         "source_language": config.source_language or "auto-detect",
-        "rules": [
-            "Keep the same number of subtitle items.",
-            "Keep each item's id exactly the same as the input.",
-            "Translate only the text field.",
-            "Preserve internal line breaks when they help readability.",
-            "Do not merge or split subtitle items.",
-            "Keep terminology consistent across the batch.",
-            "context_before is only for continuity: never translate or return those lines.",
-        ],
+        "rules": rules,
         "preserve_terms": config.preserve_terms,
         "extra_note": config.note or "",
         "output_schema": {

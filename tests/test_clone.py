@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -199,6 +200,39 @@ def test_cosyvoice_without_a_model_says_what_to_pass():
     assert resolve_model(CloneOptions(engine="cosyvoice", model="/m")) == "/m"
 
 
+def test_indextts_finds_its_weights_inside_the_checkout(tmp_path):
+    repo = tmp_path / "index-tts"
+    checkpoints = repo / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "config.yaml").write_text("model: {}\n", encoding="utf-8")
+
+    assert resolve_model(CloneOptions(engine="index-tts", repo=repo)) == str(checkpoints)
+    assert resolve_model(CloneOptions(engine="index-tts", model="/elsewhere")) == "/elsewhere"
+
+
+def test_indextts_asks_only_for_the_setup_step_that_is_missing(tmp_path):
+    """Whoever already cloned the repo must not be told to clone it again: that
+    reads as 'your checkout is wrong' when all that is missing is a download."""
+    with pytest.raises(CloneError, match="git clone") as no_repo:
+        resolve_model(CloneOptions(engine="index-tts"))
+    assert "--clone-repo" in str(no_repo.value)
+    assert "hf download" in str(no_repo.value)
+
+    with pytest.raises(CloneError, match="does not exist") as missing:
+        resolve_model(CloneOptions(engine="index-tts", repo=tmp_path / "nowhere"))
+    assert "git clone" in str(missing.value)
+    assert "hf download" not in str(missing.value)
+
+    repo = tmp_path / "index-tts"
+    repo.mkdir()
+    with pytest.raises(CloneError, match="hf download") as no_weights:
+        resolve_model(CloneOptions(engine="index-tts", repo=repo))
+    # The download command names the directory it has to land in, so it can be
+    # pasted as printed, and nothing suggests cloning the checkout again.
+    assert str(repo / "checkpoints") in str(no_weights.value)
+    assert "git clone" not in str(no_weights.value)
+
+
 def test_the_speaking_rate_carries_over_to_the_cloning_model():
     assert speed_from_rate("+0%") == 1.0
     assert speed_from_rate("+10%") == pytest.approx(1.1)
@@ -214,6 +248,24 @@ def test_the_worker_runs_on_the_interpreter_that_has_the_model():
     assert command[0] == "/venvs/f5/bin/python"
     assert command[1].endswith("clone_worker.py")
     assert command[2] == "/cache/jobs.json"
+
+
+def test_the_worker_finds_the_virtualenv_inside_the_checkout(tmp_path):
+    """IndexTTS pins its own Python and torch, so its checkout carries a venv
+    this package can never share. Nobody should have to spell that path out."""
+    repo = tmp_path / "index-tts"
+    python = repo / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("", encoding="utf-8")
+
+    with_venv = CloneOptions(engine="index-tts", repo=repo)
+    assert build_worker_command(with_venv, Path("/j"))[0] == str(python)
+
+    bare = CloneOptions(engine="index-tts", repo=tmp_path / "bare")
+    assert build_worker_command(bare, Path("/j"))[0] == sys.executable
+
+    explicit = CloneOptions(engine="index-tts", repo=repo, python="/mine/python")
+    assert build_worker_command(explicit, Path("/j"))[0] == "/mine/python"
 
 
 def test_the_manifest_carries_every_job_with_the_clip_it_clones(tmp_path):
@@ -233,8 +285,26 @@ def test_the_manifest_carries_every_job_with_the_clip_it_clones(tmp_path):
             "output": str(tmp_path / "a.wav"),
             "reference_audio": str(tmp_path / "ref.wav"),
             "reference_text": "hello",
+            "speed": None,
         }
     ]
+
+
+def test_the_manifest_says_what_language_indextts_is_speaking(tmp_path):
+    reference = Reference(speaker="", audio=tmp_path / "ref.wav")
+    jobs = [
+        CloneJob(text="你好", output=tmp_path / "a.wav", reference=reference),
+        CloneJob(text="再见", output=tmp_path / "b.wav", reference=reference, speed=1.3),
+    ]
+
+    manifest = build_manifest(jobs, CloneOptions(engine="index-tts", model="/ckpt", lang="zh"))
+
+    assert manifest["lang"] == "ZH"
+    # A re-spoken clip carries its own speed; the rest keep the manifest-wide one.
+    assert [job["speed"] for job in manifest["jobs"]] == [None, 1.3]
+
+    unknown = build_manifest(jobs, CloneOptions(engine="index-tts", model="/ckpt", lang="fr"))
+    assert unknown["lang"] is None
 
 
 def test_a_cosyvoice_checkout_is_put_on_the_workers_import_path(tmp_path):
@@ -243,6 +313,12 @@ def test_a_cosyvoice_checkout_is_put_on_the_workers_import_path(tmp_path):
     manifest = build_manifest([], CloneOptions(engine="cosyvoice", model="/m", repo=repo))
 
     assert manifest["sys_path"] == [str(repo), str(repo / "third_party" / "Matcha-TTS")]
+
+
+def test_a_respoken_clip_keeps_its_own_speed_in_the_worker():
+    assert clone_worker.job_speed({"speed": 1.3}, 1.0) == 1.3
+    assert clone_worker.job_speed({"speed": None}, 1.1) == 1.1
+    assert clone_worker.job_speed({}, 1.1) == 1.1
 
 
 def worker_calls(monkeypatch, *, returncode: int, writes: bool) -> list[list[str]]:
@@ -258,6 +334,30 @@ def worker_calls(monkeypatch, *, returncode: int, writes: bool) -> list[list[str
 
     monkeypatch.setattr(clone_module.subprocess, "run", fake_run)
     return commands
+
+
+def test_a_conversation_is_synthesized_one_speaker_at_a_time(tmp_path, monkeypatch):
+    """The model caches the encoding of the last reference clip it saw, so
+    interleaved speakers would recompute it on nearly every line."""
+    worker_calls(monkeypatch, returncode=0, writes=True)
+    host = Reference(speaker="HOST", audio=tmp_path / "host.wav", text="hi")
+    guest = Reference(speaker="GUEST", audio=tmp_path / "guest.wav", text="yo")
+    jobs = [
+        CloneJob(text="line 1", output=tmp_path / "1.wav", reference=host),
+        CloneJob(text="line 2", output=tmp_path / "2.wav", reference=guest),
+        CloneJob(text="line 3", output=tmp_path / "3.wav", reference=host),
+        CloneJob(text="line 4", output=tmp_path / "4.wav", reference=guest),
+    ]
+
+    synthesize_clips(jobs, options=CloneOptions(engine="f5-tts"), cache_dir=tmp_path)
+
+    manifest = json.loads((tmp_path / MANIFEST_NAME).read_text(encoding="utf-8"))
+    assert [job["reference_audio"] for job in manifest["jobs"]] == [
+        str(guest.audio),
+        str(guest.audio),
+        str(host.audio),
+        str(host.audio),
+    ]
 
 
 def test_the_whole_batch_goes_to_one_worker_run(tmp_path, monkeypatch):

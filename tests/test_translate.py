@@ -83,6 +83,26 @@ def test_build_messages_omits_context_when_empty():
     assert "context_before" not in payload
 
 
+def test_lines_meant_to_be_spoken_ask_for_spoken_phrasing():
+    """A dub reads the translation aloud; subtitles for the eye keep the plain rules."""
+    batch = [("1", SubtitleCue("1", "00:00:01,000 --> 00:00:02,000", ["hello"]))]
+
+    def rules(config) -> list[str]:
+        payload = json.loads(build_messages(batch, config=config, context_before=[])[1]["content"])
+        return payload["rules"]
+
+    assert not any("read aloud" in rule for rule in rules(make_config()))
+    spoken = rules(make_config(spoken=True))
+    assert any("read aloud" in rule for rule in spoken)
+
+    # Phrasing and spelling are separate rules on purpose: asked for together,
+    # the model reliably delivers the phrasing and ignores the spelling.
+    said_aloud = [rule for rule in spoken if "Spell out" in rule]
+    assert len(said_aloud) == 1
+    assert "read aloud" not in said_aloud[0]
+    assert "preserve_terms" in said_aloud[0]
+
+
 def test_build_context_walks_backwards_and_skips_empty_cues():
     cues = parse_srt_text(
         "1\n00:00:01,000 --> 00:00:02,000\none\n\n"

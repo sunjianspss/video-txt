@@ -24,8 +24,13 @@ from pathlib import Path
 from .diarize import DEFAULT_SPEAKER
 from .subtitles import SubtitleCue, join_text_parts
 
-CLONE_ENGINES = ("cosyvoice", "f5-tts")
+CLONE_ENGINES = ("cosyvoice", "f5-tts", "index-tts")
 DEFAULT_F5_MODEL = "F5TTS_v1_Base"
+# The layout the IndexTTS README tells everyone to download into.
+INDEX_CHECKPOINTS_DIR = "checkpoints"
+# The languages IndexTTS-2.5 takes as an explicit lang= hint, keyed by the
+# filename suffix language_suffix() gives a target language.
+INDEX_LANGS = {"zh": "ZH", "zh-hant": "ZH", "en": "EN", "ja": "JA", "es": "ES"}
 MANIFEST_NAME = "clone-jobs.json"
 REFERENCE_DIR_NAME = "reference"
 # What both models ask for: long enough to carry a voice, short enough to stay
@@ -63,6 +68,7 @@ class CloneOptions:
     repo: Path | None = None
     device: str | None = None
     speed: float = 1.0
+    lang: str | None = None
     references: dict[str, Path] = field(default_factory=dict)
 
 
@@ -71,6 +77,8 @@ class CloneJob:
     text: str
     output: Path
     reference: Reference
+    # Speed multiplier for this one clip; None keeps the manifest-wide speed.
+    speed: float | None = None
 
 
 def is_rate(value: str) -> bool:
@@ -86,11 +94,56 @@ def speed_from_rate(rate: str) -> float:
     return max(0.2, 1.0 + float(match.group(1)) / 100)
 
 
+INDEX_CLONE_STEPS = (
+    "  git clone https://github.com/index-tts/index-tts.git\n  cd index-tts && uv sync\n"
+)
+
+
+def index_download_step(checkpoints: Path) -> str:
+    return (
+        f"  uvx --from huggingface-hub hf download IndexTeam/IndexTTS-2.5 --local-dir {checkpoints}"
+    )
+
+
+def resolve_index_model(options: CloneOptions) -> str:
+    """The checkpoints directory inside the IndexTTS checkout.
+
+    Three ways to not have one, and telling somebody who already cloned the
+    repo to clone it again is how a missing download reads as a missing
+    checkout. So each case says only the step that is actually left.
+    """
+    if options.repo is None:
+        raise CloneError(
+            "IndexTTS needs its checkout and the weights downloaded into it:\n"
+            + INDEX_CLONE_STEPS
+            + index_download_step(Path(INDEX_CHECKPOINTS_DIR))
+            + "\nThen point at the checkout with: --clone-repo /path/to/index-tts"
+        )
+
+    repo = options.repo.expanduser().resolve()
+    if not repo.is_dir():
+        raise CloneError(
+            f"--clone-repo points at {repo}, which does not exist. Clone IndexTTS "
+            "there first:\n" + INDEX_CLONE_STEPS.rstrip()
+        )
+
+    checkpoints = repo / INDEX_CHECKPOINTS_DIR
+    if not (checkpoints / "config.yaml").is_file():
+        raise CloneError(
+            f"The IndexTTS checkout at {repo} has no weights in it yet "
+            f"({checkpoints / 'config.yaml'} is missing). Download them:\n"
+            + index_download_step(checkpoints)
+        )
+    return str(checkpoints)
+
+
 def resolve_model(options: CloneOptions) -> str:
     if options.model:
         return options.model
     if options.engine == "f5-tts":
         return DEFAULT_F5_MODEL
+    if options.engine == "index-tts":
+        return resolve_index_model(options)
     raise CloneError(
         "CosyVoice needs the model directory it was downloaded to.\n"
         "Pass it with: --clone-model /path/to/CosyVoice2-0.5B\n"
@@ -100,6 +153,18 @@ def resolve_model(options: CloneOptions) -> str:
 
 def worker_path() -> Path:
     return Path(__file__).with_name("clone_worker.py")
+
+
+def repo_python(options: CloneOptions) -> Path | None:
+    """The interpreter of the checkout's own virtualenv, when it has one.
+
+    IndexTTS pins Python 3.11 and its own torch, so its checkout carries a
+    virtualenv this package can never share. Finding it saves everybody the
+    --clone-python flag."""
+    if options.repo is None:
+        return None
+    candidate = options.repo.expanduser().resolve() / ".venv" / "bin" / "python"
+    return candidate if candidate.is_file() else None
 
 
 def sys_path_entries(options: CloneOptions) -> list[str]:
@@ -112,7 +177,8 @@ def sys_path_entries(options: CloneOptions) -> list[str]:
 
 
 def build_worker_command(options: CloneOptions, manifest: Path) -> list[str]:
-    return [options.python or sys.executable, str(worker_path()), str(manifest)]
+    python = options.python or repo_python(options) or sys.executable
+    return [str(python), str(worker_path()), str(manifest)]
 
 
 def build_manifest(jobs: list[CloneJob], options: CloneOptions) -> dict[str, object]:
@@ -121,6 +187,7 @@ def build_manifest(jobs: list[CloneJob], options: CloneOptions) -> dict[str, obj
         "model": resolve_model(options),
         "device": options.device,
         "speed": options.speed,
+        "lang": INDEX_LANGS.get((options.lang or "").lower()),
         "sys_path": sys_path_entries(options),
         "jobs": [
             {
@@ -128,6 +195,7 @@ def build_manifest(jobs: list[CloneJob], options: CloneOptions) -> dict[str, obj
                 "output": str(job.output),
                 "reference_audio": str(job.reference.audio),
                 "reference_text": job.reference.text,
+                "speed": job.speed,
             }
             for job in jobs
         ],
@@ -139,10 +207,16 @@ def synthesize_clips(jobs: list[CloneJob], *, options: CloneOptions, cache_dir: 
     if not jobs:
         return
 
+    # Clips from one reference sit together: the model caches the speaker
+    # encoding of the last reference it saw, and a conversation would
+    # otherwise recompute it on nearly every line.
+    ordered = sorted(jobs, key=lambda job: str(job.reference.audio))
+
     manifest = cache_dir / MANIFEST_NAME
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(
-        json.dumps(build_manifest(jobs, options), ensure_ascii=False, indent=2), encoding="utf-8"
+        json.dumps(build_manifest(ordered, options), ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
     command = build_worker_command(options, manifest)
