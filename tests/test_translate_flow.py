@@ -91,6 +91,35 @@ def test_resume_skips_cues_already_in_the_partial_file(srt, fake_api, tmp_path):
     assert requested == {"3", "4", "5", "6"}
 
 
+def test_a_batch_the_model_answers_short_is_split_instead_of_asked_again(
+    srt, monkeypatch, tmp_path
+):
+    """Temperature is 0: the same question would only get the same short answer back."""
+
+    class DropsLastId(FakeApi):
+        def __call__(self, *, config, messages, json_mode) -> dict:
+            response = super().__call__(config=config, messages=messages, json_mode=json_mode)
+            items = json.loads(response["choices"][0]["message"]["content"])["items"]
+            if len(items) > 1:
+                items = items[:-1]
+            content = json.dumps({"items": items})
+            return {"choices": [{"message": {"content": content}}]}
+
+    api = DropsLastId()
+    monkeypatch.setattr(translate_module, "post_chat_completion", api)
+    output = tmp_path / "clip.zh.srt"
+
+    translate_subtitle_file(
+        input_path=srt,
+        output_path=output,
+        config=make_config(batch_chars=1000, concurrency=1, retries=2),
+    )
+
+    assert [cue.text for cue in parse_srt(output)] == [f"译文 line {i}" for i in range(1, 7)]
+    asked = [tuple(item["id"] for item in payload["items"]) for payload in api.requests]
+    assert len(asked) == len(set(asked)), f"asked the same ids twice: {asked}"
+
+
 def test_a_failed_batch_leaves_the_finished_ones_on_disk(srt, monkeypatch, tmp_path):
     api = FakeApi(fail_ids={"4"})
     monkeypatch.setattr(translate_module, "post_chat_completion", api)

@@ -8,7 +8,10 @@ from .constants import (
     DEFAULT_BATCH_CHARS,
     DEFAULT_CONCURRENCY,
     DEFAULT_TARGET_LANGUAGE,
+    DEFAULT_TIMEOUT,
+    LOCAL_BATCH_CHARS,
     PROVIDERS,
+    REASONING_EFFORTS,
 )
 from .diarize import (
     DEFAULT_MODEL as DEFAULT_DIARIZE_MODEL,
@@ -118,8 +121,10 @@ def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: st
     group.add_argument(
         "--batch-chars",
         type=int,
-        default=DEFAULT_BATCH_CHARS,
-        help=f"Approximate text characters per API batch. Defaults to {DEFAULT_BATCH_CHARS}.",
+        help=(
+            f"Approximate text characters per API batch. Defaults to {DEFAULT_BATCH_CHARS}, "
+            f"or {LOCAL_BATCH_CHARS} for --provider lmstudio."
+        ),
     )
     group.add_argument(
         "--retries",
@@ -138,6 +143,20 @@ def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: st
         type=int,
         default=3,
         help="Preceding subtitle lines sent as context for tone and terminology. Defaults to 3.",
+    )
+    group.add_argument(
+        "--reasoning-effort",
+        choices=REASONING_EFFORTS,
+        help=(
+            "How much a reasoning model may think before answering. 'auto' leaves the field out "
+            "of the request. Defaults to none for --provider lmstudio, auto otherwise."
+        ),
+    )
+    group.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"Seconds to wait for one API response. Defaults to {DEFAULT_TIMEOUT:g}.",
     )
     group.add_argument(
         "--no-resume",

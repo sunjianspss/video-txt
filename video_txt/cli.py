@@ -17,7 +17,13 @@ from .arguments import (
     build_translate_command,
 )
 from .clone import CLONE_ENGINES, CloneError, CloneOptions, is_rate, speed_from_rate
-from .constants import DEFAULT_API_KEY_ENV, DEFAULT_BASE_URL, DEFAULT_TERMS, PROVIDERS
+from .constants import (
+    DEFAULT_API_KEY_ENV,
+    DEFAULT_BASE_URL,
+    DEFAULT_BATCH_CHARS,
+    DEFAULT_TERMS,
+    PROVIDERS,
+)
 from .diarize import (
     DEFAULT_SPEAKER,
     DiarizeError,
@@ -49,6 +55,7 @@ from .transcribe import TranscribeError, TranscribeOptions, run_transcribe
 from .translate import (
     TranslationConfig,
     TranslationError,
+    loaded_local_model,
     translate_subtitle_file,
 )
 from .voices import DEFAULT_SAY_VOICE, DEFAULT_VOICE, resolve_voice_name
@@ -148,6 +155,8 @@ def resolve_provider_settings(
     )
     api_key_env = args.api_key_env or provider.get("api_key_env") or DEFAULT_API_KEY_ENV
     model = args.model or provider.get("model") or os.environ.get("OPENAI_MODEL")
+    if not model and provider.get("discover_model"):
+        model = discover_local_model(base_url, parser)
     if not model:
         parser.error(
             "Missing model name. Pass --model, use --provider deepseek, or set OPENAI_MODEL."
@@ -155,9 +164,35 @@ def resolve_provider_settings(
     return base_url, api_key_env, model
 
 
+def discover_local_model(base_url: str, parser: argparse.ArgumentParser) -> str:
+    """Whatever the local server is serving, so --model can be left off."""
+    try:
+        model = loaded_local_model(base_url)
+    except TranslationError as exc:
+        parser.error(f"{exc}\nLoad a model in LM Studio and start its server, or pass --model.")
+    print(f"Local model: {model}")
+    return model
+
+
+def provider_requires_key(args: argparse.Namespace) -> bool:
+    """Whether a missing key should stop the run. A model on localhost asks for none."""
+    provider = PROVIDERS[args.provider] if args.provider else {}
+    return bool(provider.get("requires_key", True))
+
+
+def resolve_reasoning_effort(args: argparse.Namespace) -> str:
+    provider = PROVIDERS[args.provider] if args.provider else {}
+    return args.reasoning_effort or provider.get("reasoning_effort") or "auto"
+
+
+def resolve_batch_chars(args: argparse.Namespace) -> int:
+    provider = PROVIDERS[args.provider] if args.provider else {}
+    return args.batch_chars or provider.get("batch_chars") or DEFAULT_BATCH_CHARS
+
+
 def validate_translation_numbers(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """Settings the translator would otherwise quietly pull back into range."""
-    if args.batch_chars < 1:
+    if args.batch_chars is not None and args.batch_chars < 1:
         parser.error("--batch-chars must be 1 or greater")
     if args.retries < 0:
         parser.error("--retries must be 0 or greater")
@@ -165,6 +200,8 @@ def validate_translation_numbers(parser: argparse.ArgumentParser, args: argparse
         parser.error("--concurrency must be 1 or greater")
     if args.context_cues < 0:
         parser.error("--context-cues must be 0 or greater")
+    if args.timeout <= 0:
+        parser.error("--timeout must be greater than 0")
 
 
 def build_translation_config(
@@ -176,7 +213,8 @@ def build_translation_config(
 ) -> TranslationConfig:
     validate_translation_numbers(parser, args)
     base_url, api_key_env, model = resolve_provider_settings(args, parser)
-    api_key = resolve_api_key(api_key_env, secrets_file=args.secrets_file) if require_key else ""
+    read_key = resolve_api_key if provider_requires_key(args) else resolve_optional_key
+    api_key = read_key(api_key_env, secrets_file=args.secrets_file) if require_key else ""
     return TranslationConfig(
         base_url=base_url,
         api_key=api_key,
@@ -186,10 +224,12 @@ def build_translation_config(
         preserve_terms=list(dict.fromkeys([*DEFAULT_TERMS, *args.preserve_term])),
         note=args.note,
         spoken=spoken,
-        batch_chars=args.batch_chars,
+        batch_chars=resolve_batch_chars(args),
         retries=args.retries,
         concurrency=args.concurrency,
         context_cues=args.context_cues,
+        reasoning_effort=resolve_reasoning_effort(args),
+        timeout=args.timeout,
     )
 
 

@@ -9,10 +9,12 @@ from video_txt import cli as cli_module
 from video_txt.cli import (
     COMMANDS,
     build_parser,
+    build_translation_config,
     main,
     parse_clone_references,
     resolve_provider_settings,
 )
+from video_txt.translate import TranslationError
 
 SAMPLE = "1\n00:00:01,000 --> 00:00:03,000\nHello there\n\n2\n00:00:04,000 --> 00:00:06,000\nBye\n"
 
@@ -163,6 +165,83 @@ def test_explicit_flags_win_over_the_provider_preset():
         "OTHER_KEY",
         "custom",
     )
+
+
+def test_lmstudio_preset_points_at_the_local_server():
+    args = parse(["translate", "in.srt", "--provider", "lmstudio", "--model", "qwen3"])
+    assert resolve_provider_settings(args, build_parser()) == (
+        "http://localhost:1234/v1",
+        "LMSTUDIO_API_KEY",
+        "qwen3",
+    )
+
+
+def test_lmstudio_asks_the_server_which_model_is_loaded(monkeypatch):
+    monkeypatch.setattr(cli_module, "loaded_local_model", lambda base_url: "loaded-qwen3")
+    args = parse(["translate", "in.srt", "--provider", "lmstudio"])
+    assert resolve_provider_settings(args, build_parser())[2] == "loaded-qwen3"
+
+
+def test_lmstudio_with_nothing_loaded_says_so(monkeypatch, capsys):
+    def refuse(base_url: str) -> str:
+        raise TranslationError("http://localhost:1234 has no chat model loaded.")
+
+    monkeypatch.setattr(cli_module, "loaded_local_model", refuse)
+    args = parse(["translate", "in.srt", "--provider", "lmstudio"])
+    with pytest.raises(SystemExit):
+        resolve_provider_settings(args, build_parser())
+
+    assert "no chat model loaded" in capsys.readouterr().err
+
+
+def test_lmstudio_runs_without_an_api_key(monkeypatch, tmp_path):
+    monkeypatch.delenv("LMSTUDIO_API_KEY", raising=False)
+    args = parse(
+        [
+            "translate",
+            "in.srt",
+            "--provider",
+            "lmstudio",
+            "--model",
+            "qwen3",
+            "--secrets-file",
+            str(tmp_path / "absent"),
+        ]
+    )
+    config = build_translation_config(args, build_parser(), require_key=True)
+    assert config.api_key == ""
+    assert config.model == "qwen3"
+
+
+def effort_for(tmp_path, argv: list[str]) -> str:
+    args = parse(["translate", "in.srt", *argv, "--secrets-file", str(tmp_path / "absent")])
+    return build_translation_config(args, build_parser(), require_key=False).reasoning_effort
+
+
+def test_lmstudio_turns_reasoning_off(tmp_path):
+    """Local reasoning models spend minutes deliberating over a subtitle line."""
+    assert effort_for(tmp_path, ["--provider", "lmstudio", "--model", "q"]) == "none"
+
+
+def test_lmstudio_asks_for_smaller_batches_than_a_cloud_provider(tmp_path):
+    def batch_chars_for(argv: list[str]) -> int:
+        args = parse(["translate", "in.srt", *argv, "--secrets-file", str(tmp_path / "absent")])
+        return build_translation_config(args, build_parser(), require_key=False).batch_chars
+
+    local = ["--provider", "lmstudio", "--model", "q"]
+    assert batch_chars_for(local) == 800
+    assert batch_chars_for(["--provider", "deepseek"]) == 3200
+    assert batch_chars_for([*local, "--batch-chars", "2000"]) == 2000
+
+
+def test_other_providers_say_nothing_about_reasoning(tmp_path):
+    assert effort_for(tmp_path, ["--provider", "deepseek"]) == "auto"
+
+
+def test_reasoning_effort_flag_wins_over_the_preset(tmp_path):
+    local = ["--provider", "lmstudio", "--model", "q"]
+    assert effort_for(tmp_path, [*local, "--reasoning-effort", "high"]) == "high"
+    assert effort_for(tmp_path, [*local, "--reasoning-effort", "auto"]) == "auto"
 
 
 def test_missing_model_is_reported(monkeypatch, capsys):

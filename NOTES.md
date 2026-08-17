@@ -229,6 +229,69 @@ Whisper 拿这 30 秒判断语种,判成了英语,然后整片带着错误的语
 但只有开头一段能解码,Whisper 拿到 25 秒"完整"音频正常转完毫无察觉。一半的阈值放得很宽——
 对白到片尾会变稀,但不会整个后半段消失。此项需要 ffprobe 探测媒体时长,探测失败就跳过不拦。
 
+## 本地模型翻译:模型名从服务器问
+
+DeepSeek 涨价后加了 `--provider lmstudio`,指向本机 `http://localhost:1234/v1`。云端 provider
+预设里能写死默认模型名,本地不行——服务器上有哪个模型、加载没加载,只有服务器自己知道,
+所以不给默认值,而是在没传 `--model` 时去问一次。
+
+**问的是 LM Studio 自己的 `/api/v0/models`,不是 OpenAI 兼容的 `/v1/models`。** 后者把**下载过的**
+模型全列出来,嵌入模型混在里面,拿第一条经常是个根本不会翻译的 embedding。前者每条带
+`state` 和 `type`,只挑 `state=loaded` 且 `type` 是 `llm`/`vlm` 的,选中的模型会打印出来。
+`vlm` 必须算进去:实测本机加载的 `qwen/qwen3.5-35b-a3b` 就被标成 `vlm`,只认 `llm` 会说没模型。
+
+**key 是可选的,不是空字符串糊过去。** provider 预设里带 `requires_key: False`,取 key 时走
+`resolve_optional_key`;否则没设 `LMSTUDIO_API_KEY` 会被凭据检查直接拦下,而 localhost 上的模型
+本来就不认这个 header。
+
+## 本地推理模型必须关掉思考
+
+第一次拿 37 分钟的演讲试 `--provider lmstudio` 直接失败:`Timed out while calling the translation
+API`,三次重试全超时,9 批一批没成。查下来不是网络也不是并发,是模型在**想**。
+
+单独发一条只有两句话的翻译请求,回来的 usage 是:
+
+| | completion tokens | 其中 reasoning | 耗时 |
+| --- | --- | --- | --- |
+| 默认 | 4845 | **4807** | 68 秒 |
+| `reasoning_effort: "none"` | 17 | 0 | 0.3 秒 |
+
+翻两句字幕想了四千八百个 token。一批 3200 字符的字幕自然撞穿 180 秒超时,而且想完给出的译文
+跟不想时没有区别——字幕翻译本来就没有值得推演的东西。**200 倍的差距,零质量损失。**
+
+所以 `lmstudio` 预设里把 `reasoning_effort` 定成 `none`,只在这个参数不是 `auto` 时才写进请求体
+(云端 provider 保持 `auto`,即完全不提这个字段,免得 DeepSeek 那边收到不认识的参数)。想让本地
+模型思考就显式 `--reasoning-effort high`。顺带补了 `--timeout`:本地慢,180 秒不够时能自己加。
+
+试过但没用的写法:`chat_template_kwargs: {"enable_thinking": false}` 被 LM Studio 忽略(usage
+一个 token 不差);prompt 里加 `/no_think` 只把思考从 4807 压到 941,不彻底。
+
+## 本地模型答不完长列表:批次要小,失败要立刻拆
+
+关掉思考之后同一条 37 分钟演讲(698 条字幕)还是一路报 `Batch validation failed`。看快照里的
+原始响应,错误只有一种形状:**少了末尾几条,从不多给、也从不给错 id**。一批 71 条,它返回 61 条,
+JSON 还规规矩矩地闭合——不是被截断,是它自己觉得说完了。
+
+| 每批字符数 | 60 条样本的失败次数 | 耗时 |
+| --- | --- | --- |
+| 3200(云端默认) | 满屏失败,靠二分硬磨,11 分钟才过 2/9 批 | — |
+| 1600 | 0 | 134 秒 |
+| 800 | 0 | 99 秒 |
+
+所以 `lmstudio` 预设把 `batch_chars` 定成 800。批次小了并不慢,反而更快:批多了并发填得满,
+而且不用为一次失败付出重来的代价。
+
+**更值钱的是另一半:格式错不再重试同样的请求。** 原来的逻辑是同一批重试 `--retries` 次
+(默认 3 次)再对半拆。可温度是 0——同一个请求换来的是**同一个错答案**,快照里 attempt-01/02/03
+少的是同一批 id,一个不差。现在 `ResponseFormatError` 只要还能拆就直接拆,重试留给网络和 HTTP 错误
+(以及只剩一条、拆无可拆的时候)。同一条视频改完之后从每批约 40 秒降到约 9 秒。
+
+**LM Studio 不认 `response_format: json_object`**,只收 `json_schema` 或 `text`,第一批会 400 并打印
+`API rejected response_format; falling back to plain JSON prompting.`。已有的降级逻辑接住了:
+同时在飞的那几个请求各撞一次(状态是收到 400 之后才置位的),所以 `--concurrency 4` 会看到 4 行,
+之后的批次直接走纯提示词,不再重试。真要上 `json_schema`(每批按字幕 id 生成 schema、
+强制输出合法 JSON)是另一件事,小模型上大概值得做,现在没做。
+
 ## 已知现象
 
 - **Whisper 开头容易吐长段落。** 前几句常出现跨越二三十秒的一整段,烧成硬字幕就是一整屏文字。

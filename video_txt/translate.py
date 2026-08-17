@@ -18,6 +18,7 @@ from .constants import (
     DEFAULT_BATCH_CHARS,
     DEFAULT_CONCURRENCY,
     DEFAULT_TARGET_LANGUAGE,
+    DEFAULT_TIMEOUT,
 )
 from .parallel import map_in_parallel
 from .subtitles import SubtitleCue, chunk_cues, parse_srt, serialize_srt, write_srt
@@ -64,7 +65,9 @@ class TranslationConfig:
     retries: int = 2
     concurrency: int = DEFAULT_CONCURRENCY
     context_cues: int = 3
-    timeout: float = 180.0
+    # "auto" (or None) leaves reasoning_effort out of the request entirely.
+    reasoning_effort: str = "auto"
+    timeout: float = DEFAULT_TIMEOUT
     backoff_base: float = 1.5
     backoff_cap: float = 30.0
 
@@ -355,6 +358,35 @@ def write_raw_response_debug(
     return path
 
 
+def loaded_local_model(base_url: str, *, timeout: float = 10.0) -> str:
+    """The chat model LM Studio currently has in memory.
+
+    Local models are named after the file they were downloaded as, which nobody
+    wants to retype, so ask the server instead. This uses LM Studio's own model
+    listing rather than the OpenAI-compatible one: that one also lists models
+    that are merely downloaded, and embedding models among them, so its first
+    entry is often something that cannot translate a word.
+    """
+    host = base_url.rstrip("/").removesuffix("/v1")
+    url = host + "/api/v0/models"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        raise TranslationError(f"Could not ask {url} which model is loaded: {exc}") from exc
+
+    loaded = [
+        entry.get("id")
+        for entry in payload.get("data") or []
+        if entry.get("id")
+        and entry.get("state") == "loaded"
+        and entry.get("type") in {"llm", "vlm"}
+    ]
+    if not loaded:
+        raise TranslationError(f"{host} has no chat model loaded.")
+    return loaded[0]
+
+
 def post_chat_completion(
     *,
     config: TranslationConfig,
@@ -366,6 +398,8 @@ def post_chat_completion(
         "temperature": 0,
         "messages": messages,
     }
+    if config.reasoning_effort and config.reasoning_effort != "auto":
+        payload["reasoning_effort"] = config.reasoning_effort
     using_json_mode = json_mode.supported
     if using_json_mode:
         payload["response_format"] = {"type": "json_object"}
@@ -457,6 +491,12 @@ def request_items(
                 print(f"Saved invalid API response to: {debug_path}", file=sys.stderr)
                 last_error = ResponseFormatError(f"{exc} Raw response saved to: {debug_path}")
             if not is_retryable(exc):
+                break
+            if isinstance(exc, ResponseFormatError) and len(ids) > 1:
+                # Not bad luck: temperature is 0, so asking the same question again
+                # gets the same wrong answer back. Smaller questions are the way out,
+                # and the split below is right there. A single id has nothing to split,
+                # so that one keeps its retries.
                 break
             if attempt <= config.retries:
                 time.sleep(backoff_delay(attempt, config, exc))
@@ -626,6 +666,8 @@ def translate_subtitle_file(
     print(f"Subtitle blocks: {len(cues)} ({len(translatable)} with text)")
     print(f"Batches: {len(batches)} (about {config.batch_chars} chars each)")
     print(f"Concurrency: {max(1, config.concurrency)}")
+    if config.reasoning_effort and config.reasoning_effort != "auto":
+        print(f"Reasoning effort: {config.reasoning_effort}")
     if config.source_language:
         print(f"Source language hint: {config.source_language}")
     if config.preserve_terms:

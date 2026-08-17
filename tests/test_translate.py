@@ -23,6 +23,7 @@ from video_txt.translate import (
     build_messages,
     build_partial_meta,
     is_retryable,
+    loaded_local_model,
     parse_translation_json,
     partial_path_for,
     post_chat_completion,
@@ -232,6 +233,86 @@ def test_json_mode_rejection_falls_back_even_if_another_request_disabled_the_sha
     assert response["choices"][0]["message"]["content"] == "ok"
     assert "response_format" in payloads[0]
     assert "response_format" not in payloads[1]
+
+
+def fake_model_listing(monkeypatch, entries: list[dict], seen: list[str] | None = None):
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"data": entries}).encode("utf-8")
+
+    def fake_urlopen(url, **_kwargs):
+        if seen is not None:
+            seen.append(url)
+        return FakeResponse()
+
+    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+
+
+def test_reasoning_effort_is_sent_only_when_it_is_not_auto(monkeypatch):
+    payloads: list[dict] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"choices": [{"message": {"content": "ok"}}]}'
+
+    def fake_urlopen(request, **_kwargs):
+        payloads.append(json.loads(request.data))
+        return FakeResponse()
+
+    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+
+    post_chat_completion(config=make_config(), messages=[], json_mode=JsonModeState())
+    post_chat_completion(
+        config=make_config(reasoning_effort="none"), messages=[], json_mode=JsonModeState()
+    )
+
+    assert "reasoning_effort" not in payloads[0]
+    assert payloads[1]["reasoning_effort"] == "none"
+
+
+def test_loaded_local_model_skips_embeddings_and_unloaded_models(monkeypatch):
+    seen: list[str] = []
+    fake_model_listing(
+        monkeypatch,
+        [
+            {"id": "text-embedding-nomic", "type": "embeddings", "state": "loaded"},
+            {"id": "qwen3-30b", "type": "llm", "state": "not-loaded"},
+            {"id": "qwen3-8b", "type": "llm", "state": "loaded"},
+        ],
+        seen,
+    )
+
+    assert loaded_local_model("http://localhost:1234/v1") == "qwen3-8b"
+    assert seen == ["http://localhost:1234/api/v0/models"]
+
+
+def test_loaded_local_model_reports_an_idle_server(monkeypatch):
+    fake_model_listing(monkeypatch, [{"id": "qwen3-8b", "type": "llm", "state": "not-loaded"}])
+
+    with pytest.raises(TranslationError, match="no chat model loaded"):
+        loaded_local_model("http://localhost:1234/v1")
+
+
+def test_loaded_local_model_reports_an_unreachable_server(monkeypatch):
+    def refuse(url, **_kwargs):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(translate_module.urllib.request, "urlopen", refuse)
+
+    with pytest.raises(TranslationError, match="which model is loaded"):
+        loaded_local_model("http://localhost:1234/v1")
 
 
 def test_apply_translations_keeps_empty_cues_and_requires_the_rest():

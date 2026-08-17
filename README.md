@@ -13,18 +13,24 @@ brew install ffmpeg
 uv sync
 ```
 
-翻译要用 key(见文末「凭据约定」)。这条命令只检查、不打印 key:
+翻译交给**本机 LM Studio**,不花钱也不用 key:装好 LM Studio,加载一个模型,
+在 Developer 面板里把本地服务器打开(默认 `http://localhost:1234`)。这条命令只检查、不翻译,
+打印出来的就是接下来会用到的模型:
 
 ```bash
-uv run python -c "from video_txt.env import resolve_api_key; resolve_api_key('DEEPSEEK_API_KEY'); print('key 就绪')"
+uv run python -c "from video_txt.translate import loaded_local_model; print(loaded_local_model('http://localhost:1234/v1'))"
 ```
+
+想用云端 DeepSeek(快很多,按量收费)就把下面所有的 `--provider lmstudio` 换成
+`--provider deepseek`,并按文末「凭据约定」准备好 key。两者的取舍见
+[「本机还是云端」](#本机还是云端)。
 
 然后跑:
 
 ```bash
 cd /Users/sun/Documents/docx/video-txt
 
-uv run video-txt run '/绝对路径/你的视频.mp4' --provider deepseek --mux-mode hard
+uv run video-txt run '/绝对路径/你的视频.mp4' --provider lmstudio --mux-mode hard
 ```
 
 跑完在**视频所在目录**得到三个文件:
@@ -38,7 +44,8 @@ uv run video-txt run '/绝对路径/你的视频.mp4' --provider deepseek --mux-
 去掉 `--mux-mode hard` 就是软字幕版,输出 `你的视频.zh-subbed.mp4`,字幕可以在播放器里开关。
 想先看看会执行什么、不真跑,加 `--dry-run`。
 
-参考耗时:24 分钟的 480p 视频,CPU 转写 7.5 分钟 + 翻译 30 秒 + 烧字幕 42 秒,合计约 8.5 分钟。
+参考耗时:24 分钟的 480p 视频,CPU 转写 7.5 分钟 + 烧字幕 42 秒,翻译那一步走云端约 30 秒,
+走本机模型看机器和模型大小,慢不少。
 
 可选功能按需装,首次运行还要下模型权重:
 
@@ -56,13 +63,13 @@ uv sync --extra clone     # 原声克隆(F5-TTS)
 
 | 想做什么 | 命令 |
 | --- | --- |
-| 中文硬字幕成片(最常用) | `uv run video-txt run "$V" --provider deepseek --mux-mode hard` |
+| 中文硬字幕成片(最常用) | `uv run video-txt run "$V" --provider lmstudio --mux-mode hard` |
 | 原片底部已有烧死字幕 | 上面那条加 `--hard-subtitle-layout top`,新字幕放顶部,两边各占一头 |
 | 已有原文 `.srt`,不想重新转写 | 加 `--subtitle '/绝对路径/字幕.srt'` |
 | 电影这类大文件,只要外挂中文字幕 | 见下面「.mkv 电影:只做外挂字幕」 |
-| 已有 `.srt`,只要中文字幕文件 | `uv run video-txt translate '/绝对路径/字幕.srt' --provider deepseek` |
+| 已有 `.srt`,只要中文字幕文件 | `uv run video-txt translate '/绝对路径/字幕.srt' --provider lmstudio` |
 | 只要文字稿,不翻译 | `uv run video-txt transcribe "$V"`,加 `--format srt` 出字幕 |
-| 中文配音 | `uv run video-txt dub "$V" --provider deepseek` |
+| 中文配音 | `uv run video-txt dub "$V" --provider lmstudio` |
 | 对谈类,几个人配几个音色 | 上面那条加 `--diarize` |
 | 保留原讲者的音色 | 再加 `--tts-engine f5-tts` |
 
@@ -83,11 +90,11 @@ uv run video-txt transcribe "$V" -f srt --language ja \
   --whisper-arg=--condition_on_previous_text --whisper-arg=False
 
 # 2. 翻译上一步生成的 .srt
-uv run video-txt translate "${V%.mkv}.srt" --provider deepseek
+uv run video-txt translate "${V%.mkv}.srt" --provider lmstudio
 ```
 
 第 1 步结束会自动体检转写结果,有问题会报出来并以非零退出,所以两步之间用 `&&` 串起来也是安全的:
-转写不干净就不会接着花钱翻译,按提示重转即可。
+转写不干净就不会接着白翻一遍,按提示重转即可。
 
 跑完视频旁边多两个文件:`电影.srt`(日文原文)和 `电影.zh.srt`(中文)。用 IINA 或 VLC 打开电影,
 把 `.zh.srt` 拖进播放窗口就行。两份字幕同前缀,自动加载的播放器可能先挂上日文那份,
@@ -101,14 +108,14 @@ uv run video-txt translate "${V%.mkv}.srt" --provider deepseek
   电影里长段音乐和静默容易让模型卡进重复循环,一句话每 30 秒重复到片尾。
   值必须用等号连接,否则会被 argparse 当成新参数。
 
-参考耗时,一部 109 分钟的 4K 日语电影、CPU 转写:第 1 步 35 分钟,第 2 步 8 分钟
-(1849 条字幕分 7 批并发)。第 1 步装 `--extra mlx` 走 GPU 能快数倍。
+参考耗时,一部 109 分钟的 4K 日语电影、CPU 转写:第 1 步 35 分钟,第 2 步走云端 8 分钟
+(1849 条字幕分 7 批并发),本机模型要久得多。第 1 步装 `--extra mlx` 走 GPU 能快数倍。
 
 **要一个自带字幕的单文件**发给别人时,mkv 还有个便宜做法:软字幕封装是直接流拷贝,
 不重新编码、画质无损,只是要多占一份视频的空间。
 
 ```bash
-uv run video-txt run "$V" --provider deepseek --mux-mode soft --subtitle "${V%.mkv}.srt"
+uv run video-txt run "$V" --provider lmstudio --mux-mode soft --subtitle "${V%.mkv}.srt"
 # → 电影.zh-subbed.mkv,里面一条可开关的中文字幕轨
 ```
 
@@ -116,8 +123,8 @@ uv run video-txt run "$V" --provider deepseek --mux-mode soft --subtitle "${V%.m
 
 ## 重跑规则
 
-每个阶段的产物都落盘,重跑时**已经存在的阶段自动跳过**。所以调字幕样式直接重跑就行,不会重新
-花钱转写和翻译——上面那个 24 分钟的视频,改样式重跑只花 40 秒。
+每个阶段的产物都落盘,重跑时**已经存在的阶段自动跳过**。所以调字幕样式直接重跑就行,
+不会重新转写和翻译——上面那个 24 分钟的视频,改样式重跑只花 40 秒。
 
 | 想强制重做 | 加这个参数 |
 | --- | --- |
@@ -132,7 +139,7 @@ uv run video-txt run "$V" --provider deepseek --mux-mode soft --subtitle "${V%.m
 
 ```bash
 uv sync --extra dub                            # 只做一次,装的是 edge-tts,合成时要联网
-uv run video-txt dub "$V" --provider deepseek
+uv run video-txt dub "$V" --provider lmstudio
 ```
 
 和字幕流程一样先转写、再翻译,然后合成中文语音、按字幕时间轴对齐、混进视频,
@@ -188,7 +195,7 @@ uv run video-txt dub "$V" --provider deepseek
 ```bash
 uv sync --extra diarize
 export HF_TOKEN=hf_xxx        # 也可以放进凭据文件,见文末「凭据约定」
-uv run video-txt dub "$V" --provider deepseek --diarize
+uv run video-txt dub "$V" --provider lmstudio --diarize
 ```
 
 - **首次要过 Hugging Face 门禁。** 模型是 gated 的,得先去
@@ -216,7 +223,7 @@ git clone https://github.com/index-tts/index-tts.git ~/tools/index-tts
 cd ~/tools/index-tts && uv sync                # 独立环境,自带 Python 3.11
 uvx --from huggingface-hub hf download IndexTeam/IndexTTS-2.5 --local-dir checkpoints
 
-uv run video-txt dub "$V" --provider deepseek --tts-engine index-tts \
+uv run video-txt dub "$V" --provider lmstudio --tts-engine index-tts \
   --clone-repo ~/tools/index-tts
 ```
 
@@ -277,7 +284,7 @@ uv run video-txt dub "$V" --provider deepseek --tts-engine index-tts \
 拿到字幕后会自动体检三项:同一句话连续重复超过一分钟(Whisper 听不到人声时空转的特征),
 指定了 `--language ja` 却几乎没有日文字符,以及字幕只覆盖到视频前一半就没了——最后这种
 基本是转写时文件还没下载完(种子按块乱序落盘,文件看着是全尺寸,其实只有开头能解码)。
-`run` 和 `dub` 一旦发现就停在这里,不往下花钱和时间;单独跑 `transcribe` 字幕照样写出来,
+`run` 和 `dub` 一旦发现就停在这里,不往下浪费时间和钱;单独跑 `transcribe` 字幕照样写出来,
 但退出码是 1——用 `&&` 串起来的下一条命令不会跑,想看看问题再决定就分两次跑。
 复用已有 `.srt` 时同样会查。确认没问题,加 `--skip-transcript-check` 跳过。
 
@@ -286,7 +293,7 @@ uv run video-txt dub "$V" --provider deepseek --tts-engine index-tts \
 字号和边距的单位是**视频原始分辨率下的像素**,不传时按分辨率自动换算(1080p ≈ 49px / 54px)。
 
 ```bash
-uv run video-txt run "$V" --provider deepseek --mux-mode hard \
+uv run video-txt run "$V" --provider lmstudio --mux-mode hard \
   --hard-subtitle-font 'PingFang SC' --hard-subtitle-font-size 44 --hard-subtitle-margin-v 60
 ```
 
@@ -300,13 +307,45 @@ uv run video-txt run "$V" --provider deepseek --mux-mode hard \
 
 | 参数 | 说明 |
 | --- | --- |
-| `--provider deepseek` | 一次性设好接口地址、key 变量名和默认模型 `deepseek-v4-flash` |
+| `--provider lmstudio` | 默认推荐。指向本机 `http://localhost:1234/v1`,模型问 LM Studio 要,不花钱也不用 key |
+| `--provider deepseek` | 云端。一次性设好接口地址、key 变量名和默认模型 `deepseek-v4-flash` |
 | `--model` / `--base-url` / `--api-key-env` | 换别的服务时逐项覆盖 |
-| `--concurrency 4` | 并发批数,长视频提速明显;被限流就调小 |
+| `--concurrency 4` | 并发批数,长视频提速明显;被限流或本地服务器扛不住就调小 |
 | `--preserve-term Kubernetes` | 追加保留不译的术语,可传多次;默认已含 Claude、MCP、OpenAI、token 等 AI 术语,长期增删改 `video_txt/constants.py` 的 `DEFAULT_TERMS` |
 | `--note '保持轻松的教程口吻'` | 追加翻译要求 |
 
+### 本机还是云端
+
+文档里的命令一律用 `--provider lmstudio`,因为不花钱。要哪个换哪个,别的参数都不用动。
+
+| | `--provider lmstudio` | `--provider deepseek` |
+| --- | --- | --- |
+| 花钱 | 不花 | 按 token 计费 |
+| key | 不用 | 要,见下面「凭据约定」 |
+| 速度 | 慢,取决于本机和模型大小 | 快,24 分钟的视频约 30 秒译完 |
+| 联网 | 不用 | 要 |
+| 长片 | 先拿一小段试译看质量,再整片跑 | 直接跑 |
+
+**本机这边只有一步准备:** 在 LM Studio 里加载一个模型、打开它的本地服务器。不用给 key,
+也不用 `--model`——工具会问 LM Studio 当前加载的是哪个模型,并打印 `Local model: ...`。
+想钉死某个模型就照常加 `--model`;LM Studio 装在别的机器上就加 `--base-url`。
+
+`lmstudio` 预设还替本地模型改了两个默认值,都是实测调出来的
+(数据见 [NOTES.md](NOTES.md#本地推理模型必须关掉思考)):
+
+- **不让它思考**(`reasoning_effort: none`)。现在的本地模型多半是推理模型,让它想的话翻两句字幕
+  能烧掉四千多个 token、等一分钟,而译文跟不想时没差别。真想让它思考就 `--reasoning-effort high`。
+- **每批 800 字**而不是云端的 3200。一次问它七十条,它答六十条就收尾了。批次小了反而更快。
+
+还是嫌慢或一批跑不完 180 秒,用 `--timeout 600` 放宽、`--concurrency` 调并发。
+
+开头会打印几行 `API rejected response_format; falling back to plain JSON prompting.`——
+LM Studio 不认 `json_object`,工具自动改用纯提示词要 JSON。同时在飞的请求各撞一次,
+所以默认并发下是 4 行,之后不再出现,可以忽略。
+
 ## 凭据约定
+
+只在用云端 provider 时才需要看这节,`--provider lmstudio` 全程不碰 key。
 
 - 任何真实 key 都不写进 README、脚本、提交信息或示例命令,文档里只出现占位符。
 - key 只放两个地方:shell 环境变量,或仓库之外的本地凭据文件。两者都用同样的写法:
@@ -326,7 +365,7 @@ export DEEPSEEK_API_KEY='你的 key'
 
 ```bash
 uv run --python 3.12 python transcribe_media.py '/绝对路径/视频.mp4'
-uv run --python 3.12 python translate_srt.py '/绝对路径/字幕.srt' --provider deepseek
+uv run --python 3.12 python translate_srt.py '/绝对路径/字幕.srt' --provider lmstudio
 uv run --python 3.12 python translate_and_mux_video.py '/绝对路径/视频.mp4' '/绝对路径/字幕.srt' \
   --mux-mode hard
 ```
