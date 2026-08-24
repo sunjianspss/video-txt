@@ -17,6 +17,7 @@ from .arguments import (
     build_dub_command,
     build_mux_command,
     build_project_command,
+    build_retranscribe_range_command,
     build_run_command,
     build_transcribe_command,
     build_translate_command,
@@ -59,6 +60,12 @@ from .project import (
 )
 from .project import write_json as write_project_json
 from .quality import audit_transcript, check_transcript, probe_media_duration, repair_transcript
+from .retranscribe import (
+    RetranscribeError,
+    RetranscribeOptions,
+    parse_timecode,
+    run_retranscribe,
+)
 from .separate import SeparateError
 from .subtitles import (
     SubtitleFormatError,
@@ -640,6 +647,71 @@ def command_transcribe(args: argparse.Namespace, parser: argparse.ArgumentParser
     return 1
 
 
+def command_retranscribe_range(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> int:
+    video = existing_file(parser, args.video, "Video file")
+    subtitle = existing_file(parser, args.subtitle, "Subtitle file")
+    if subtitle.suffix.lower() != ".srt":
+        parser.error(f"Expected an .srt file, got: {subtitle.name}")
+    timed_range = args.from_time is not None or args.to_time is not None
+    cue_range = args.from_cue is not None or args.to_cue is not None
+    if timed_range and cue_range:
+        parser.error("Use either --from/--to or --from-cue/--to-cue, not both.")
+    if not timed_range and not cue_range:
+        parser.error("Pass --from and --to, or --from-cue and --to-cue.")
+    if cue_range:
+        if args.from_cue is None or args.to_cue is None:
+            parser.error("--from-cue and --to-cue must be passed together.")
+        source_cues = parse_srt(subtitle)
+        if args.from_cue < 1 or args.to_cue < args.from_cue:
+            parser.error("Cue range must start at 1 or greater and end at or after its start.")
+        if args.to_cue > len(source_cues):
+            parser.error(
+                f"Cue range ends at {args.to_cue}, but {subtitle.name} has "
+                f"only {len(source_cues)} cues."
+            )
+        start = source_cues[args.from_cue - 1].start_seconds
+        end = source_cues[args.to_cue - 1].end_seconds
+    else:
+        if args.from_time is None or args.to_time is None:
+            parser.error("--from and --to must be passed together.")
+        start = parse_timecode(args.from_time)
+        end = parse_timecode(args.to_time)
+
+    output = resolved(args.output) or subtitle.with_name(f"{subtitle.stem}.repaired.srt")
+    assert output is not None
+    report = resolved(args.report) or output.with_name(
+        f"{output.stem}.retranscription-report.json"
+    )
+    options = RetranscribeOptions(
+        video_path=video,
+        subtitle_path=subtitle,
+        output_path=output,
+        report_path=report,
+        start=start,
+        end=end,
+        padding=args.padding,
+        model=args.whisper_model,
+        language=args.language,
+        backend=args.whisper_backend,
+        device=args.device,
+        initial_prompt=args.initial_prompt,
+        extra_args=args.whisper_args,
+        refine_subtitles=args.refine_subtitles,
+        audio_stream=args.audio_stream,
+        overwrite=args.overwrite,
+        from_cue=args.from_cue,
+        to_cue=args.to_cue,
+    )
+    output = run_retranscribe(options, dry_run=args.dry_run)
+    if args.dry_run:
+        return 0
+    print(f"Repaired: {output}")
+    print(f"Report: {report}")
+    return 0
+
+
 def write_json(path: Path, payload: dict[str, object]) -> Path:
     """Atomically write a generated JSON artifact."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1122,6 +1194,12 @@ COMMANDS = (
         command_transcribe,
     ),
     Command(
+        "retranscribe-range",
+        "Re-run Whisper for one subtitle range and splice it into a new SRT.",
+        build_retranscribe_range_command,
+        command_retranscribe_range,
+    ),
+    Command(
         "translate",
         "Translate an .srt subtitle file with an OpenAI-compatible API.",
         build_translate_command,
@@ -1175,6 +1253,7 @@ def main(argv: list[str] | None = None) -> int:
         MediaError,
         MuxError,
         ProjectError,
+        RetranscribeError,
         SeparateError,
         SubtitleFormatError,
         TerminologyError,

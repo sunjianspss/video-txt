@@ -187,7 +187,9 @@ def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: st
     )
 
 
-def add_transcribe_arguments(parser: argparse.ArgumentParser, *, standalone: bool) -> None:
+def add_transcribe_arguments(
+    parser: argparse.ArgumentParser, *, standalone: bool, include_transcript_check: bool = True
+) -> None:
     group = parser.add_argument_group("transcription")
     model_flags = ["-m", "--model"] if standalone else ["--whisper-model"]
     group.add_argument(
@@ -238,11 +240,12 @@ def add_transcribe_arguments(parser: argparse.ArgumentParser, *, standalone: boo
         dest="whisper_args",
         help="Extra raw argument passed to the backend. Can be passed multiple times.",
     )
-    group.add_argument(
-        "--skip-transcript-check",
-        action="store_true",
-        help="Do not look for repeated lines and wrong-language output in the transcript.",
-    )
+    if include_transcript_check:
+        group.add_argument(
+            "--skip-transcript-check",
+            action="store_true",
+            help="Do not look for repeated lines and wrong-language output in the transcript.",
+        )
 
 
 def add_mux_arguments(parser: argparse.ArgumentParser) -> None:
@@ -544,6 +547,44 @@ def build_transcribe_command(parser: argparse.ArgumentParser) -> None:
     )
     add_transcribe_arguments(parser, standalone=True)
     add_dry_run(parser, "Print the transcription command without running it.")
+
+
+def build_retranscribe_range_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("video", type=Path, help="Path to the source video file.")
+    parser.add_argument(
+        "--subtitle",
+        type=Path,
+        required=True,
+        help="Existing source-language .srt to repair.",
+    )
+    parser.add_argument("--from", dest="from_time", help="Core range start as HH:MM:SS[.mmm].")
+    parser.add_argument("--to", dest="to_time", help="Core range end as HH:MM:SS[.mmm].")
+    parser.add_argument("--from-cue", type=int, help="First one-based source cue to replace.")
+    parser.add_argument("--to-cue", type=int, help="Last one-based source cue to replace.")
+    parser.add_argument(
+        "--padding",
+        type=float,
+        default=1.5,
+        help="Context seconds extracted before and after the core range. Defaults to 1.5.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="New repaired .srt path. Defaults to '<subtitle>.repaired.srt'.",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path. Defaults beside the repaired subtitle.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite generated output and report files, never the source subtitle.",
+    )
+    add_transcribe_arguments(parser, standalone=True, include_transcript_check=False)
+    add_dry_run(parser, "Show the extraction and replacement plan without writing files.")
 
 
 def build_audit_command(parser: argparse.ArgumentParser) -> None:

@@ -72,6 +72,42 @@ uv run --python 3.12 video-txt project run project.video-txt.json
 - 没有 state 时，已有目标译文或成片视为外部文件，真实运行会拒绝覆盖；先 dry-run，或把文件移开/改输出路径。
 - `project run --dry-run` 不写字幕、成片或 state。原有 `run`、`dub`、`translate` 等命令行为不变。
 
+## 指定时间段局部重新识别（v0.7）
+
+长片只有少量字幕听错时，不必重新识别整部电影。按绝对时间指定核心区间：
+
+```bash
+V='/绝对路径/电影.mkv'
+S='/绝对路径/电影.srt'
+
+uv run --python 3.12 video-txt retranscribe-range "$V" \
+  --subtitle "$S" \
+  --from 00:19:30 --to 00:20:10 \
+  --language en --audio-stream 2 \
+  -o '/绝对路径/电影.repaired.srt'
+```
+
+知道字幕位置时也可按一基序号选择（这里指 SRT 中第 320～335 条，而不是依赖文件里可能损坏的
+显示编号）：
+
+```bash
+uv run --python 3.12 video-txt retranscribe-range "$V" \
+  --subtitle "$S" --from-cue 320 --to-cue 335 \
+  --language en --audio-stream 2 \
+  -o '/绝对路径/电影.repaired.srt'
+```
+
+命令默认在核心区间前后各提取 1.5 秒上下文，可用 `--padding` 调整。它复用现有多音轨选择、
+OpenAI Whisper / MLX Whisper、`--model`、`--initial-prompt`、`--whisper-arg` 和
+`--refine-subtitles`；临时 16 kHz 单声道 WAV 及 Whisper 中间文件会自动清理。局部时间戳会加回
+全片偏移，padding 中重复识别的边界字幕会被丢弃，结果重新排序并连续编号。
+
+源字幕始终只读。省略 `-o` 时默认生成 `<字幕名>.repaired.srt`，同时写出
+`<输出名>.retranscription-report.json`，记录核心/提取区间、音轨选择依据、删除和新增的字幕。
+已有生成物默认不覆盖；确认替换时加 `--overwrite`。先加 `--dry-run` 可只查看音频提取、Whisper 和
+替换计划，不写任何文件。v0.7.0 只修原文 SRT，不会修改已有译文；局部翻译与翻译审计更新留到
+v0.7.1。
+
 参考耗时:24 分钟的 480p 视频,CPU 转写 7.5 分钟 + 烧字幕 42 秒,翻译那一步走云端约 30 秒,
 走本机模型看机器和模型大小,慢不少。
 
@@ -95,6 +131,7 @@ uv sync --extra clone     # 原声克隆(F5-TTS)
 | 自动修掉过长、满屏的 Whisper 字幕 | 上面那条加 `--refine-subtitles` |
 | 已有 `.srt`,先检查质量 | `uv run --python 3.12 video-txt audit '/绝对路径/字幕.srt'` |
 | 已有 `.srt`,安全清理明显坏块 | `uv run --python 3.12 video-txt clean '/绝对路径/字幕.srt' -o '/绝对路径/字幕.clean.srt'` |
+| 只重识别一小段错误字幕 | `uv run --python 3.12 video-txt retranscribe-range "$V" --subtitle source.srt --from 00:19:30 --to 00:20:10` |
 | 固定人名/术语译法并审计译文 | 翻译命令加 `--term-file project.terms.json`,详见 v0.5 |
 | 双语或多音轨影片 | 正常传 `--language en`;选不准时再加 `--audio-stream 2` |
 | 原片底部已有烧死字幕 | 上面那条加 `--hard-subtitle-layout top`,新字幕放顶部,两边各占一头 |
@@ -568,7 +605,8 @@ uv run ruff check . && uv run ruff format .
 `diarize.py`(说话人分离)、
 `clone.py`(参考音频抽取与克隆编排)、`clone_worker.py`(在模型自己的环境里合成的独立脚本)、
 `voices.py`(音色分配)、`timeline.py`(语音片段对齐与整轨渲染)、`dub.py`(配音编排)、
-`transcribe.py`、`mux.py`、`pipeline.py`(阶段编排)、`project.py`(项目配置、内容指纹与阶段失效)、
+`transcribe.py`、`retranscribe.py`(局部音频提取、重识别与 SRT 拼接)、`mux.py`、
+`pipeline.py`(阶段编排)、`project.py`(项目配置、内容指纹与阶段失效)、
 `arguments.py`(命令行参数声明)、
 `cli.py`(参数校验与命令处理)、`env.py`(凭据读取)、`parallel.py`(线程池)。
 

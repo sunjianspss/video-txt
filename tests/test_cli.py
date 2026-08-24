@@ -235,6 +235,58 @@ def test_audio_stream_override_is_available_to_transcribe_run_and_dub():
     assert cli_module.build_transcribe_stage(dub).audio_stream == 4
 
 
+def test_retranscribe_range_flags_parse():
+    timed = parse(
+        [
+            "retranscribe-range",
+            "movie.mkv",
+            "--subtitle",
+            "movie.srt",
+            "--from",
+            "00:19:30",
+            "--to",
+            "00:20:10.500",
+            "--padding",
+            "2",
+            "--language",
+            "en",
+            "--audio-stream",
+            "2",
+            "--backend",
+            "mlx-whisper",
+            "--model",
+            "large-v3",
+            "--refine-subtitles",
+            "-o",
+            "movie.repaired.srt",
+        ]
+    )
+    by_cue = parse(
+        [
+            "retranscribe-range",
+            "movie.mkv",
+            "--subtitle",
+            "movie.srt",
+            "--from-cue",
+            "320",
+            "--to-cue",
+            "335",
+        ]
+    )
+
+    assert (timed.from_time, timed.to_time, timed.padding) == (
+        "00:19:30",
+        "00:20:10.500",
+        2.0,
+    )
+    assert timed.audio_stream == 2
+    assert timed.whisper_backend == "mlx-whisper"
+    assert timed.whisper_model == "large-v3"
+    assert timed.refine_subtitles is True
+    assert timed.output == Path("movie.repaired.srt")
+    assert (by_cue.from_cue, by_cue.to_cue) == (320, 335)
+
+
 def test_transcribe_passes_refinement_to_the_backend(project, monkeypatch):
     video, _ = project
     seen = []
