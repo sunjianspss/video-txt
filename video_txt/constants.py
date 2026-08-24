@@ -10,7 +10,7 @@ DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_TIMEOUT = 180.0
 
 # "auto" means: say nothing about reasoning and let the model do whatever it defaults to.
-REASONING_EFFORTS = ("auto", "none", "low", "medium", "high")
+REASONING_EFFORTS = ("auto", "none", "low", "medium", "high", "max")
 
 # AI terms that stay in the original language in every translation.
 # Add terms here to keep them untranslated for good; --preserve-term adds per-run ones.
@@ -43,6 +43,9 @@ PROVIDERS = {
         "base_url": "https://api.deepseek.com",
         "api_key_env": "DEEPSEEK_API_KEY",
         "model": "deepseek-v4-flash",
+        # V4 enables thinking by default. Subtitle translation is a deterministic
+        # transformation, so keep the fast non-thinking mode unless explicitly changed.
+        "thinking": "disabled",
     },
     # A model running on this machine: no bill, no key, and no fixed model name
     # either — whichever one LM Studio has loaded is the one we ask for.

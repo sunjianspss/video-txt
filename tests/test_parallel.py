@@ -46,6 +46,26 @@ def test_the_jobs_still_queued_behind_a_failure_are_dropped():
     assert len(started) < 12
 
 
+def test_a_later_failure_is_seen_before_an_earlier_slow_job_finishes():
+    started: list[int] = []
+    lock = threading.Lock()
+    beginning = time.monotonic()
+
+    def work(job: int) -> None:
+        with lock:
+            started.append(job)
+        if job == 0:
+            time.sleep(0.5)
+        elif job == 1:
+            raise RuntimeError("the second request failed first")
+
+    with pytest.raises(RuntimeError, match="second request failed first"):
+        map_in_parallel(list(range(12)), work, workers=2)
+
+    assert time.monotonic() - beginning < 0.3
+    assert len(started) < 12
+
+
 def test_one_worker_needs_no_pool():
     assert map_in_parallel([1, 2], lambda job: job * 2, workers=1) == [2, 4]
     assert map_in_parallel([], lambda job: job, workers=8) == []

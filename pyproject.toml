@@ -1,6 +1,6 @@
 [project]
 name = "video-txt"
-version = "0.2.0"
+version = "0.6.0"
 description = "Transcribe, translate, subtitle and dub local audio or video files."
 readme = "README.md"
 requires-python = ">=3.12"

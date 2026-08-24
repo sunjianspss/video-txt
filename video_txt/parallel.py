@@ -8,7 +8,7 @@ whole of it — there is no CPU work here worth a process pool.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
 
 
 def map_in_parallel[T, R](jobs: Sequence[T], work: Callable[[T], R], *, workers: int) -> list[R]:
@@ -22,11 +22,29 @@ def map_in_parallel[T, R](jobs: Sequence[T], work: Callable[[T], R], *, workers:
     if limit == 1:
         return [work(job) for job in jobs]
 
-    with ThreadPoolExecutor(max_workers=limit) as pool:
+    pool = ThreadPoolExecutor(max_workers=limit)
+    futures = []
+    try:
         futures = [pool.submit(work, job) for job in jobs]
-        try:
-            return [future.result() for future in futures]
-        except BaseException:
-            for queued in futures:
-                queued.cancel()
-            raise
+        done, _pending = wait(futures, return_when=FIRST_EXCEPTION)
+        failed = next(
+            (
+                future
+                for future in done
+                if not future.cancelled() and future.exception() is not None
+            ),
+            None,
+        )
+        if failed is not None:
+            failed.result()
+        results = [future.result() for future in futures]
+    except BaseException:
+        for queued in futures:
+            queued.cancel()
+        # Running network calls cannot be killed safely, but they must not keep
+        # this function from surfacing a sibling failure immediately.
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
+        return results

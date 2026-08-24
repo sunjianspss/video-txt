@@ -53,6 +53,26 @@ def test_a_cloned_clip_is_cached_against_the_reference_it_came_from(tmp_path):
     assert first.identity != reworded.identity
 
 
+def test_same_named_reference_clips_with_different_audio_never_share_a_cache_key(tmp_path):
+    first_audio = tmp_path / "host" / "ref.wav"
+    second_audio = tmp_path / "guest" / "ref.wav"
+    first_audio.parent.mkdir()
+    second_audio.parent.mkdir()
+    first_audio.write_bytes(b"first voice")
+    second_audio.write_bytes(b"second voice")
+
+    first = VoiceChoice(
+        name="main@F5TTS_v1_Base",
+        reference=Reference(speaker="", audio=first_audio, text="same words"),
+    )
+    second = VoiceChoice(
+        name="main@F5TTS_v1_Base",
+        reference=Reference(speaker="", audio=second_audio, text="same words"),
+    )
+
+    assert first.identity != second.identity
+
+
 def test_the_speaker_who_talks_most_keeps_the_voice_that_was_chosen():
     names = voices_for(["SPEAKER_00", "SPEAKER_01", "SPEAKER_02"])
 

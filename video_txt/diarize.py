@@ -13,11 +13,12 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .media import file_identity
 from .subtitles import SubtitleCue
 
 DEFAULT_MODEL = "pyannote/speaker-diarization-3.1"
 DEFAULT_TOKEN_ENV = "HF_TOKEN"
-SPEAKERS_VERSION = 1
+SPEAKERS_VERSION = 2
 # The label every line carries when nobody ran diarization: one speaker, no name.
 DEFAULT_SPEAKER = ""
 # Diarization returns slivers where two turns touch. They are not speech anyone
@@ -148,10 +149,27 @@ def diarize_media(media: Path, options: DiarizeOptions) -> list[SpeakerTurn]:
     return collect_turns(pipeline(str(media), **limits))
 
 
-def save_turns(path: Path, turns: list[SpeakerTurn], *, model: str) -> Path:
+def diarize_cache_key(video: Path, options: DiarizeOptions) -> dict[str, object]:
+    return {
+        "source": file_identity(video),
+        "model": options.model,
+        "speakers": options.speakers,
+        "min_speakers": options.min_speakers,
+        "max_speakers": options.max_speakers,
+    }
+
+
+def save_turns(
+    path: Path,
+    turns: list[SpeakerTurn],
+    *,
+    model: str,
+    cache_key: dict[str, object] | None = None,
+) -> Path:
     payload = {
         "version": SPEAKERS_VERSION,
         "model": model,
+        "cache_key": cache_key,
         "turns": [
             {"start": round(turn.start, 3), "end": round(turn.end, 3), "speaker": turn.speaker}
             for turn in turns
@@ -162,7 +180,12 @@ def save_turns(path: Path, turns: list[SpeakerTurn], *, model: str) -> Path:
     return path
 
 
-def load_turns(path: Path, *, model: str) -> list[SpeakerTurn] | None:
+def load_turns(
+    path: Path,
+    *,
+    model: str,
+    cache_key: dict[str, object] | None = None,
+) -> list[SpeakerTurn] | None:
     """Turns from an earlier run, or None when there is nothing usable to reuse."""
     if not path.is_file():
         return None
@@ -173,6 +196,8 @@ def load_turns(path: Path, *, model: str) -> list[SpeakerTurn] | None:
     if not isinstance(payload, dict) or payload.get("version") != SPEAKERS_VERSION:
         return None
     if payload.get("model") != model:
+        return None
+    if cache_key is not None and payload.get("cache_key") != cache_key:
         return None
 
     turns: list[SpeakerTurn] = []
@@ -256,8 +281,9 @@ def ensure_speakers(
     """Diarize the video, or reuse the turns an earlier run already wrote."""
     prefix = f"{label} " if label else ""
     path = speakers_path(video)
+    cache_key = diarize_cache_key(video, options)
     if not options.rediarize:
-        cached = load_turns(path, model=options.model)
+        cached = load_turns(path, model=options.model, cache_key=cache_key)
         if cached is not None:
             print(f"{prefix}Diarize: skip, reusing {path}")
             print(f"  {len(speaker_totals(cached))} speakers: {describe_speakers(cached)}")
@@ -275,7 +301,7 @@ def ensure_speakers(
             f"{options.model} found no speech in {video.name}. "
             "Drop --diarize, or check that the video has an audio track."
         )
-    save_turns(path, turns, model=options.model)
+    save_turns(path, turns, model=options.model, cache_key=cache_key)
     print(f"  {len(speaker_totals(turns))} speakers: {describe_speakers(turns)}")
     print(f"  Wrote the speaker turns to: {path}")
     return turns

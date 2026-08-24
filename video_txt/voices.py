@@ -39,7 +39,7 @@ class VoiceChoice:
         """What makes this voice different from another, for the clip cache."""
         if self.reference is None:
             return self.name
-        return f"{self.name}|{self.reference.audio.name}|{self.reference.text}"
+        return f"{self.name}|{self.reference.fingerprint}"
 
 
 @dataclass

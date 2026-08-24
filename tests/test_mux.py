@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from video_txt import mux as mux_module
 from video_txt.media import MediaError, parse_video_size, quote_filter_value
 from video_txt.mux import (
     MuxError,
@@ -12,6 +14,7 @@ from video_txt.mux import (
     build_subtitles_filter,
     default_video_output,
     resolve_subtitle_codec,
+    run_mux,
     styled_subtitle_path,
     validate_output_container,
 )
@@ -166,6 +169,70 @@ def test_quote_filter_value_escapes_single_quotes():
 def test_styled_subtitle_path_names_the_layout():
     assert styled_subtitle_path(Path("/v/a.zh.srt"), "top").name == "a.zh.top.ass"
     assert styled_subtitle_path(Path("/v/a.zh.srt"), "normal").name == "a.zh.normal.ass"
+
+
+def test_hard_mux_never_overwrites_a_same_named_ass_file(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    subtitle = tmp_path / "clip.zh.srt"
+    output = tmp_path / "out.mp4"
+    video.write_bytes(b"video")
+    subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
+    caller_ass = styled_subtitle_path(subtitle, "normal")
+    caller_ass.write_text("caller-owned\n", encoding="utf-8")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr(mux_module, "find_ffmpeg", lambda **_kwargs: "ffmpeg")
+    monkeypatch.setattr(mux_module, "probe_video_size", lambda *_args, **_kwargs: (1280, 720))
+    monkeypatch.setattr(
+        mux_module.subprocess,
+        "run",
+        lambda command: (
+            commands.append(command),
+            Path(command[-1]).write_bytes(b"video"),
+            SimpleNamespace(returncode=0),
+        )[-1],
+    )
+
+    run_mux(
+        MuxOptions(
+            video_input=video,
+            subtitle_input=subtitle,
+            video_output=output,
+            mux_mode="hard",
+        )
+    )
+
+    assert caller_ass.read_text(encoding="utf-8") == "caller-owned\n"
+    assert str(caller_ass) not in commands[0][commands[0].index("-vf") + 1]
+
+
+def test_failed_mux_preserves_an_existing_output_video(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    subtitle = tmp_path / "clip.zh.srt"
+    output = tmp_path / "out.mp4"
+    video.write_bytes(b"video")
+    subtitle.write_text("1\n00:00:01,000 --> 00:00:02,000\nhello\n", encoding="utf-8")
+    output.write_bytes(b"known-good video")
+
+    def interrupted(command):
+        Path(command[-1]).write_bytes(b"partial replacement")
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(mux_module, "find_ffmpeg", lambda **_kwargs: "ffmpeg")
+    monkeypatch.setattr(mux_module.subprocess, "run", interrupted)
+
+    with pytest.raises(MuxError, match="exit code 1"):
+        run_mux(
+            MuxOptions(
+                video_input=video,
+                subtitle_input=subtitle,
+                video_output=output,
+                overwrite=True,
+            )
+        )
+
+    assert output.read_bytes() == b"known-good video"
+    assert list(tmp_path.glob(".out.*.part.mp4")) == []
 
 
 def test_parse_video_size():

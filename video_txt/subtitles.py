@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import html
+import os
 import re
+import tempfile
+import unicodedata
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -77,6 +81,10 @@ TIMING_PATTERN = re.compile(
     r"(?P<start>\d+:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(?P<end>\d+:\d{2}:\d{2}[,.]\d{1,3})"
 )
 TIMESTAMP_PATTERN = re.compile(r"(\d+):(\d{2}):(\d{2})[,.](\d{1,3})")
+SUBTITLE_TAG_PATTERN = re.compile(
+    r"</?(?:b|i|u|s|font|span|ruby|rt|br|c|v|lang)(?:\s+[^<>]*)?\s*/?>",
+    re.IGNORECASE,
+)
 
 
 class SubtitleFormatError(ValueError):
@@ -130,6 +138,11 @@ class SubtitleCue:
 
 def is_cjk(char: str) -> bool:
     return "\u3000" <= char <= "\u9fff" or "\uff00" <= char <= "\uffef"
+
+
+def display_width(text: str) -> int:
+    """Approximate terminal/subtitle width, counting wide CJK glyphs as two columns."""
+    return sum(2 if unicodedata.east_asian_width(char) in {"F", "W"} else 1 for char in text)
 
 
 def join_text_parts(parts: list[str]) -> str:
@@ -244,7 +257,26 @@ def serialize_srt(cues: list[SubtitleCue]) -> str:
 
 def write_srt(path: Path, cues: list[SubtitleCue]) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(serialize_srt(cues), encoding="utf-8")
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        handle = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        fd = -1
+        with handle:
+            handle.write(serialize_srt(cues))
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except Exception:
+        if fd >= 0:
+            with suppress(OSError):
+                os.close(fd)
+        temporary.unlink(missing_ok=True)
+        raise
     return path
 
 
@@ -276,7 +308,7 @@ def chunk_cues(cues: list[SubtitleCue], batch_chars: int) -> list[list[SubtitleC
 
 def escape_ass_text(value: str) -> str:
     text = html.unescape(value.strip())
-    text = re.sub(r"<[^>]+>", "", text)
+    text = SUBTITLE_TAG_PATTERN.sub("", text)
     return text.replace("\\", r"\\").replace("{", r"\{").replace("}", r"\}")
 
 

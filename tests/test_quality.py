@@ -176,6 +176,30 @@ def test_a_transcript_that_cannot_be_read_is_not_second_guessed(tmp_path: Path):
     assert check_transcript(unreadable) is None
 
 
+def test_pipeline_check_now_catches_a_single_full_window_hallucination(tmp_path: Path):
+    subtitle = tmp_path / "clip.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:29,980\nThank you.\n",
+        encoding="utf-8",
+    )
+
+    report = check_transcript(subtitle, language="en")
+
+    assert report is not None
+    assert "full Whisper decoding window" in report
+
+
+def test_pipeline_check_does_not_block_on_review_only_layout_findings(tmp_path: Path):
+    subtitle = tmp_path / "clip.srt"
+    subtitle.write_text(
+        "1\n00:00:01,000 --> 00:00:04,000\nFirst speaker.\n\n"
+        "2\n00:00:03,500 --> 00:00:05,000\nSecond speaker.\n",
+        encoding="utf-8",
+    )
+
+    assert check_transcript(subtitle) is None
+
+
 def broken_subtitle(tmp_path: Path) -> Path:
     path = tmp_path / "clip.en.srt"
     path.write_text(

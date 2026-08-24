@@ -14,11 +14,13 @@ own, and --clone-python points the same script at that interpreter.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from functools import cached_property
 from pathlib import Path
 
 from .diarize import DEFAULT_SPEAKER
@@ -58,6 +60,23 @@ class Reference:
     @property
     def label(self) -> str:
         return self.speaker or "main"
+
+    @cached_property
+    def fingerprint(self) -> str:
+        """Audio and transcript identity used to isolate synthesized-clip caches."""
+        digest = hashlib.sha1()
+        resolved = self.audio.expanduser().resolve()
+        try:
+            with resolved.open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            # Dry runs and unit-level plans can name a future reference clip. Its
+            # absolute path still prevents unrelated same-named clips from colliding.
+            digest.update(str(resolved).encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(self.text.encode("utf-8"))
+        return digest.hexdigest()
 
 
 @dataclass

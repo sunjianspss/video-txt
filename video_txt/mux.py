@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from .constants import DEFAULT_LANGUAGE_CODE
-from .media import find_ffmpeg, format_command, probe_video_size, quote_filter_value
+from .media import (
+    find_ffmpeg,
+    format_command,
+    probe_video_size,
+    quote_filter_value,
+    temporary_output_path,
+)
 from .subtitles import (
     SubtitleCue,
     language_suffix,
@@ -127,6 +134,7 @@ def prepare_styled_subtitle(
     *,
     ffmpeg_path: str,
     cues: list[SubtitleCue] | None = None,
+    output_path: Path | None = None,
 ) -> Path:
     width, height = options.video_size or probe_video_size(
         options.video_input, ffmpeg_path=ffmpeg_path
@@ -138,7 +146,7 @@ def prepare_styled_subtitle(
         f"Subtitle style: {options.font} {font_size}px, margin {margin_v}px, video {width}x{height}"
     )
     return write_ass_subtitle(
-        styled_subtitle_path(options.subtitle_input, options.hard_layout),
+        output_path or styled_subtitle_path(options.subtitle_input, options.hard_layout),
         cues=cues if cues is not None else parse_srt(options.subtitle_input),
         video_width=width,
         video_height=height,
@@ -257,18 +265,42 @@ def run_mux(options: MuxOptions, *, dry_run: bool = False) -> Path:
             "Pass --overwrite-video to replace it."
         )
 
-    if options.mux_mode == "hard":
-        print("Preparing styled hard subtitle layout...")
-        subtitle_for_mux = prepare_styled_subtitle(options, ffmpeg_path=ffmpeg_path)
+    temporary_directory: TemporaryDirectory[str] | None = None
+    temporary_video: Path | None = None
+    try:
+        if options.mux_mode == "hard":
+            print("Preparing styled hard subtitle layout...")
+            temporary_directory = TemporaryDirectory(prefix="video-txt-ass-")
+            temporary_ass = (
+                Path(temporary_directory.name)
+                / styled_subtitle_path(options.subtitle_input, options.hard_layout).name
+            )
+            subtitle_for_mux = prepare_styled_subtitle(
+                options,
+                ffmpeg_path=ffmpeg_path,
+                output_path=temporary_ass,
+            )
 
-    command = build_mux_command(options, ffmpeg_path=ffmpeg_path, subtitle_for_mux=subtitle_for_mux)
-    if options.mux_mode == "soft":
-        print("Muxing soft subtitles into the video container...")
-    else:
-        print("Burning hard subtitles into the video frames...")
+        options.video_output.parent.mkdir(parents=True, exist_ok=True)
+        temporary_video = temporary_output_path(options.video_output)
+        command_options = replace(options, video_output=temporary_video, overwrite=True)
+        command = build_mux_command(
+            command_options, ffmpeg_path=ffmpeg_path, subtitle_for_mux=subtitle_for_mux
+        )
+        if options.mux_mode == "soft":
+            print("Muxing soft subtitles into the video container...")
+        else:
+            print("Burning hard subtitles into the video frames...")
 
-    options.video_output.parent.mkdir(parents=True, exist_ok=True)
-    completed = subprocess.run(command)
-    if completed.returncode != 0:
-        raise MuxError(f"ffmpeg failed with exit code {completed.returncode}.")
-    return options.video_output
+        completed = subprocess.run(command)
+        if completed.returncode != 0:
+            raise MuxError(f"ffmpeg failed with exit code {completed.returncode}.")
+        if not temporary_video.is_file() or temporary_video.stat().st_size == 0:
+            raise MuxError("ffmpeg reported success but did not write the output video.")
+        temporary_video.replace(options.video_output)
+        return options.video_output
+    finally:
+        if temporary_video is not None:
+            temporary_video.unlink(missing_ok=True)
+        if temporary_directory is not None:
+            temporary_directory.cleanup()

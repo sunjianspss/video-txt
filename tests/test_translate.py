@@ -8,6 +8,7 @@ import pytest
 
 from video_txt import translate as translate_module
 from video_txt.subtitles import SubtitleCue, parse_srt_text
+from video_txt.terminology import Term, Terminology
 from video_txt.translate import (
     ApiHttpError,
     ApiNetworkError,
@@ -27,6 +28,7 @@ from video_txt.translate import (
     parse_translation_json,
     partial_path_for,
     post_chat_completion,
+    request_items,
     strip_code_fence,
 )
 
@@ -51,10 +53,18 @@ def test_parse_translation_json_rejects_bad_payloads():
         parse_translation_json("not json at all")
     with pytest.raises(ResponseFormatError, match="items"):
         parse_translation_json(json.dumps({"result": "nope"}))
+    with pytest.raises(ResponseFormatError, match="object or list"):
+        parse_translation_json(json.dumps("not an object"))
     with pytest.raises(ResponseFormatError, match="without an id"):
         parse_translation_json(json.dumps({"items": [{"text": "x"}]}))
     with pytest.raises(ResponseFormatError, match="non-string"):
         parse_translation_json(json.dumps({"items": [{"id": "1", "text": 5}]}))
+    with pytest.raises(ResponseFormatError, match="empty translation"):
+        parse_translation_json(json.dumps({"items": [{"id": "1", "text": "  "}]}))
+    with pytest.raises(ResponseFormatError, match="duplicate id"):
+        parse_translation_json(
+            json.dumps({"items": [{"id": "1", "text": "一"}, {"id": "1", "text": "又一"}]})
+        )
 
 
 def test_strip_code_fence_leaves_plain_text_alone():
@@ -74,6 +84,25 @@ def test_build_messages_carries_ids_terms_and_context():
     assert payload["extra_note"] == "casual"
     assert payload["context_before"] == [{"source": "prior line", "translation": "上一句"}]
     assert messages[0]["role"] == "system"
+
+
+def test_build_messages_and_resume_identity_include_project_terminology():
+    batch = [("1", SubtitleCue("1", "00:00:01,000 --> 00:00:02,000", ["Woody"]))]
+    terminology = Terminology(
+        source_language="en",
+        target_language="Simplified Chinese",
+        terms=(Term("Woody", "胡迪", "word", ("伍迪",)),),
+    )
+    config = make_config(terminology=terminology)
+
+    payload = json.loads(build_messages(batch, config=config, context_before=[])[1]["content"])
+    assert payload["terminology"] == [{"source": "Woody", "target": "胡迪"}]
+    assert any("terminology" in rule for rule in payload["rules"])
+
+    meta = build_partial_meta([batch[0][1]], config)
+    assert meta["terminology"]["terms"] == [
+        {"source": "Woody", "target": "胡迪", "match": "word", "aliases": ["伍迪"]}
+    ]
 
 
 def test_build_messages_omits_context_when_empty():
@@ -183,6 +212,8 @@ def test_partial_path_and_meta_shape(tmp_path):
         ("note", "keep it formal"),
         ("batch_chars", 100),
         ("context_cues", 0),
+        ("thinking", "enabled"),
+        ("reasoning_effort", "high"),
     ],
 )
 def test_partial_meta_changes_with_every_output_affecting_setting(setting, changed):
@@ -235,6 +266,52 @@ def test_json_mode_rejection_falls_back_even_if_another_request_disabled_the_sha
     assert "response_format" not in payloads[1]
 
 
+def test_a_200_response_with_invalid_json_is_retried(monkeypatch):
+    bodies = [
+        b"this is not json",
+        json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({"items": [{"id": "1", "text": "\u4f60\u597d"}]})
+                        }
+                    }
+                ]
+            }
+        ).encode(),
+    ]
+    calls = 0
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return bodies.pop(0)
+
+    def fake_urlopen(_request, **_kwargs):
+        nonlocal calls
+        calls += 1
+        return FakeResponse()
+
+    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+
+    result = request_items(
+        ids=["1"],
+        build_request=lambda _ids: [],
+        config=make_config(retries=1, backoff_base=0, backoff_cap=0),
+        json_mode=JsonModeState(),
+        debug_dir=None,
+    )
+
+    assert result == {"1": "\u4f60\u597d"}
+    assert calls == 2
+
+
 def fake_model_listing(monkeypatch, entries: list[dict], seen: list[str] | None = None):
     class FakeResponse:
         def __enter__(self):
@@ -280,6 +357,34 @@ def test_reasoning_effort_is_sent_only_when_it_is_not_auto(monkeypatch):
 
     assert "reasoning_effort" not in payloads[0]
     assert payloads[1]["reasoning_effort"] == "none"
+
+
+def test_thinking_toggle_is_sent_only_when_a_provider_sets_it(monkeypatch):
+    payloads: list[dict] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return b'{"choices": [{"message": {"content": "ok"}}]}'
+
+    def fake_urlopen(request, **_kwargs):
+        payloads.append(json.loads(request.data))
+        return FakeResponse()
+
+    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+
+    post_chat_completion(config=make_config(), messages=[], json_mode=JsonModeState())
+    post_chat_completion(
+        config=make_config(thinking="disabled"), messages=[], json_mode=JsonModeState()
+    )
+
+    assert "thinking" not in payloads[0]
+    assert payloads[1]["thinking"] == {"type": "disabled"}
 
 
 def test_loaded_local_model_skips_embeddings_and_unloaded_models(monkeypatch):

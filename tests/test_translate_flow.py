@@ -7,6 +7,7 @@ import pytest
 
 from video_txt import translate as translate_module
 from video_txt.subtitles import parse_srt, parse_srt_text, write_srt
+from video_txt.terminology import Term, Terminology
 from video_txt.translate import (
     ApiHttpError,
     PartialStore,
@@ -258,3 +259,71 @@ def test_dry_run_writes_nothing(srt, fake_api, tmp_path):
     translate_subtitle_file(input_path=srt, output_path=output, config=make_config(), dry_run=True)
     assert not output.exists()
     assert fake_api.requests == []
+
+
+def test_translation_normalizes_terms_and_writes_a_clean_audit_report(tmp_path, monkeypatch):
+    source = tmp_path / "story.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nWoody is here.\n", encoding="utf-8"
+    )
+    output = tmp_path / "story.zh.srt"
+
+    def translated_alias(**_kwargs):
+        content = json.dumps({"items": [{"id": "1", "text": "伍迪来了。"}]})
+        return {"choices": [{"message": {"content": content}}]}
+
+    monkeypatch.setattr(translate_module, "post_chat_completion", translated_alias)
+    terminology = Terminology(
+        source_language="en",
+        target_language="Simplified Chinese",
+        terms=(Term("Woody", "胡迪", "word", ("伍迪",)),),
+    )
+
+    translate_subtitle_file(
+        input_path=source,
+        output_path=output,
+        config=make_config(terminology=terminology),
+    )
+
+    assert parse_srt(output)[0].text == "胡迪来了。"
+    report = json.loads(
+        (tmp_path / "story.zh.translation-audit.json").read_text(encoding="utf-8")
+    )
+    assert report["schema"] == "video-txt.translation-audit"
+    assert report["is_clean"] is True
+    assert report["enforcement"]["changed_cue_count"] == 1
+
+
+def test_unresolved_terminology_stops_after_preserving_the_translation_and_report(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "story.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nWoody is here.\n", encoding="utf-8"
+    )
+    output = tmp_path / "story.zh.srt"
+
+    def missing_term(**_kwargs):
+        content = json.dumps({"items": [{"id": "1", "text": "他来了。"}]})
+        return {"choices": [{"message": {"content": content}}]}
+
+    monkeypatch.setattr(translate_module, "post_chat_completion", missing_term)
+    terminology = Terminology(
+        source_language="en",
+        target_language="Simplified Chinese",
+        terms=(Term("Woody", "胡迪", "word"),),
+    )
+
+    with pytest.raises(translate_module.TranslationError, match="audit found 1 error"):
+        translate_subtitle_file(
+            input_path=source,
+            output_path=output,
+            config=make_config(terminology=terminology),
+        )
+
+    assert output.is_file()
+    report = json.loads(
+        (tmp_path / "story.zh.translation-audit.json").read_text(encoding="utf-8")
+    )
+    assert report["has_errors"] is True
+    assert report["findings"][0]["code"] == "glossary_target_missing"

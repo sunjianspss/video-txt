@@ -22,6 +22,13 @@ from .constants import (
 )
 from .parallel import map_in_parallel
 from .subtitles import SubtitleCue, chunk_cues, parse_srt, serialize_srt, write_srt
+from .terminology import (
+    Terminology,
+    audit_translation,
+    enforce_terminology,
+    translation_audit_path_for,
+    write_translation_audit_report,
+)
 
 RETRYABLE_STATUS = {408, 409, 425, 429}
 
@@ -58,6 +65,7 @@ class TranslationConfig:
     target_language: str = DEFAULT_TARGET_LANGUAGE
     source_language: str | None = None
     preserve_terms: list[str] = field(default_factory=list)
+    terminology: Terminology | None = None
     note: str | None = None
     # The lines are written to be spoken by a voice, not read off the screen.
     spoken: bool = False
@@ -65,6 +73,8 @@ class TranslationConfig:
     retries: int = 2
     concurrency: int = DEFAULT_CONCURRENCY
     context_cues: int = 3
+    # Provider-specific thinking toggle. "auto" leaves the request untouched.
+    thinking: str = "auto"
     # "auto" (or None) leaves reasoning_effort out of the request entirely.
     reasoning_effort: str = "auto"
     timeout: float = DEFAULT_TIMEOUT
@@ -132,7 +142,7 @@ class PartialStore:
             except json.JSONDecodeError:
                 continue
             cue_id, text = record.get("id"), record.get("text")
-            if isinstance(cue_id, str) and isinstance(text, str):
+            if isinstance(cue_id, str) and isinstance(text, str) and text.strip():
                 translations[cue_id] = text
         return translations
 
@@ -179,7 +189,7 @@ def build_partial_meta(cues: list[SubtitleCue], config: TranslationConfig) -> di
     fingerprint = hashlib.sha1(serialize_srt(cues).encode("utf-8")).hexdigest()
     return {
         "kind": "video-txt.translation.partial",
-        "version": 2,
+        "version": 4,
         "source_sha1": fingerprint,
         "cue_count": len(cues),
         "base_url": config.base_url,
@@ -187,10 +197,13 @@ def build_partial_meta(cues: list[SubtitleCue], config: TranslationConfig) -> di
         "target_language": config.target_language,
         "source_language": config.source_language,
         "preserve_terms": config.preserve_terms,
+        "terminology": config.terminology.to_dict() if config.terminology else None,
         "note": config.note,
         "spoken": config.spoken,
         "batch_chars": config.batch_chars,
         "context_cues": config.context_cues,
+        "thinking": config.thinking,
+        "reasoning_effort": config.reasoning_effort,
     }
 
 
@@ -230,6 +243,10 @@ def build_messages(
             "normally said letter by letter, and anything in preserve_terms, stay "
             "exactly as they are."
         )
+    if config.terminology and config.terminology.terms:
+        rules.append(
+            "Whenever a source term listed in terminology appears, use its target value exactly."
+        )
 
     payload: dict[str, object] = {
         "task": "Translate subtitle text",
@@ -237,6 +254,12 @@ def build_messages(
         "source_language": config.source_language or "auto-detect",
         "rules": rules,
         "preserve_terms": config.preserve_terms,
+        "terminology": [
+            {"source": term.source, "target": term.target}
+            for term in config.terminology.terms
+        ]
+        if config.terminology
+        else [],
         "extra_note": config.note or "",
         "output_schema": {
             "items": [{"id": "same as input", "text": "translated subtitle text only"}]
@@ -295,7 +318,12 @@ def parse_translation_json(raw_content: str) -> dict[str, str]:
     except json.JSONDecodeError as exc:
         raise ResponseFormatError(f"API did not return valid JSON: {exc}") from exc
 
-    items = parsed if isinstance(parsed, list) else parsed.get("items")
+    if isinstance(parsed, list):
+        items = parsed
+    elif isinstance(parsed, dict):
+        items = parsed.get("items")
+    else:
+        raise ResponseFormatError("API JSON must be an object or list.")
     if not isinstance(items, list):
         raise ResponseFormatError("API did not return an 'items' list.")
 
@@ -309,6 +337,10 @@ def parse_translation_json(raw_content: str) -> dict[str, str]:
             raise ResponseFormatError("API returned an item without an id.")
         if not isinstance(text, str):
             raise ResponseFormatError(f"API returned a non-string translation for id {item_id}.")
+        if not text.strip():
+            raise ResponseFormatError(f"API returned an empty translation for id {item_id}.")
+        if item_id in translations:
+            raise ResponseFormatError(f"API returned a duplicate id: {item_id}.")
         translations[item_id] = text
     return translations
 
@@ -398,6 +430,8 @@ def post_chat_completion(
         "temperature": 0,
         "messages": messages,
     }
+    if config.thinking and config.thinking != "auto":
+        payload["thinking"] = {"type": config.thinking}
     if config.reasoning_effort and config.reasoning_effort != "auto":
         payload["reasoning_effort"] = config.reasoning_effort
     using_json_mode = json_mode.supported
@@ -416,7 +450,12 @@ def post_chat_completion(
 
     try:
         with urllib.request.urlopen(request, timeout=config.timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+            try:
+                return json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ResponseFormatError(
+                    f"API returned an invalid JSON response body: {exc}"
+                ) from exc
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         if using_json_mode and exc.code == 400 and "response_format" in body:
@@ -654,6 +693,7 @@ def translate_subtitle_file(
     debug_dir: Path | None = None,
     resume: bool = True,
     dry_run: bool = False,
+    overwrite_audit: bool = False,
 ) -> Path:
     cues = parse_srt(input_path)
     translatable = [cue for cue in cues if not cue.is_empty]
@@ -672,6 +712,9 @@ def translate_subtitle_file(
         print(f"Source language hint: {config.source_language}")
     if config.preserve_terms:
         print(f"Preserve terms: {', '.join(config.preserve_terms)}")
+    if config.terminology:
+        print(f"Terminology: {len(config.terminology.terms)} approved mappings")
+    print(f"Translation audit: {translation_audit_path_for(output_path)}")
     print()
 
     if dry_run:
@@ -689,6 +732,13 @@ def translate_subtitle_file(
         debug_dir=debug_dir or auto_debug_dir,
         partial_store=store,
     )
+    enforcement = (
+        enforce_terminology(cues, translated, config.terminology)
+        if config.terminology
+        else None
+    )
+    if enforcement is not None:
+        translated = enforcement.cues
     write_srt(output_path, translated)
     if store is not None:
         store.discard()
@@ -697,6 +747,27 @@ def translate_subtitle_file(
         if removed:
             print(f"Removed {removed} debug snapshot(s); every batch succeeded after retries.")
     print(f"Wrote translated subtitles to: {output_path}")
+    audit = audit_translation(cues, translated, config.terminology)
+    report_path = write_translation_audit_report(
+        source_path=input_path,
+        translation_path=output_path,
+        terminology=config.terminology,
+        audit=audit,
+        enforcement=enforcement,
+        overwrite=overwrite_audit,
+    )
+    changed = len(enforcement.changes) if enforcement is not None else 0
+    if changed:
+        print(f"Terminology normalized: {changed} subtitle block(s)")
+    print(
+        f"Translation audit: {audit.summary['error']} errors, "
+        f"{audit.summary['warning']} warnings -> {report_path}"
+    )
+    if audit.has_errors:
+        raise TranslationError(
+            f"Translation audit found {audit.summary['error']} error(s). "
+            f"Review: {report_path}"
+        )
     return output_path
 
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from video_txt import subtitles as subtitles_module
 from video_txt.subtitles import (
     SubtitleCue,
     SubtitleFormatError,
@@ -17,6 +18,7 @@ from video_txt.subtitles import (
     srt_time_to_ass,
     srt_time_to_seconds,
     translated_subtitle_path,
+    write_srt,
 )
 
 SAMPLE = """1
@@ -77,6 +79,23 @@ def test_serialize_srt_round_trips_including_empty_cues():
         "1\n00:00:01,000 --> 00:00:02,000\n\n2\n00:00:03,000 --> 00:00:04,000\nhi"
     )
     assert parse_srt_text(serialize_srt(cues)) == cues
+
+
+def test_write_srt_preserves_the_old_file_when_the_new_write_is_interrupted(tmp_path, monkeypatch):
+    target = tmp_path / "out.srt"
+    target.write_text("caller-owned subtitle\n", encoding="utf-8")
+    cues = parse_srt_text(SAMPLE)
+
+    def interrupted(_fd):
+        raise OSError("disk write interrupted")
+
+    monkeypatch.setattr(subtitles_module.os, "fsync", interrupted)
+
+    with pytest.raises(OSError, match="interrupted"):
+        write_srt(target, cues)
+
+    assert target.read_text(encoding="utf-8") == "caller-owned subtitle\n"
+    assert list(tmp_path.glob(".out.srt.*.tmp")) == []
 
 
 def test_time_conversions():
@@ -190,3 +209,26 @@ def test_build_ass_subtitle_sanitizes_font_and_escapes_braces():
     )
     assert "Style: Default,Bad Font,40," in ass
     assert r"\{weird\} tag & more" in ass
+
+
+def test_ass_text_keeps_literal_comparison_operators():
+    cues = [
+        SubtitleCue(
+            "1",
+            "00:00:01,000 --> 00:00:02,000",
+            ["Use x < y and z > 2, but remove <i>markup</i>."],
+        )
+    ]
+
+    ass = build_ass_subtitle(
+        cues=cues,
+        video_width=1280,
+        video_height=720,
+        layout="normal",
+        font="PingFang SC",
+        font_size=32,
+        margin_v=36,
+    )
+
+    assert "x < y and z > 2" in ass
+    assert "<i>" not in ass

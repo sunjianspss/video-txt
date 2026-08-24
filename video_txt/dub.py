@@ -19,7 +19,7 @@ import shutil
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .clone import (
@@ -45,6 +45,7 @@ from .media import (
     format_command,
     probe_duration,
     run_ffprobe,
+    temporary_output_path,
 )
 from .mux import container_arguments, subtitle_track_arguments
 from .parallel import map_in_parallel
@@ -675,7 +676,7 @@ def build_dub_mux_command(
             [
                 "-filter_complex",
                 f"[{background}]volume={volume:.3f}[bg];[1:a]volume=1.0[vo];"
-                "[bg][vo]amix=inputs=2:duration=first:normalize=0[mix];"
+                "[bg][vo]amix=inputs=2:duration=longest:normalize=0[mix];"
                 f"[mix]{LOUDNORM_FILTER}[aout]",
                 "-map",
                 "0:v:0",
@@ -714,9 +715,28 @@ def check_speaker_names(options: DubOptions) -> None:
         raise DubError(problem)
 
 
+def validate_audio_output(options: DubOptions, audio_output: Path) -> None:
+    """Keep the intermediate voice track away from every input and final output."""
+    candidate = audio_output.expanduser().resolve()
+    protected = (
+        ("the source video", options.video_input),
+        ("the translated subtitle", options.subtitle_input),
+        ("the source subtitle", options.source_subtitle),
+        ("the output video", options.video_output),
+    )
+    for label, path in protected:
+        if path is not None and candidate == path.expanduser().resolve():
+            raise DubError(f"--audio-output conflicts with {label}: {candidate}")
+    if options.audio_output is not None and candidate.exists():
+        raise DubError(
+            f"Audio output already exists: {candidate}. Choose another --audio-output path."
+        )
+
+
 def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
-    ffmpeg_path = find_ffmpeg(explicit=options.ffmpeg_path)
     audio_output = options.audio_output or default_audio_output(options.video_output)
+    validate_audio_output(options, audio_output)
+    ffmpeg_path = find_ffmpeg(explicit=options.ffmpeg_path)
     cache_dir = options.cache_dir or default_cache_dir(options.video_input)
     if options.turns:
         check_speaker_names(options)
@@ -854,17 +874,24 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
         )
 
     print("Muxing the dubbed voice track into the video...")
-    command = build_dub_mux_command(
-        options,
-        ffmpeg_path=ffmpeg_path,
-        audio_path=audio_output,
-        keep_bgm=keep_bgm,
-        subtitle_path=subtitle_for_mux,
-        bgm_path=bgm_path,
-    )
-    completed = subprocess.run(command)
-    if completed.returncode != 0:
-        raise DubError(f"ffmpeg failed with exit code {completed.returncode}.")
+    temporary_video = temporary_output_path(options.video_output)
+    try:
+        command = build_dub_mux_command(
+            replace(options, video_output=temporary_video, overwrite=True),
+            ffmpeg_path=ffmpeg_path,
+            audio_path=audio_output,
+            keep_bgm=keep_bgm,
+            subtitle_path=subtitle_for_mux,
+            bgm_path=bgm_path,
+        )
+        completed = subprocess.run(command)
+        if completed.returncode != 0:
+            raise DubError(f"ffmpeg failed with exit code {completed.returncode}.")
+        if not temporary_video.is_file() or temporary_video.stat().st_size == 0:
+            raise DubError("ffmpeg reported success but did not write the dubbed video.")
+        temporary_video.replace(options.video_output)
+    finally:
+        temporary_video.unlink(missing_ok=True)
 
     # The track is inside the video now. Only clean up the file we chose ourselves;
     # a path the caller named is theirs to keep.

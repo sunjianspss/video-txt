@@ -2,17 +2,27 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from video_txt import cli as cli_module
+from video_txt import transcribe as transcribe_module
 from video_txt.cli import (
     COMMANDS,
     build_parser,
+    build_translate_stage,
     build_translation_config,
     main,
     parse_clone_references,
     resolve_provider_settings,
+)
+from video_txt.diarize import (
+    DiarizeOptions,
+    SpeakerTurn,
+    diarize_cache_key,
+    save_turns,
+    speakers_path,
 )
 from video_txt.translate import TranslationError
 
@@ -33,6 +43,152 @@ def project(tmp_path, monkeypatch):
 
 def parse(argv: list[str]):
     return build_parser().parse_args(argv)
+
+
+def test_audit_writes_a_machine_readable_report(tmp_path, capsys):
+    subtitle = tmp_path / "clip.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:29,980\nThank you.\n",
+        encoding="utf-8",
+    )
+
+    assert main(["audit", str(subtitle)]) == 1
+
+    report_path = tmp_path / "clip.audit.json"
+    payload = json.loads(report_path.read_text(encoding="utf-8"))
+    assert payload["schema"] == "video-txt.subtitle-audit"
+    assert payload["version"] == 1
+    assert payload["source"] == str(subtitle.resolve())
+    assert payload["summary"]["full_window_hallucination"] == 1
+    assert payload["findings"][0]["repair"] == "remove"
+    output = capsys.readouterr().out
+    assert "1 finding" in output
+    assert str(report_path) in output
+
+
+def test_translation_audit_command_reports_glossary_violations_without_rewriting(tmp_path, capsys):
+    source = tmp_path / "story.srt"
+    source.write_text(
+        "1\n00:00:01,000 --> 00:00:02,000\nWoody is here.\n", encoding="utf-8"
+    )
+    translation = tmp_path / "story.zh.srt"
+    original = "1\n00:00:01,000 --> 00:00:02,000\n伍迪来了。\n"
+    translation.write_text(original, encoding="utf-8")
+    term_file = tmp_path / "project.terms.json"
+    term_file.write_text(
+        json.dumps(
+            {
+                "schema": "video-txt.terminology",
+                "version": 1,
+                "terms": [
+                    {
+                        "source": "Woody",
+                        "target": "胡迪",
+                        "match": "word",
+                        "aliases": ["伍迪"],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(
+        [
+            "audit-translation",
+            str(source),
+            str(translation),
+            "--term-file",
+            str(term_file),
+        ]
+    ) == 1
+
+    assert translation.read_text(encoding="utf-8") == original
+    report_path = tmp_path / "story.zh.translation-audit.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["schema"] == "video-txt.translation-audit"
+    assert {finding["code"] for finding in report["findings"]} == {
+        "glossary_alias",
+        "glossary_target_missing",
+    }
+    assert "2 findings" in capsys.readouterr().out
+
+
+def test_clean_writes_a_new_subtitle_and_records_safe_repairs(tmp_path, capsys):
+    subtitle = tmp_path / "clip.srt"
+    original = (
+        "1\n00:00:01,000 --> 00:00:03,000\nI was\n\n"
+        "2\n00:00:03,000 --> 00:00:03,000\ngoing.\n\n"
+        "3\n00:00:04,000 --> 00:00:33,980\nThank you.\n\n"
+        "4\n00:00:35,000 --> 00:00:37,000\nNext line.\n"
+    )
+    subtitle.write_text(original, encoding="utf-8")
+    output = tmp_path / "clip.clean.srt"
+
+    assert main(["clean", str(subtitle), "-o", str(output)]) == 0
+
+    assert subtitle.read_text(encoding="utf-8") == original
+    cleaned = output.read_text(encoding="utf-8")
+    assert "I was going." in cleaned
+    assert "Thank you." not in cleaned
+    assert "Next line." in cleaned
+    payload = json.loads((tmp_path / "clip.clean.audit.json").read_text(encoding="utf-8"))
+    assert payload["repair"]["removed_count"] == 1
+    assert payload["repair"]["merged_count"] == 1
+    assert payload["post_repair"]["is_clean"] is True
+    assert f"Cleaned: {output}" in capsys.readouterr().out
+
+
+def test_clean_refuses_to_replace_its_source_even_with_overwrite(tmp_path):
+    subtitle = tmp_path / "clip.srt"
+    subtitle.write_text(SAMPLE, encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        main(["clean", str(subtitle), "-o", str(subtitle), "--overwrite"])
+
+    assert subtitle.read_text(encoding="utf-8") == SAMPLE
+
+
+def test_clean_preserves_an_existing_output_without_overwrite(tmp_path):
+    subtitle = tmp_path / "clip.srt"
+    subtitle.write_text(SAMPLE, encoding="utf-8")
+    output = tmp_path / "clean.srt"
+    output.write_text("caller-owned", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        main(["clean", str(subtitle), "-o", str(output)])
+
+    assert output.read_text(encoding="utf-8") == "caller-owned"
+
+
+def test_clean_dry_run_writes_nothing(tmp_path, capsys):
+    subtitle = tmp_path / "clip.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:29,980\nThank you.\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "clean.srt"
+
+    assert main(["clean", str(subtitle), "-o", str(output), "--dry-run"]) == 0
+
+    assert not output.exists()
+    assert not (tmp_path / "clean.audit.json").exists()
+    assert "Would clean" in capsys.readouterr().out
+
+
+def test_clean_succeeds_with_review_only_warnings(tmp_path, capsys):
+    subtitle = tmp_path / "clip.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:12,000\nOne two three four five six seven.\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "clean.srt"
+
+    assert main(["clean", str(subtitle), "-o", str(output)]) == 0
+
+    assert output.is_file()
+    assert "Manual review still needed" in capsys.readouterr().err
 
 
 def test_legacy_transcribe_flags_still_parse():
@@ -58,6 +214,94 @@ def test_legacy_transcribe_flags_still_parse():
     assert args.mode == "translate"
     assert args.format == "srt"
     assert args.dry_run
+
+
+def test_subtitle_refinement_flag_is_available_to_transcribe_and_pipelines():
+    standalone = parse(["transcribe", "in.mp4", "-f", "srt", "--refine-subtitles"])
+    pipeline = parse(["run", "in.mp4", "--refine-subtitles"])
+
+    assert standalone.refine_subtitles is True
+    assert pipeline.refine_subtitles is True
+    assert cli_module.build_transcribe_stage(pipeline).refine_subtitles is True
+
+
+def test_audio_stream_override_is_available_to_transcribe_run_and_dub():
+    standalone = parse(["transcribe", "in.mkv", "--audio-stream", "2"])
+    run = parse(["run", "in.mkv", "--audio-stream", "3"])
+    dub = parse(["dub", "in.mkv", "--audio-stream", "4"])
+
+    assert standalone.audio_stream == 2
+    assert cli_module.build_transcribe_stage(run).audio_stream == 3
+    assert cli_module.build_transcribe_stage(dub).audio_stream == 4
+
+
+def test_transcribe_passes_refinement_to_the_backend(project, monkeypatch):
+    video, _ = project
+    seen = []
+
+    def capture(options, *, dry_run=False):
+        seen.append((options, dry_run))
+        return options.output_dir / f"{options.input_path.stem}.srt"
+
+    monkeypatch.setattr(cli_module, "run_transcribe", capture)
+
+    assert main(
+        ["transcribe", str(video), "-f", "srt", "--refine-subtitles", "--dry-run"]
+    ) == 0
+    assert seen[0][0].refine_subtitles is True
+    assert seen[0][1] is True
+
+
+def test_transcribe_refinement_cli_writes_the_complete_artifact_pair(project, monkeypatch):
+    video, subtitle = project
+    monkeypatch.setattr(transcribe_module, "find_ffmpeg", lambda: Path("/usr/bin/ffmpeg"))
+    monkeypatch.setattr(transcribe_module, "resolve_backend", lambda _value: "openai-whisper")
+
+    def whisper(command, **_kwargs):
+        if "-select_streams" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout='{"streams":[{"index":1,"codec_name":"aac","channels":2}]}',
+                stderr="",
+            )
+        raw_output_dir = Path(command[command.index("--output_dir") + 1])
+        (raw_output_dir / "clip.json").write_text(
+            '{"language":"en","segments":[{"words":['
+            '{"word":" A","start":0.0,"end":0.5},'
+            '{"word":" complete.","start":0.5,"end":1.0}]}]}',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(transcribe_module.subprocess, "run", whisper)
+
+    assert main(
+        [
+            "transcribe",
+            str(video),
+            "-f",
+            "srt",
+            "--refine-subtitles",
+            "--skip-transcript-check",
+        ]
+    ) == 0
+    assert "A complete." in subtitle.read_text(encoding="utf-8")
+    assert (video.parent / "clip.words.json").is_file()
+
+
+def test_transcribe_refinement_dry_run_shows_word_json_command(
+    project, monkeypatch, capsys
+):
+    video, _ = project
+    monkeypatch.setattr(transcribe_module, "resolve_backend", lambda _value: "openai-whisper")
+
+    assert main(
+        ["transcribe", str(video), "-f", "srt", "--refine-subtitles", "--dry-run"]
+    ) == 0
+
+    command = capsys.readouterr().out
+    assert "--output_format json" in command
+    assert "--word_timestamps True" in command
 
 
 def test_legacy_translate_flags_still_parse():
@@ -88,6 +332,126 @@ def test_legacy_translate_flags_still_parse():
     assert args.batch_chars == 2400
     assert args.preserve_term == ["MCP"]
     assert args.resume is True
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["translate", "in.srt"],
+        ["run", "clip.mp4"],
+        ["dub", "clip.mp4"],
+    ],
+)
+def test_translation_workflows_accept_one_project_terminology_file(argv):
+    args = parse([*argv, "--term-file", "project.terms.json", "--dry-run"])
+
+    assert args.term_file == Path("project.terms.json")
+
+
+def test_translation_config_loads_the_term_file_and_uses_its_source_language(tmp_path):
+    term_file = tmp_path / "project.terms.json"
+    term_file.write_text(
+        json.dumps(
+            {
+                "schema": "video-txt.terminology",
+                "version": 1,
+                "source_language": "en",
+                "target_language": "zh-CN",
+                "terms": [{"source": "Woody", "target": "胡迪", "match": "word"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    args = parse(
+        [
+            "translate",
+            "in.srt",
+            "--provider",
+            "deepseek",
+            "--term-file",
+            str(term_file),
+            "--dry-run",
+        ]
+    )
+
+    config = build_translation_config(
+        args,
+        build_parser(),
+        require_key=False,
+        discover_model=False,
+    )
+
+    assert config.source_language == "en"
+    assert config.terminology is not None
+    assert config.terminology.terms[0].target == "胡迪"
+
+
+def test_pipeline_stage_loads_terminology_before_deciding_to_reuse_a_translation(tmp_path):
+    term_file = tmp_path / "project.terms.json"
+    term_file.write_text(
+        json.dumps(
+            {
+                "schema": "video-txt.terminology",
+                "version": 1,
+                "terms": [{"source": "Woody", "target": "胡迪"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    args = parse(
+        [
+            "run",
+            "clip.mp4",
+            "--provider",
+            "deepseek",
+            "--term-file",
+            str(term_file),
+            "--dry-run",
+        ]
+    )
+
+    stage = build_translate_stage(
+        args,
+        build_parser(),
+        require_key=False,
+        output_path=None,
+    )
+
+    assert stage.config.terminology is not None
+    assert stage.config.terminology.terms[0].target == "胡迪"
+
+
+def test_translation_refuses_a_term_file_for_another_target_language(project, tmp_path, capsys):
+    _, subtitle = project
+    term_file = tmp_path / "japanese.terms.json"
+    term_file.write_text(
+        json.dumps(
+            {
+                "schema": "video-txt.terminology",
+                "version": 1,
+                "target_language": "Japanese",
+                "terms": [{"source": "Woody", "target": "ウッディ"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(
+        [
+            "translate",
+            str(subtitle),
+            "--provider",
+            "deepseek",
+            "--term-file",
+            str(term_file),
+            "--dry-run",
+        ]
+    ) == 1
+
+    assert "target language" in capsys.readouterr().err.lower()
 
 
 def test_legacy_mux_flags_still_parse():
@@ -194,6 +558,19 @@ def test_lmstudio_with_nothing_loaded_says_so(monkeypatch, capsys):
     assert "no chat model loaded" in capsys.readouterr().err
 
 
+def test_lmstudio_dry_run_does_not_contact_the_local_server(project, monkeypatch, capsys):
+    _, subtitle = project
+    monkeypatch.setattr(
+        cli_module,
+        "loaded_local_model",
+        lambda _base_url: pytest.fail("a dry run must not contact LM Studio"),
+    )
+
+    assert main(["translate", str(subtitle), "--provider", "lmstudio", "--dry-run"]) == 0
+
+    assert "Model: <loaded-local-model>" in capsys.readouterr().out
+
+
 def test_lmstudio_runs_without_an_api_key(monkeypatch, tmp_path):
     monkeypatch.delenv("LMSTUDIO_API_KEY", raising=False)
     args = parse(
@@ -218,6 +595,11 @@ def effort_for(tmp_path, argv: list[str]) -> str:
     return build_translation_config(args, build_parser(), require_key=False).reasoning_effort
 
 
+def thinking_for(tmp_path, argv: list[str]) -> str:
+    args = parse(["translate", "in.srt", *argv, "--secrets-file", str(tmp_path / "absent")])
+    return build_translation_config(args, build_parser(), require_key=False).thinking
+
+
 def test_lmstudio_turns_reasoning_off(tmp_path):
     """Local reasoning models spend minutes deliberating over a subtitle line."""
     assert effort_for(tmp_path, ["--provider", "lmstudio", "--model", "q"]) == "none"
@@ -238,10 +620,24 @@ def test_other_providers_say_nothing_about_reasoning(tmp_path):
     assert effort_for(tmp_path, ["--provider", "deepseek"]) == "auto"
 
 
+def test_deepseek_translation_disables_thinking_by_default(tmp_path):
+    assert thinking_for(tmp_path, ["--provider", "deepseek"]) == "disabled"
+
+
 def test_reasoning_effort_flag_wins_over_the_preset(tmp_path):
     local = ["--provider", "lmstudio", "--model", "q"]
     assert effort_for(tmp_path, [*local, "--reasoning-effort", "high"]) == "high"
     assert effort_for(tmp_path, [*local, "--reasoning-effort", "auto"]) == "auto"
+
+
+def test_deepseek_maps_reasoning_controls_to_its_thinking_api(tmp_path):
+    disabled = ["--provider", "deepseek", "--reasoning-effort", "none"]
+    enabled = ["--provider", "deepseek", "--reasoning-effort", "max"]
+
+    assert thinking_for(tmp_path, disabled) == "disabled"
+    assert effort_for(tmp_path, disabled) == "auto"
+    assert thinking_for(tmp_path, enabled) == "enabled"
+    assert effort_for(tmp_path, enabled) == "max"
 
 
 def test_missing_model_is_reported(monkeypatch, capsys):
@@ -302,6 +698,30 @@ def test_run_dry_run_reuses_an_existing_transcript(project, capsys):
     assert f"skip, reusing {subtitle}" in out
 
 
+def test_run_places_an_external_subtitle_translation_in_the_output_directory(project, capsys):
+    video, subtitle = project
+    output_dir = video.parent / "intermediates"
+
+    assert (
+        main(
+            [
+                "run",
+                str(video),
+                "--subtitle",
+                str(subtitle),
+                "--output-dir",
+                str(output_dir),
+                "--provider",
+                "deepseek",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    assert f"{output_dir / 'clip.zh.srt'}" in capsys.readouterr().out
+
+
 def test_run_reuses_an_existing_translation_without_model_or_key(project, monkeypatch, capsys):
     video, subtitle = project
     (subtitle.parent / "clip.zh.srt").write_text(SAMPLE, encoding="utf-8")
@@ -313,7 +733,7 @@ def test_run_reuses_an_existing_translation_without_model_or_key(project, monkey
         lambda *_args, **_kwargs: pytest.fail("a skipped translation must not load a key"),
     )
 
-    assert main(["run", str(video)]) == 0
+    assert main(["run", str(video), "--dry-run"]) == 0
 
     assert "Translate: skip, reusing" in capsys.readouterr().out
 
@@ -333,6 +753,47 @@ def test_dub_dry_run_prints_the_mux_command(project, capsys):
     assert "clip.zh-dubbed.mp4" in out
     assert "amix" in out
     assert "clip.dub-cache" in out
+
+
+def test_dub_rejects_an_audio_output_that_would_replace_the_source_video(project, capsys):
+    video, _subtitle = project
+
+    code = main(
+        [
+            "dub",
+            str(video),
+            "--provider",
+            "deepseek",
+            "--audio-output",
+            str(video),
+            "--dry-run",
+        ]
+    )
+
+    assert code == 1
+    assert "--audio-output conflicts with the source video" in capsys.readouterr().err
+
+
+def test_dub_rejects_an_existing_caller_owned_audio_output(project, capsys):
+    video, _subtitle = project
+    audio_output = video.with_name("my-recording.wav")
+    audio_output.write_bytes(b"caller-owned")
+
+    code = main(
+        [
+            "dub",
+            str(video),
+            "--provider",
+            "deepseek",
+            "--audio-output",
+            str(audio_output),
+            "--dry-run",
+        ]
+    )
+
+    assert code == 1
+    assert "Audio output already exists" in capsys.readouterr().err
+    assert audio_output.read_bytes() == b"caller-owned"
 
 
 def test_dub_speaks_whole_sentences_unless_told_otherwise(project, capsys):
@@ -406,21 +867,23 @@ def test_dub_rejects_a_fit_tempo_the_renderer_cannot_reach(project, capsys):
     assert "Lower --fit-tempo or raise --max-atempo" in capsys.readouterr().err
 
 
-SPEAKER_TURNS = {
-    "version": 1,
-    "model": "pyannote/speaker-diarization-3.1",
-    "turns": [
-        {"start": 0.0, "end": 3.5, "speaker": "SPEAKER_00"},
-        {"start": 3.5, "end": 6.0, "speaker": "SPEAKER_01"},
-    ],
-}
+SPEAKER_TURNS = [
+    SpeakerTurn(0.0, 3.5, "SPEAKER_00"),
+    SpeakerTurn(3.5, 6.0, "SPEAKER_01"),
+]
 
 
 @pytest.fixture
 def diarized(project):
     video, subtitle = project
     (subtitle.parent / "clip.zh.srt").write_text(SAMPLE, encoding="utf-8")
-    (subtitle.parent / "clip.speakers.json").write_text(json.dumps(SPEAKER_TURNS), encoding="utf-8")
+    options = DiarizeOptions()
+    save_turns(
+        speakers_path(video),
+        SPEAKER_TURNS,
+        model=options.model,
+        cache_key=diarize_cache_key(video, options),
+    )
     return video
 
 
@@ -494,6 +957,25 @@ def test_a_voice_per_speaker_needs_diarization(project, capsys):
         main(["dub", str(video), "--speaker-voice", "SPEAKER_01=zh-CN-YunxiNeural", "--dry-run"])
 
     assert "--speaker-voice needs --diarize" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("flag", ["--speakers", "--min-speakers", "--max-speakers"])
+def test_speaker_count_constraints_need_diarization(project, capsys, flag):
+    video, _ = project
+
+    with pytest.raises(SystemExit):
+        main(["dub", str(video), flag, "2", "--dry-run"])
+
+    assert f"{flag} needs --diarize" in capsys.readouterr().err
+
+
+def test_rediarize_needs_diarization(project, capsys):
+    video, _ = project
+
+    with pytest.raises(SystemExit):
+        main(["dub", str(video), "--rediarize", "--dry-run"])
+
+    assert "--rediarize needs --diarize" in capsys.readouterr().err
 
 
 def test_a_reference_clip_named_for_a_speaker_needs_diarization(project, capsys):

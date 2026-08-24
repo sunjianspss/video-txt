@@ -12,6 +12,7 @@ from video_txt.diarize import (
     assign_speakers,
     collect_turns,
     describe_speakers,
+    diarize_cache_key,
     ensure_speakers,
     load_turns,
     save_turns,
@@ -135,14 +136,56 @@ def test_a_damaged_file_is_ignored_rather_than_crashing(tmp_path):
 
 def test_ensure_speakers_reuses_the_turns_instead_of_loading_the_model(tmp_path, monkeypatch):
     video = tmp_path / "clip.mp4"
-    save_turns(speakers_path(video), TURNS, model="pyannote/x")
+    options = DiarizeOptions(model="pyannote/x")
+    save_turns(
+        speakers_path(video),
+        TURNS,
+        model="pyannote/x",
+        cache_key=diarize_cache_key(video, options),
+    )
     monkeypatch.setattr(
         diarize_module,
         "diarize_media",
         lambda *_args, **_kwargs: pytest.fail("the turns were already on disk"),
     )
 
-    assert ensure_speakers(video, options=DiarizeOptions(model="pyannote/x")) == TURNS
+    assert ensure_speakers(video, options=options) == TURNS
+
+
+def test_changing_speaker_constraints_invalidates_saved_turns(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"video")
+    calls: list[int | None] = []
+
+    def fake_diarize(_video, options):
+        calls.append(options.speakers)
+        return TURNS
+
+    monkeypatch.setattr(diarize_module, "diarize_media", fake_diarize)
+
+    ensure_speakers(video, options=DiarizeOptions(model="pyannote/x", speakers=2))
+    ensure_speakers(video, options=DiarizeOptions(model="pyannote/x", speakers=3))
+
+    assert calls == [2, 3]
+
+
+def test_changing_the_source_video_invalidates_saved_turns(tmp_path, monkeypatch):
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"first version")
+    calls = 0
+
+    def fake_diarize(_video, _options):
+        nonlocal calls
+        calls += 1
+        return TURNS
+
+    monkeypatch.setattr(diarize_module, "diarize_media", fake_diarize)
+
+    ensure_speakers(video, options=DiarizeOptions(model="pyannote/x"))
+    video.write_bytes(b"second version")
+    ensure_speakers(video, options=DiarizeOptions(model="pyannote/x"))
+
+    assert calls == 2
 
 
 def test_rediarize_runs_again_over_the_saved_turns(tmp_path, monkeypatch):

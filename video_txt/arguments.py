@@ -177,6 +177,14 @@ def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: st
         default=[],
         help="Term to keep in the original language. Can be passed multiple times.",
     )
+    group.add_argument(
+        "--term-file",
+        type=Path,
+        help=(
+            "Project terminology JSON containing approved source-to-target mappings. "
+            "The same file is used for prompting, exact normalization and translation audit."
+        ),
+    )
 
 
 def add_transcribe_arguments(parser: argparse.ArgumentParser, *, standalone: bool) -> None:
@@ -206,6 +214,22 @@ def add_transcribe_arguments(parser: argparse.ArgumentParser, *, standalone: boo
     group.add_argument(
         "--initial-prompt",
         help="Prompt that biases spelling of names and jargon, for example 'Claude Code, MCP'.",
+    )
+    group.add_argument(
+        "--audio-stream",
+        type=int,
+        help=(
+            "FFmpeg audio stream index to transcribe, for example 2. "
+            "By default multiple tracks are selected from language, title and disposition metadata."
+        ),
+    )
+    group.add_argument(
+        "--refine-subtitles",
+        action="store_true",
+        help=(
+            "Build readable subtitle cues from Whisper word timestamps. "
+            "Standalone transcription also requires --format srt."
+        ),
     )
     group.add_argument(
         "--whisper-arg",
@@ -341,7 +365,9 @@ def add_speaker_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_voice_arguments(parser: argparse.ArgumentParser) -> None:
+def add_voice_arguments(
+    parser: argparse.ArgumentParser, *, include_shared_arguments: bool = True
+) -> None:
     group = parser.add_argument_group("voice-over")
     group.add_argument(
         "--tts-engine",
@@ -429,7 +455,8 @@ def add_voice_arguments(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Also embed the translated subtitles as a toggleable track.",
     )
-    add_language_code_argument(group)
+    if include_shared_arguments:
+        add_language_code_argument(group)
     group.add_argument(
         "--tts-concurrency",
         type=int,
@@ -452,7 +479,8 @@ def add_voice_arguments(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--audio-output", type=Path, help="Path for the rendered Chinese audio track."
     )
-    add_ffmpeg_arguments(group)
+    if include_shared_arguments:
+        add_ffmpeg_arguments(group)
 
 
 def add_clone_arguments(parser: argparse.ArgumentParser) -> None:
@@ -518,6 +546,68 @@ def build_transcribe_command(parser: argparse.ArgumentParser) -> None:
     add_dry_run(parser, "Print the transcription command without running it.")
 
 
+def build_audit_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("input", type=Path, help="Path to the source .srt subtitle file.")
+    parser.add_argument(
+        "--media",
+        type=Path,
+        help="Optional audio or video used to check whether the transcript ends too early.",
+    )
+    parser.add_argument("-l", "--language", help="Expected subtitle language, for example en.")
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path. Defaults to '<input>.audit.json'.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing JSON report.",
+    )
+
+
+def build_translation_audit_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("source", type=Path, help="Path to the source-language .srt file.")
+    parser.add_argument("translation", type=Path, help="Path to the translated .srt file.")
+    parser.add_argument(
+        "--term-file",
+        type=Path,
+        help="Optional project terminology JSON used to verify approved translations.",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path. Defaults to '<translation>.translation-audit.json'.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite an existing JSON report; source and translation are always read-only.",
+    )
+
+
+def build_clean_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("input", type=Path, help="Path to the source .srt subtitle file.")
+    parser.add_argument("-o", "--output", type=Path, required=True, help="New cleaned .srt path.")
+    parser.add_argument(
+        "--media",
+        type=Path,
+        help="Optional audio or video used to check whether the transcript ends too early.",
+    )
+    parser.add_argument("-l", "--language", help="Expected subtitle language, for example en.")
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path. Defaults to '<output>.audit.json'.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing generated output and report files, never the source subtitle.",
+    )
+    add_dry_run(parser, "Show the safe repairs without writing output files.")
+
+
 def build_translate_command(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("input", type=Path, help="Path to the source .srt file.")
     parser.add_argument(
@@ -576,3 +666,37 @@ def build_dub_command(parser: argparse.ArgumentParser) -> None:
     add_transcribe_arguments(parser, standalone=False)
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
     add_dry_run(parser, "Print every stage's plan without synthesizing speech or running ffmpeg.")
+
+
+def build_project_command(parser: argparse.ArgumentParser) -> None:
+    actions = parser.add_subparsers(dest="project_action", required=True)
+    init = actions.add_parser("init", help="Create a reproducible project configuration.")
+    init.add_argument("video", type=Path, help="Path to the source video file.")
+    init.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=Path("project.video-txt.json"),
+        help="Project JSON path. Defaults to project.video-txt.json.",
+    )
+    init.add_argument("--workflow", choices=("run", "dub"), default="run")
+    init.add_argument("--subtitle", type=Path, help="Existing source-language .srt.")
+    init.add_argument("--subtitle-output", type=Path, help="Translated subtitle path.")
+    init.add_argument("--video-output", type=Path, help="Finished video path.")
+    init.add_argument("--output-dir", type=Path, help="Directory for intermediate files.")
+    init.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing project configuration."
+    )
+    add_transcribe_arguments(init, standalone=False)
+    add_translation_arguments(init, debug_flag="--translation-debug-dir")
+    add_mux_arguments(init)
+    add_voice_arguments(init, include_shared_arguments=False)
+    add_speaker_arguments(init)
+    add_clone_arguments(init)
+
+    status = actions.add_parser("status", help="Show current, stale and disabled stages.")
+    status.add_argument("project_file", type=Path, help="Path to project.video-txt.json.")
+
+    run = actions.add_parser("run", help="Run stale project stages and update state.")
+    run.add_argument("project_file", type=Path, help="Path to project.video-txt.json.")
+    add_dry_run(run, "Print the resolved project plan without writing artifacts or state.")

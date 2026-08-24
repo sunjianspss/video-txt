@@ -327,7 +327,7 @@ def test_fit_subtitle_to_timeline_keeps_the_original_file_when_nothing_overruns(
     assert not (tmp_path / "clip.zh.fitted.srt").exists()
 
 
-def dub_with_fakes(monkeypatch, tmp_path, **overrides) -> Path:
+def dub_with_fakes(monkeypatch, tmp_path, *, mux_returncode: int = 0, **overrides) -> Path:
     """Run the whole dub with ffmpeg stubbed out; hand back the intermediate track."""
     subtitle = tmp_path / "clip.zh.srt"
     subtitle.write_text(BACK_TO_BACK, encoding="utf-8")
@@ -346,9 +346,12 @@ def dub_with_fakes(monkeypatch, tmp_path, **overrides) -> Path:
     monkeypatch.setattr(dub_module, "probe_durations", lambda paths, **_kwargs: [0.5] * len(paths))
     monkeypatch.setattr(dub_module, "probe_duration", lambda *_args, **_kwargs: 10.0)
     monkeypatch.setattr(dub_module, "render_audio_track", fake_render)
-    monkeypatch.setattr(
-        dub_module.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0)
-    )
+
+    def fake_mux(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"mux output")
+        return SimpleNamespace(returncode=mux_returncode)
+
+    monkeypatch.setattr(dub_module.subprocess, "run", fake_mux)
 
     options = make_options(
         **{
@@ -415,9 +418,12 @@ def test_lines_with_no_words_keep_their_subtitle_but_get_no_voice_clip(
     monkeypatch.setattr(dub_module, "probe_durations", lambda paths, **_kwargs: [0.5] * len(paths))
     monkeypatch.setattr(dub_module, "probe_duration", lambda *_args, **_kwargs: 10.0)
     monkeypatch.setattr(dub_module, "render_audio_track", fake_render)
-    monkeypatch.setattr(
-        dub_module.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0)
-    )
+
+    def fake_mux(command, **_kwargs):
+        Path(command[-1]).write_bytes(b"video")
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(dub_module.subprocess, "run", fake_mux)
 
     run_dub(make_options(subtitle_input=subtitle, video_output=tmp_path / "clip.zh-dubbed.mp4"))
 
@@ -438,6 +444,23 @@ def test_a_folder_named_for_the_output_is_made_before_ffmpeg_needs_it(monkeypatc
     )
 
     assert destination.is_dir()
+
+
+def test_failed_dub_mux_preserves_an_existing_output_video(tmp_path, monkeypatch):
+    output = tmp_path / "clip.zh-dubbed.mp4"
+    output.write_bytes(b"known-good video")
+
+    with pytest.raises(DubError, match="exit code 1"):
+        dub_with_fakes(
+            monkeypatch,
+            tmp_path,
+            mux_returncode=1,
+            video_output=output,
+            overwrite=True,
+        )
+
+    assert output.read_bytes() == b"known-good video"
+    assert list(tmp_path.glob(".clip.zh-dubbed.*.part.mp4")) == []
 
 
 def test_respoken_rate_leaves_fitting_and_barely_overrunning_clips_alone():
@@ -738,7 +761,7 @@ def test_every_dub_comes_out_equally_loud():
         assert command[command.index("-ar") + 1] == "48000"
 
 
-def test_dub_mux_command_mixes_the_original_audio_when_keeping_bgm():
+def test_dub_mux_command_keeps_the_full_voice_timeline_when_mixing_bgm():
     command = build_dub_mux_command(
         make_options(bgm_volume=0.2),
         ffmpeg_path="/bin/ffmpeg",
@@ -747,7 +770,7 @@ def test_dub_mux_command_mixes_the_original_audio_when_keeping_bgm():
     )
     graph = command[command.index("-filter_complex") + 1]
     assert graph.startswith("[0:a]volume=0.200")
-    assert "amix=inputs=2:duration=first:normalize=0[mix]" in graph
+    assert "amix=inputs=2:duration=longest:normalize=0[mix]" in graph
     assert "[aout]" in command
 
 

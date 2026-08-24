@@ -34,6 +34,33 @@ def test_the_finished_background_is_reused_as_is(tmp_path, monkeypatch):
     assert ensure_instrumental(Path("/v/a.mp4"), cache_dir=tmp_path, ffmpeg_path="ffmpeg") == target
 
 
+def test_a_shared_cache_never_reuses_the_background_from_another_video(tmp_path, monkeypatch):
+    monkeypatch.setattr(separate_module, "require_demucs", lambda: None)
+    first = tmp_path / "first.mp4"
+    second = tmp_path / "second.mp4"
+    first.write_bytes(b"first video")
+    second.write_bytes(b"second video")
+    splits = 0
+
+    def fake_run(command, **_kwargs):
+        nonlocal splits
+        if "demucs.separate" in command:
+            splits += 1
+            stem = tmp_path / "cache" / "bgm" / "htdemucs" / "source" / "no_vocals.wav"
+            stem.parent.mkdir(parents=True, exist_ok=True)
+            stem.write_bytes(b"wav")
+        else:
+            Path(command[-1]).write_bytes(b"data")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(separate_module.subprocess, "run", fake_run)
+
+    ensure_instrumental(first, cache_dir=tmp_path / "cache", ffmpeg_path="ffmpeg")
+    ensure_instrumental(second, cache_dir=tmp_path / "cache", ffmpeg_path="ffmpeg")
+
+    assert splits == 2
+
+
 def test_a_missing_demucs_is_reported_with_the_install_command(tmp_path, monkeypatch):
     monkeypatch.setattr(separate_module, "find_spec", lambda _name: None)
 

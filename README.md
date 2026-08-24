@@ -33,16 +33,44 @@ cd /Users/sun/Documents/docx/video-txt
 uv run video-txt run '/绝对路径/你的视频.mp4' --provider lmstudio --mux-mode hard
 ```
 
-跑完在**视频所在目录**得到三个文件:
+跑完在**视频所在目录**得到四个文件:
 
 | 文件 | 是什么 |
 | --- | --- |
 | `你的视频.srt` | Whisper 转写的原文字幕 |
 | `你的视频.zh.srt` | 翻译后的中文字幕 |
+| `你的视频.zh.translation-audit.json` | 原文/译文结构与翻译质量审计报告 |
 | `你的视频.zh-burned.mp4` | 中文字幕烧进画面的成片 |
+
+加 `--refine-subtitles` 时还会生成 `你的视频.words.json`,保存可复用、与具体 Whisper
+实现无关的词级时间戳。
 
 去掉 `--mux-mode hard` 就是软字幕版,输出 `你的视频.zh-subbed.mp4`,字幕可以在播放器里开关。
 想先看看会执行什么、不真跑,加 `--dry-run`。
+
+## 长视频项目配置（v0.6）
+
+同一部长片需要反复精修时，用项目文件固定音轨、Whisper、翻译、术语表、字幕样式、配音和输出路径：
+
+```bash
+uv run --python 3.12 video-txt project init "$V" \
+  -o project.video-txt.json \
+  --audio-stream 2 --language en \
+  --provider lmstudio --model '当前加载的模型名' \
+  --term-file project.terms.json --mux-mode hard
+
+uv run --python 3.12 video-txt project status project.video-txt.json
+uv run --python 3.12 video-txt project run project.video-txt.json --dry-run
+uv run --python 3.12 video-txt project run project.video-txt.json
+```
+
+- `project.video-txt.json` 只保存稳定声明；相对路径始终以该文件所在目录为基准。
+- `.video-txt/state.json` 保存上次成功运行的内容/配置指纹、实际 Whisper 后端与模型、实际音轨及选择依据、阶段状态和产物。
+- 视频、原文字幕、术语表和译文按内容 SHA-256 判断，单纯 touch 文件不会失效。
+- 音轨或转写设置变化会使转写及下游过期；原文、术语表或翻译设置只从翻译向下失效；字幕样式只重跑 mux；音色只重跑配音并复用未变化的语音片段缓存。
+- 项目 JSON 和 state 只记录凭据环境变量名，不保存 API key、token 或其他秘密；真正执行云端阶段时仍从环境变量或凭据文件读取。
+- 没有 state 时，已有目标译文或成片视为外部文件，真实运行会拒绝覆盖；先 dry-run，或把文件移开/改输出路径。
+- `project run --dry-run` 不写字幕、成片或 state。原有 `run`、`dub`、`translate` 等命令行为不变。
 
 参考耗时:24 分钟的 480p 视频,CPU 转写 7.5 分钟 + 烧字幕 42 秒,翻译那一步走云端约 30 秒,
 走本机模型看机器和模型大小,慢不少。
@@ -64,6 +92,11 @@ uv sync --extra clone     # 原声克隆(F5-TTS)
 | 想做什么 | 命令 |
 | --- | --- |
 | 中文硬字幕成片(最常用) | `uv run video-txt run "$V" --provider lmstudio --mux-mode hard` |
+| 自动修掉过长、满屏的 Whisper 字幕 | 上面那条加 `--refine-subtitles` |
+| 已有 `.srt`,先检查质量 | `uv run --python 3.12 video-txt audit '/绝对路径/字幕.srt'` |
+| 已有 `.srt`,安全清理明显坏块 | `uv run --python 3.12 video-txt clean '/绝对路径/字幕.srt' -o '/绝对路径/字幕.clean.srt'` |
+| 固定人名/术语译法并审计译文 | 翻译命令加 `--term-file project.terms.json`,详见 v0.5 |
+| 双语或多音轨影片 | 正常传 `--language en`;选不准时再加 `--audio-stream 2` |
 | 原片底部已有烧死字幕 | 上面那条加 `--hard-subtitle-layout top`,新字幕放顶部,两边各占一头 |
 | 已有原文 `.srt`,不想重新转写 | 加 `--subtitle '/绝对路径/字幕.srt'` |
 | 电影这类大文件,只要外挂中文字幕 | 见下面「.mkv 电影:只做外挂字幕」 |
@@ -75,6 +108,155 @@ uv sync --extra clone     # 原声克隆(F5-TTS)
 
 同名 `.srt` 就在视频旁边时会自动复用,`--subtitle` 只在字幕不同名或不同目录时才需要。
 底部已有字幕时优先用 `top` 而不是黑罩,原因见 [NOTES.md](NOTES.md#硬字幕顶部布局-vs-黑罩)。
+
+## 字幕自动精修(v0.3)
+
+Whisper 默认按解码窗口输出字幕,开头几句有时会跨二三十秒、一次铺满整屏。精修模式改用
+Whisper 的词级时间戳重建字幕块:
+
+```bash
+V='/绝对路径/你的视频.mp4'
+
+# 完整流水线
+uv run --python 3.12 video-txt run "$V" --provider lmstudio --mux-mode hard \
+  --refine-subtitles
+
+# 只生成精修后的原文字幕
+uv run --python 3.12 video-txt transcribe "$V" -f srt --refine-subtitles
+```
+
+它会优先在完整句末和超过 0.8 秒的停顿处断句,同时把每条字幕限制在约 6 秒、最多两行;
+东亚全角字符按双倍显示宽度计算。OpenAI Whisper 和 MLX Whisper 两个后端都支持,默认不开启,
+所以旧命令的输出完全不变。
+
+一次成功转写会分别原子写入 `<视频名>.srt` 和 `<视频名>.words.json`,并以最后写入的词级文档作为
+完成标记。流水线只有在两者都存在、且词级文档格式有效时才复用;缺失或损坏会自动重转,显式重做
+仍用 `--retranscribe`。如果 `.srt` 在生成后被手工改过,校验不匹配时会停下而不会覆盖修改;
+确认要丢弃手工修改再加 `--retranscribe`。厂商原始 JSON 只在临时目录中存在,成功或失败后都会清理。
+
+精修必须从音视频重新取得词级时间戳,因此不能和 `--subtitle` 一起用;单独运行 `transcribe` 时必须
+同时指定 `-f srt`。
+
+## 已有字幕的审计与安全清理(v0.3.1)
+
+`--refine-subtitles` 是“转写时用词级时间戳重新断句”;如果手里已经有 `.srt`,不想重新跑 Whisper,
+用 `audit` / `clean`。先只检查:
+
+```bash
+S='/绝对路径/原文字幕.srt'
+V='/绝对路径/对应视频.mkv'
+
+uv run --python 3.12 video-txt audit "$S" --media "$V" --language en
+```
+
+终端会显示问题数,并在字幕旁写出 `<字幕名>.audit.json`。检查范围包括:接近 30 秒解码窗的短句幻觉、
+零时长/倒序/重叠时间轴、空字幕、过长字幕、超过两行或 42 显示列、序号异常、长段重复、明显的语种
+文字不符,以及字幕是否远早于视频结束。发现任何项目时 `audit` 返回非零状态,方便放进脚本或流水线;
+JSON 报告已经存在时要显式加 `--overwrite`,避免误盖人工留存的报告。
+
+确认要生成一份安全清理版时:
+
+```bash
+uv run --python 3.12 video-txt clean "$S" -o '/绝对路径/原文字幕.clean.srt' \
+  --media "$V" --language en
+```
+
+`clean` 只自动做可以确定的操作:删除整窗短句幻觉和空块、把零时长碎片并入紧邻的前一条、重新连续
+编号。重叠、倒序、普通长句和版式告警不会猜着改,都留在 `<输出名>.audit.json` 供人工复核。源字幕永远
+不会被覆盖,`-o` 必须是新路径;目标已存在时也会停下,只有明确传 `--overwrite` 才替换生成物。
+先预览而不写任何文件可加 `--dry-run`。
+
+## 多音轨智能选择(v0.4)
+
+双语电影经常把默认音轨设成配音版,甚至把语言标签写错。现在 `transcribe`、`run` 和 `dub` 在真正
+转写前会先读取所有音轨:优先匹配 `--language` 与音轨标题/语言标签,其次参考默认轨,并主动避开
+评论音轨和无障碍解说。最推荐的用法仍然只需指定源语言:
+
+```bash
+V='/绝对路径/双语电影.mkv'
+
+uv run --python 3.12 video-txt transcribe "$V" -f srt --language en
+```
+
+选择成功时会先显示依据,例如:
+
+```text
+Audio stream: 2 (Eng, spa, stereo) — title 'Eng' matches en
+```
+
+上例故意保留了真实的矛盾元数据:语言标签误写成 `spa`,但标题 `Eng` 与用户要求的英语一致,所以选择
+stream 2。选中的轨道会先被提取成临时 16 kHz 单声道 WAV 再交给 Whisper;任务结束后临时音频自动
+清理,源视频不变。
+
+两条轨道同样可信时程序会停下并列出索引、标题、语言和声道布局。确认后用 FFmpeg 的全局 stream
+index 明确覆盖:
+
+```bash
+uv run --python 3.12 video-txt transcribe "$V" -f srt --language en --audio-stream 2
+
+# 完整字幕流水线和配音流水线同样支持
+uv run --python 3.12 video-txt run "$V" --provider lmstudio --language en --audio-stream 2
+uv run --python 3.12 video-txt dub "$V" --provider lmstudio --language en --audio-stream 2
+```
+
+如果流水线已经有同名原文字幕,它仍会保护并复用旧文件;要按新音轨重转,同时加 `--retranscribe`。
+不确定选择结果时先加 `--dry-run`,它只显示音轨、提取命令和 Whisper 命令。
+
+## 项目术语表与翻译审计(v0.5)
+
+电影人名、产品名和行业术语不要靠每一批模型临场决定。为项目建立一份 JSON 术语表:
+
+```json
+{
+  "schema": "video-txt.terminology",
+  "version": 1,
+  "source_language": "en",
+  "target_language": "zh-CN",
+  "terms": [
+    {
+      "source": "Woody",
+      "target": "胡迪",
+      "match": "word",
+      "aliases": ["伍迪", "乌迪"]
+    },
+    {
+      "source": "Buzz Lightyear",
+      "target": "巴斯光年",
+      "match": "phrase"
+    }
+  ]
+}
+```
+
+`word` 只匹配完整单词,例如 `Woody` 不会误中 `Woodyard`;`phrase` 匹配完整短语。
+`aliases` 只放你明确批准替换的错误或旧译法。程序不会猜测近义词,也不会把普通词擅自改成人名。
+
+翻译、完整成片和配音都使用同一个参数:
+
+```bash
+T='/绝对路径/project.terms.json'
+
+uv run --python 3.12 video-txt translate source.srt --provider lmstudio --term-file "$T"
+uv run --python 3.12 video-txt run "$V" --provider lmstudio --term-file "$T"
+uv run --python 3.12 video-txt dub "$V" --provider lmstudio --term-file "$T"
+```
+
+术语表会同时用于三层保障:作为模型提示、精确规范化源词/`aliases`、翻译后审计。翻译完成会在译文
+旁写出 `<译文名>.translation-audit.json`;字幕数量、序号、时间轴或批准译法有确定性错误时命令返回
+非零,`run` / `dub` 会在封装或合成前停下。整句疑似未翻译和译文异常膨胀只记为 warning,不会因
+启发式判断阻断正常结果;连续至少 3 个英文词残留也会给出 warning。已经存在的译文也会按当前术语表
+复审;若不合格,修正术语表后加 `--retranslate` 重新生成。已有审计报告默认保留:`translate` 用
+`--overwrite`,流水线用 `--retranslate`,独立审计用 `--overwrite` 才会明确替换它。
+
+只审计已有译文、不调用模型也不改字幕:
+
+```bash
+uv run --python 3.12 video-txt audit-translation source.srt source.zh.srt \
+  --term-file "$T"
+```
+
+术语表可省略,此时仍检查原文/译文数量、序号、时间轴、空译文、整句残留原文和异常长度。
+报告已经存在时显式加 `--overwrite`;两份字幕始终只读。
 
 ## .mkv 电影:只做外挂字幕
 
@@ -312,6 +494,7 @@ uv run video-txt run "$V" --provider lmstudio --mux-mode hard \
 | `--model` / `--base-url` / `--api-key-env` | 换别的服务时逐项覆盖 |
 | `--concurrency 4` | 并发批数,长视频提速明显;被限流或本地服务器扛不住就调小 |
 | `--preserve-term Kubernetes` | 追加保留不译的术语,可传多次;默认已含 Claude、MCP、OpenAI、token 等 AI 术语,长期增删改 `video_txt/constants.py` 的 `DEFAULT_TERMS` |
+| `--term-file project.terms.json` | 指定源词→目标译法;用于模型提示、精确规范化和翻译审计 |
 | `--note '保持轻松的教程口吻'` | 追加翻译要求 |
 
 ### 本机还是云端
@@ -378,11 +561,15 @@ uv run pytest -q
 uv run ruff check . && uv run ruff format .
 ```
 
-代码分层:`video_txt/subtitles.py`(SRT/ASS 解析与生成)、`media.py`(ffmpeg/ffprobe 探测)、
-`translate.py`(翻译引擎)、`quality.py`(字幕体检)、`fit.py`(时长感知重译)、`diarize.py`(说话人分离)、
+代码分层:`video_txt/subtitles.py`(SRT/ASS 解析与生成)、`refine.py`(词级时间戳归一化与字幕精修)、
+`media.py`(ffmpeg/ffprobe 探测)、
+`translate.py`(翻译引擎)、`terminology.py`(项目术语表、规范化与翻译审计)、
+`quality.py`(结构化字幕审计与安全修复)、`fit.py`(时长感知重译)、
+`diarize.py`(说话人分离)、
 `clone.py`(参考音频抽取与克隆编排)、`clone_worker.py`(在模型自己的环境里合成的独立脚本)、
 `voices.py`(音色分配)、`timeline.py`(语音片段对齐与整轨渲染)、`dub.py`(配音编排)、
-`transcribe.py`、`mux.py`、`pipeline.py`(阶段编排)、`arguments.py`(命令行参数声明)、
+`transcribe.py`、`mux.py`、`pipeline.py`(阶段编排)、`project.py`(项目配置、内容指纹与阶段失效)、
+`arguments.py`(命令行参数声明)、
 `cli.py`(参数校验与命令处理)、`env.py`(凭据读取)、`parallel.py`(线程池)。
 
 Python 只用 `uv` 管:不动系统自带 Python,不用 `sudo pip install`,不引入 pyenv / conda / poetry。

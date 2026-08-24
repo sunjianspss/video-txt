@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import __version__
 from .arguments import (
+    build_audit_command,
+    build_clean_command,
     build_dub_command,
     build_mux_command,
+    build_project_command,
     build_run_command,
     build_transcribe_command,
     build_translate_command,
+    build_translation_audit_command,
 )
 from .clone import CLONE_ENGINES, CloneError, CloneOptions, is_rate, speed_from_rate
 from .constants import (
@@ -34,7 +40,7 @@ from .diarize import (
 from .dub import DubError, DubOptions, default_dubbed_output, run_dub
 from .env import CredentialError, resolve_api_key, resolve_optional_key
 from .fit import FitOptions
-from .media import MediaError, parse_video_size
+from .media import MediaError, parse_video_size, probe_audio_streams, select_audio_stream
 from .mux import MuxError, MuxOptions, default_video_output, run_mux
 from .pipeline import (
     TranscribeStage,
@@ -43,15 +49,36 @@ from .pipeline import (
     ensure_translated_subtitle,
     run_pipeline,
 )
-from .quality import check_transcript
+from .project import (
+    ProjectError,
+    build_project_state,
+    create_project_config,
+    inspect_project,
+    project_legacy_argv,
+    untracked_project_outputs,
+)
+from .project import write_json as write_project_json
+from .quality import audit_transcript, check_transcript, probe_media_duration, repair_transcript
 from .separate import SeparateError
 from .subtitles import (
     SubtitleFormatError,
     language_code,
     language_suffix,
+    parse_srt,
     translated_subtitle_path,
+    write_srt,
+)
+from .terminology import (
+    Terminology,
+    TerminologyError,
+    audit_translation,
+    load_terminology,
+    translation_audit_path_for,
+    write_translation_audit_report,
 )
 from .transcribe import TranscribeError, TranscribeOptions, run_transcribe
+from .transcribe import resolve_backend as resolve_transcription_backend
+from .transcribe import resolve_model as resolve_whisper_model
 from .translate import (
     TranslationConfig,
     TranslationError,
@@ -144,7 +171,10 @@ def build_clone_options(
 
 
 def resolve_provider_settings(
-    args: argparse.Namespace, parser: argparse.ArgumentParser
+    args: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    *,
+    discover_model: bool = True,
 ) -> tuple[str, str, str]:
     provider = PROVIDERS[args.provider] if args.provider else {}
     base_url = (
@@ -155,8 +185,10 @@ def resolve_provider_settings(
     )
     api_key_env = args.api_key_env or provider.get("api_key_env") or DEFAULT_API_KEY_ENV
     model = args.model or provider.get("model") or os.environ.get("OPENAI_MODEL")
-    if not model and provider.get("discover_model"):
+    if not model and provider.get("discover_model") and discover_model:
         model = discover_local_model(base_url, parser)
+    elif not model and provider.get("discover_model"):
+        model = "<loaded-local-model>"
     if not model:
         parser.error(
             "Missing model name. Pass --model, use --provider deepseek, or set OPENAI_MODEL."
@@ -182,7 +214,20 @@ def provider_requires_key(args: argparse.Namespace) -> bool:
 
 def resolve_reasoning_effort(args: argparse.Namespace) -> str:
     provider = PROVIDERS[args.provider] if args.provider else {}
+    if args.provider == "deepseek" and args.reasoning_effort == "none":
+        # DeepSeek controls the off state with `thinking.type`, not an effort named none.
+        return "auto"
     return args.reasoning_effort or provider.get("reasoning_effort") or "auto"
+
+
+def resolve_thinking(args: argparse.Namespace) -> str:
+    provider = PROVIDERS[args.provider] if args.provider else {}
+    if args.provider == "deepseek" and args.reasoning_effort:
+        if args.reasoning_effort == "none":
+            return "disabled"
+        if args.reasoning_effort != "auto":
+            return "enabled"
+    return provider.get("thinking") or "auto"
 
 
 def resolve_batch_chars(args: argparse.Namespace) -> int:
@@ -204,15 +249,62 @@ def validate_translation_numbers(parser: argparse.ArgumentParser, args: argparse
         parser.error("--timeout must be greater than 0")
 
 
+def translation_language_key(value: str) -> str:
+    suffix = language_suffix(value)
+    return suffix if suffix != "translated" else re.sub(r"[\s_-]+", "", value).casefold()
+
+
+def validate_terminology_languages(
+    terminology: Terminology, *, source_language: str | None, target_language: str
+) -> None:
+    if terminology.target_language and translation_language_key(
+        terminology.target_language
+    ) != translation_language_key(target_language):
+        raise TerminologyError(
+            f"Terminology target language {terminology.target_language!r} does not match "
+            f"the requested target language {target_language!r}."
+        )
+    if (
+        terminology.source_language
+        and source_language
+        and translation_language_key(terminology.source_language)
+        != translation_language_key(source_language)
+    ):
+        raise TerminologyError(
+            f"Terminology source language {terminology.source_language!r} does not match "
+            f"the requested source language {source_language!r}."
+        )
+
+
+def terminology_from_args(args: argparse.Namespace) -> Terminology | None:
+    if not args.term_file:
+        return None
+    term_path = resolved(args.term_file)
+    assert term_path is not None
+    return load_terminology(term_path)
+
+
 def build_translation_config(
     args: argparse.Namespace,
     parser: argparse.ArgumentParser,
     *,
     require_key: bool,
     spoken: bool = False,
+    discover_model: bool = True,
+    terminology: Terminology | None = None,
 ) -> TranslationConfig:
     validate_translation_numbers(parser, args)
-    base_url, api_key_env, model = resolve_provider_settings(args, parser)
+    if terminology is None:
+        terminology = terminology_from_args(args)
+    if terminology is not None:
+        validate_terminology_languages(
+            terminology,
+            source_language=args.source_language,
+            target_language=args.target_language,
+        )
+    base_url, api_key_env, model = resolve_provider_settings(
+        args, parser, discover_model=discover_model
+    )
     read_key = resolve_api_key if provider_requires_key(args) else resolve_optional_key
     api_key = read_key(api_key_env, secrets_file=args.secrets_file) if require_key else ""
     return TranslationConfig(
@@ -220,14 +312,18 @@ def build_translation_config(
         api_key=api_key,
         model=model,
         target_language=args.target_language,
-        source_language=args.source_language,
+        source_language=args.source_language or (
+            terminology.source_language if terminology is not None else None
+        ),
         preserve_terms=list(dict.fromkeys([*DEFAULT_TERMS, *args.preserve_term])),
+        terminology=terminology,
         note=args.note,
         spoken=spoken,
         batch_chars=resolve_batch_chars(args),
         retries=args.retries,
         concurrency=args.concurrency,
         context_cues=args.context_cues,
+        thinking=resolve_thinking(args),
         reasoning_effort=resolve_reasoning_effort(args),
         timeout=args.timeout,
     )
@@ -318,22 +414,41 @@ def build_translate_stage(
     *,
     require_key: bool,
     output_path: Path | None,
+    output_dir: Path | None = None,
     spoken: bool = False,
 ) -> TranslateStage:
+    terminology = terminology_from_args(args)
+    if terminology is not None:
+        validate_terminology_languages(
+            terminology,
+            source_language=args.source_language,
+            target_language=args.target_language,
+        )
     return TranslateStage(
         config=TranslationConfig(
             base_url="",
             api_key="",
             model="",
             target_language=args.target_language,
+            source_language=args.source_language or (
+                terminology.source_language if terminology is not None else None
+            ),
+            terminology=terminology,
         ),
         config_loader=lambda: build_translation_config(
-            args, parser, require_key=require_key, spoken=spoken
+            args,
+            parser,
+            require_key=require_key,
+            spoken=spoken,
+            discover_model=require_key,
+            terminology=terminology,
         ),
         output_path=output_path,
+        output_dir=output_dir,
         debug_dir=resolved(args.debug_dir),
         resume=args.resume,
         retranslate=args.retranslate,
+        reuse_if_exists=getattr(args, "project_reuse_translation", False),
     )
 
 
@@ -345,6 +460,8 @@ def build_transcribe_stage(args: argparse.Namespace) -> TranscribeStage:
         device=args.device,
         initial_prompt=args.initial_prompt,
         extra_args=args.whisper_args,
+        refine_subtitles=args.refine_subtitles,
+        audio_stream=args.audio_stream,
         retranscribe=args.retranscribe,
         skip_transcript_check=args.skip_transcript_check,
     )
@@ -459,6 +576,12 @@ def validate_voice_options(parser: argparse.ArgumentParser, args: argparse.Names
         "--min-speakers": args.min_speakers,
         "--max-speakers": args.max_speakers,
     }
+    if not args.diarize:
+        for flag, value in counts.items():
+            if value is not None:
+                parser.error(f"{flag} needs --diarize")
+        if args.rediarize:
+            parser.error("--rediarize needs --diarize")
     for flag, value in counts.items():
         if value is not None and value < 1:
             parser.error(f"{flag} must be 1 or greater")
@@ -497,6 +620,8 @@ def command_transcribe(args: argparse.Namespace, parser: argparse.ArgumentParser
         device=args.device,
         initial_prompt=args.initial_prompt,
         extra_args=args.whisper_args,
+        refine_subtitles=args.refine_subtitles,
+        audio_stream=args.audio_stream,
     )
     output_path = run_transcribe(options, dry_run=args.dry_run)
     if args.dry_run:
@@ -515,6 +640,151 @@ def command_transcribe(args: argparse.Namespace, parser: argparse.ArgumentParser
     return 1
 
 
+def write_json(path: Path, payload: dict[str, object]) -> Path:
+    """Atomically write a generated JSON artifact."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return path
+
+
+def command_audit(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    subtitle = existing_file(parser, args.input, "Subtitle file")
+    if subtitle.suffix.lower() != ".srt":
+        parser.error(f"Expected an .srt file, got: {subtitle.name}")
+    media = existing_file(parser, args.media, "Media file") if args.media else None
+    report_path = resolved(args.report) or subtitle.with_suffix(".audit.json")
+    if report_path == subtitle:
+        parser.error("The JSON report cannot replace the source subtitle.")
+    if report_path.exists() and not args.overwrite:
+        parser.error(f"Report already exists: {report_path}. Pass --overwrite to replace it.")
+
+    report = audit_transcript(
+        parse_srt(subtitle),
+        language=args.language,
+        media_duration=probe_media_duration(media) if media else None,
+    )
+    payload = {
+        "schema": "video-txt.subtitle-audit",
+        "version": 1,
+        "source": str(subtitle),
+        "media": str(media) if media else None,
+        **report.to_dict(),
+    }
+    write_json(report_path, payload)
+    noun = "finding" if len(report.findings) == 1 else "findings"
+    print(f"Audit: {len(report.findings)} {noun} across {report.cue_count} cues")
+    print(f"Report: {report_path}")
+    return 0 if report.is_clean else 1
+
+
+def command_translation_audit(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    source = existing_file(parser, args.source, "Source subtitle")
+    translation = existing_file(parser, args.translation, "Translated subtitle")
+    for label, path in (("Source", source), ("Translation", translation)):
+        if path.suffix.lower() != ".srt":
+            parser.error(f"{label} must be an .srt file, got: {path.name}")
+
+    term_file = (
+        existing_file(parser, args.term_file, "Terminology file") if args.term_file else None
+    )
+    terminology = load_terminology(term_file) if term_file is not None else None
+    report_path = resolved(args.report) or translation_audit_path_for(translation)
+    protected = {source, translation}
+    if term_file is not None:
+        protected.add(term_file)
+    if report_path in protected:
+        parser.error("The JSON report cannot replace an input subtitle or terminology file.")
+    if report_path.exists() and not args.overwrite:
+        parser.error(f"Report already exists: {report_path}. Pass --overwrite to replace it.")
+
+    report = audit_translation(parse_srt(source), parse_srt(translation), terminology)
+    write_translation_audit_report(
+        source_path=source,
+        translation_path=translation,
+        terminology=terminology,
+        audit=report,
+        report_path=report_path,
+        overwrite=args.overwrite,
+    )
+    noun = "finding" if len(report.findings) == 1 else "findings"
+    print(f"Translation audit: {len(report.findings)} {noun}")
+    print(f"Report: {report_path}")
+    return 0 if report.is_clean else 1
+
+
+def command_clean(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    subtitle = existing_file(parser, args.input, "Subtitle file")
+    if subtitle.suffix.lower() != ".srt":
+        parser.error(f"Expected an .srt file, got: {subtitle.name}")
+    media = existing_file(parser, args.media, "Media file") if args.media else None
+    output = resolved(args.output)
+    assert output is not None
+    if output.suffix.lower() != ".srt":
+        parser.error(f"Expected an .srt output file, got: {output.name}")
+    if output == subtitle:
+        parser.error("--output must be a new path; clean never overwrites the source subtitle.")
+    report_path = resolved(args.report) or output.with_suffix(".audit.json")
+    if report_path in {subtitle, output}:
+        parser.error("The JSON report must not replace the source or cleaned subtitle.")
+    for label, path in (("Output file", output), ("Report", report_path)):
+        if path.exists() and not args.overwrite and not args.dry_run:
+            parser.error(f"{label} already exists: {path}. Pass --overwrite to replace it.")
+
+    cues = parse_srt(subtitle)
+    duration = probe_media_duration(media) if media else None
+    report = audit_transcript(cues, language=args.language, media_duration=duration)
+    result = repair_transcript(cues, report)
+    post_repair = audit_transcript(
+        result.cues,
+        language=args.language,
+        media_duration=duration,
+    )
+    if args.dry_run:
+        print(
+            f"Would clean {subtitle}: remove {result.removed_count}, "
+            f"merge {result.merged_count}, leave {len(post_repair.findings)} findings"
+        )
+        print(f"Would write: {output}")
+        print(f"Would report: {report_path}")
+        return 1 if post_repair.has_errors else 0
+
+    write_srt(output, result.cues)
+    payload = {
+        "schema": "video-txt.subtitle-audit",
+        "version": 1,
+        "source": str(subtitle),
+        "media": str(media) if media else None,
+        "output": str(output),
+        **report.to_dict(),
+        "repair": result.to_dict(),
+        "post_repair": post_repair.to_dict(),
+    }
+    write_json(report_path, payload)
+    print(
+        f"Cleaned: {output} "
+        f"(removed {result.removed_count}, merged {result.merged_count})"
+    )
+    print(f"Report: {report_path}")
+    if not post_repair.is_clean:
+        print(f"Manual review still needed: {len(post_repair.findings)} findings", file=sys.stderr)
+    return 1 if post_repair.has_errors else 0
+
+
 def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     input_path = existing_file(parser, args.input, "Input file")
     if input_path.suffix.lower() != ".srt":
@@ -525,14 +795,23 @@ def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser)
     )
     if output_path.exists() and not args.overwrite and not args.dry_run:
         parser.error(f"Output file already exists: {output_path}. Pass --overwrite to replace it.")
+    report_path = translation_audit_path_for(output_path)
+    if report_path.exists() and not args.overwrite and not args.dry_run:
+        parser.error(f"Report already exists: {report_path}. Pass --overwrite to replace it.")
 
     translate_subtitle_file(
         input_path=input_path,
         output_path=output_path,
-        config=build_translation_config(args, parser, require_key=not args.dry_run),
+        config=build_translation_config(
+            args,
+            parser,
+            require_key=not args.dry_run,
+            discover_model=not args.dry_run,
+        ),
         debug_dir=resolved(args.debug_dir),
         resume=args.resume,
         dry_run=args.dry_run,
+        overwrite_audit=args.overwrite,
     )
     return 0
 
@@ -581,6 +860,7 @@ def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
             parser,
             require_key=not args.dry_run,
             output_path=resolved(args.subtitle_output),
+            output_dir=output_dir,
         ),
         mux_options_for=lambda translated: build_mux_options(
             args, video=video, subtitle=translated, video_output=video_output
@@ -627,6 +907,7 @@ def command_dub(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         parser,
         require_key=not args.dry_run,
         output_path=resolved(args.subtitle_output),
+        output_dir=output_dir,
         # The lines are going to be spoken, so they should read like speech.
         # An already-translated subtitle is reused as is: --retranslate redoes it.
         spoken=True,
@@ -655,6 +936,152 @@ def command_dub(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
     return 0
 
 
+def command_project(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.project_action == "status":
+        inspection = inspect_project(args.project_file)
+        print(f"Project: {inspection.project_path}")
+        print(f"Video: {inspection.paths['video']}")
+        audio_selection = inspection.state.get("audio_selection")
+        if isinstance(audio_selection, dict):
+            selected = audio_selection.get("selected_stream")
+            reason = audio_selection.get("reason")
+            print(
+                f"Selected audio stream: {selected or 'unknown'} — "
+                f"{reason or 'no reason recorded'}"
+            )
+        transcription_resolution = inspection.state.get("transcription_resolution")
+        if isinstance(transcription_resolution, dict):
+            print(
+                "Whisper: "
+                f"{transcription_resolution.get('backend') or 'unknown'} / "
+                f"{transcription_resolution.get('model') or 'unknown'}"
+            )
+        print(f"Translated subtitle: {inspection.paths['translated_subtitle']}")
+        print(f"Video output: {inspection.paths['video_output']}")
+        for name, status in inspection.statuses.items():
+            label = "stale" if status.stale else status.reason
+            print(f"{name}: {label} — {status.reason}" if status.stale else f"{name}: {label}")
+        return 1 if inspection.stale else 0
+    if args.project_action == "run":
+        inspection = inspect_project(args.project_file)
+        transcription = inspection.config["transcription"]
+        translation = inspection.config["translation"]
+        assert isinstance(transcription, dict)
+        assert isinstance(translation, dict)
+        print(f"Project: {inspection.project_path}")
+        print(f"Requested audio stream: {transcription.get('audio_stream') or 'auto'}")
+        print(f"Spoken language: {transcription.get('language') or 'auto'}")
+        if "terminology" in inspection.paths:
+            print(f"Terminology file: {inspection.paths['terminology']}")
+        print(f"Translation model: {translation.get('model') or 'provider default'}")
+        print(f"Translated subtitle: {inspection.paths['translated_subtitle']}")
+        print(f"Video output: {inspection.paths['video_output']}")
+        if not inspection.stale:
+            print("All enabled stages are current; nothing to run.")
+            return 0
+        if not args.dry_run:
+            untracked = untracked_project_outputs(inspection)
+            if untracked:
+                listed = "\n".join(f"  {path}" for path in untracked)
+                raise ProjectError(
+                    "Refusing to replace output files that are not recorded in project state:\n"
+                    f"{listed}\nMove them aside, choose new output paths, "
+                    "or use --dry-run to inspect."
+                )
+        legacy_argv = project_legacy_argv(inspection, dry_run=args.dry_run)
+        legacy_args = build_parser().parse_args(legacy_argv)
+        legacy_args.project_reuse_translation = not inspection.statuses["translate"].stale
+        code = legacy_args.handler(legacy_args, parser)
+        if code != 0 or args.dry_run:
+            return code
+        requested_stream = transcription.get("audio_stream")
+        if isinstance(requested_stream, int):
+            audio_selection: dict[str, object] = {
+                "requested_stream": requested_stream,
+                "selected_stream": requested_stream,
+                "reason": f"selected explicitly with --audio-stream {requested_stream}",
+            }
+        else:
+            try:
+                selected = select_audio_stream(
+                    probe_audio_streams(inspection.paths["video"]),
+                    preferred_language=(
+                        str(transcription["language"])
+                        if transcription.get("language") is not None
+                        else None
+                    ),
+                )
+                audio_selection = {
+                    "requested_stream": None,
+                    "selected_stream": selected.stream.index,
+                    "reason": selected.reason,
+                }
+            except MediaError as exc:
+                audio_selection = {
+                    "requested_stream": None,
+                    "selected_stream": None,
+                    "reason": f"could not inspect after run: {exc}",
+                }
+        refreshed = inspect_project(inspection.project_path)
+        transcription_resolution = None
+        if transcription.get("enabled", True):
+            actual_backend = resolve_transcription_backend(
+                str(transcription.get("backend") or "auto")
+            )
+            transcription_resolution = {
+                "backend": actual_backend,
+                "model": resolve_whisper_model(
+                    mode="transcribe",
+                    model=(
+                        str(transcription["model"])
+                        if transcription.get("model") is not None
+                        else None
+                    ),
+                    backend=actual_backend,
+                ),
+                "language": transcription.get("language"),
+            }
+        write_project_json(
+            refreshed.state_path,
+            build_project_state(
+                refreshed,
+                audio_selection=audio_selection,
+                transcription_resolution=transcription_resolution,
+            ),
+        )
+        print(f"State: {refreshed.state_path}")
+        return 0
+    if args.project_action != "init":
+        parser.error(f"Unknown project action: {args.project_action}")
+    project_path = resolved(args.output)
+    assert project_path is not None
+    if project_path.exists() and not args.overwrite:
+        parser.error(
+            f"Project file already exists: {project_path}. Pass --overwrite to replace it."
+        )
+    video = existing_file(parser, args.video, "Video file")
+    subtitle = existing_file(parser, args.subtitle, "Subtitle file") if args.subtitle else None
+    term_file = (
+        existing_file(parser, args.term_file, "Terminology file") if args.term_file else None
+    )
+    if term_file is not None:
+        validate_terminology_languages(
+            load_terminology(term_file),
+            source_language=args.source_language,
+            target_language=args.target_language,
+        )
+    payload = create_project_config(
+        project_path=project_path,
+        video=video,
+        args=args,
+        term_file=term_file,
+        subtitle=subtitle,
+    )
+    write_project_json(project_path, payload)
+    print(f"Project: {project_path}")
+    return 0
+
+
 @dataclass(frozen=True)
 class Command:
     name: str
@@ -664,6 +1091,30 @@ class Command:
 
 
 COMMANDS = (
+    Command(
+        "project",
+        "Create, inspect and run reproducible video projects.",
+        build_project_command,
+        command_project,
+    ),
+    Command(
+        "audit",
+        "Inspect an .srt file for timing, hallucination and layout defects.",
+        build_audit_command,
+        command_audit,
+    ),
+    Command(
+        "audit-translation",
+        "Compare source and translated subtitles for structure and terminology defects.",
+        build_translation_audit_command,
+        command_translation_audit,
+    ),
+    Command(
+        "clean",
+        "Write a new .srt with only high-confidence safe repairs applied.",
+        build_clean_command,
+        command_clean,
+    ),
     Command(
         "transcribe",
         "Convert audio or video into text with Whisper.",
@@ -723,8 +1174,10 @@ def main(argv: list[str] | None = None) -> int:
         DubError,
         MediaError,
         MuxError,
+        ProjectError,
         SeparateError,
         SubtitleFormatError,
+        TerminologyError,
         TranscribeError,
         TranslationError,
     ) as exc:

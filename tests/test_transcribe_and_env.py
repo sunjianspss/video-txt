@@ -3,9 +3,12 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from video_txt import media as media_module
+from video_txt import transcribe as transcribe_module
 from video_txt.env import (
     CredentialError,
     parse_secrets_text,
@@ -13,12 +16,14 @@ from video_txt.env import (
     resolve_api_key,
     resolve_optional_key,
 )
+from video_txt.subtitles import parse_srt
 from video_txt.transcribe import (
     TranscribeError,
     TranscribeOptions,
     build_command,
     expected_output_path,
     resolve_model,
+    run_transcribe,
 )
 
 
@@ -40,6 +45,17 @@ def test_openai_whisper_command_uses_underscore_flags():
     assert command[command.index("--initial_prompt") + 1] == "Claude Code, MCP"
 
 
+def test_openai_refinement_command_requests_word_timestamp_json():
+    command = build_command(
+        make_options(output_format="json", refine_subtitles=True),
+        backend="openai-whisper",
+        model="turbo",
+    )
+
+    assert command[command.index("--output_format") + 1] == "json"
+    assert command[command.index("--word_timestamps") + 1] == "True"
+
+
 def test_mlx_whisper_command_uses_hyphen_flags_and_pins_the_output_name():
     command = build_command(
         make_options(output_format="srt", extra_args=["--word-timestamps", "True"]),
@@ -50,6 +66,215 @@ def test_mlx_whisper_command_uses_hyphen_flags_and_pins_the_output_name():
     assert command[command.index("--output-dir") + 1] == "/media/out"
     assert command[command.index("--output-name") + 1] == "talk"
     assert command[-2:] == ["--word-timestamps", "True"]
+
+
+def test_mlx_refinement_command_requests_word_timestamp_json():
+    command = build_command(
+        make_options(output_format="json", refine_subtitles=True),
+        backend="mlx-whisper",
+        model="mlx-community/whisper-large-v3-turbo",
+    )
+
+    assert command[command.index("--output-format") + 1] == "json"
+    assert command[command.index("--word-timestamps") + 1] == "True"
+
+
+def test_dry_run_extracts_the_requested_audio_stream_before_whisper(
+    tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "talk.mkv"
+    video.write_bytes(b"media")
+    monkeypatch.setattr(transcribe_module, "find_ffmpeg", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(transcribe_module, "resolve_backend", lambda _value: "openai-whisper")
+    monkeypatch.setattr(
+        media_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"streams":['
+                '{"index":1,"codec_name":"ac3","channels":2,'
+                '"tags":{"language":"spa","title":"Lat"}},'
+                '{"index":2,"codec_name":"aac","channels":2,'
+                '"tags":{"language":"spa","title":"Eng"}}]}'
+            ),
+            stderr="",
+        ),
+    )
+
+    output = run_transcribe(
+        TranscribeOptions(
+            input_path=video,
+            output_dir=tmp_path / "out",
+            output_format="srt",
+            language="en",
+            audio_stream=2,
+        ),
+        dry_run=True,
+    )
+
+    lines = capsys.readouterr().out.splitlines()
+    assert "Audio stream: 2" in lines[0]
+    assert "selected explicitly" in lines[0]
+    assert "-map 0:2" in lines[1]
+    assert "-ac 1" in lines[1]
+    assert "-ar 16000" in lines[1]
+    assert "talk.wav" in lines[1]
+    assert "talk.wav" in lines[2]
+    assert output == tmp_path / "out" / "talk.srt"
+
+
+def test_dry_run_automatically_selects_language_title_from_multiple_tracks(
+    tmp_path, monkeypatch, capsys
+):
+    video = tmp_path / "talk.mkv"
+    video.write_bytes(b"media")
+    monkeypatch.setattr(transcribe_module, "find_ffmpeg", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(transcribe_module, "resolve_backend", lambda _value: "openai-whisper")
+    monkeypatch.setattr(
+        media_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"streams":['
+                '{"index":1,"disposition":{"default":1},'
+                '"tags":{"language":"spa","title":"Lat"}},'
+                '{"index":2,"tags":{"language":"spa","title":"Eng"}}]}'
+            ),
+            stderr="",
+        ),
+    )
+
+    run_transcribe(
+        TranscribeOptions(
+            input_path=video,
+            output_dir=tmp_path / "out",
+            output_format="srt",
+            language="en",
+        ),
+        dry_run=True,
+    )
+
+    output = capsys.readouterr().out
+    assert "Audio stream: 2 (Eng, spa)" in output
+    assert "title 'Eng' matches en" in output
+    assert "-map 0:2" in output
+
+
+def test_selected_stream_is_extracted_to_temporary_audio_for_whisper(
+    tmp_path, monkeypatch
+):
+    video = tmp_path / "talk.mkv"
+    video.write_bytes(b"media")
+    output_dir = tmp_path / "out"
+    commands: list[list[str]] = []
+    extracted_paths: list[Path] = []
+    monkeypatch.setattr(transcribe_module, "find_ffmpeg", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(transcribe_module, "resolve_backend", lambda _value: "openai-whisper")
+    monkeypatch.setattr(media_module, "find_ffprobe", lambda _path=None: "/usr/bin/ffprobe")
+
+    def external_tool(command, **_kwargs):
+        commands.append(command)
+        if "-select_streams" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout=(
+                    '{"streams":['
+                    '{"index":1,"tags":{"language":"spa","title":"Lat"}},'
+                    '{"index":2,"tags":{"language":"spa","title":"Eng"}}]}'
+                ),
+                stderr="",
+            )
+        if command[0] == "/usr/bin/ffmpeg":
+            extracted = Path(command[-1])
+            extracted_paths.append(extracted)
+            extracted.write_bytes(b"wav")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(media_module.subprocess, "run", external_tool)
+
+    output = run_transcribe(
+        TranscribeOptions(
+            input_path=video,
+            output_dir=output_dir,
+            output_format="srt",
+            language="en",
+        )
+    )
+
+    extraction = next(command for command in commands if command[0] == "/usr/bin/ffmpeg")
+    whisper = next(command for command in commands if "whisper" in command)
+    assert extraction[extraction.index("-map") + 1] == "0:2"
+    assert Path(whisper[3]).name == "talk.wav"
+    assert output == output_dir / "talk.srt"
+    assert extracted_paths and not extracted_paths[0].exists()
+
+
+def test_missing_explicit_audio_stream_is_a_transcription_error(tmp_path, monkeypatch):
+    video = tmp_path / "talk.mkv"
+    video.write_bytes(b"media")
+    monkeypatch.setattr(transcribe_module, "find_ffmpeg", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(transcribe_module, "resolve_backend", lambda _value: "openai-whisper")
+    monkeypatch.setattr(media_module, "find_ffprobe", lambda _path=None: "/usr/bin/ffprobe")
+    monkeypatch.setattr(
+        media_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout='{"streams":[{"index":1,"tags":{"title":"English"}}]}',
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(TranscribeError, match=r"Audio stream 9.*Available indexes: 1"):
+        run_transcribe(
+            TranscribeOptions(
+                input_path=video,
+                output_dir=tmp_path / "out",
+                audio_stream=9,
+            ),
+            dry_run=True,
+        )
+
+
+def test_mlx_whisper_receives_the_same_selected_temporary_audio(tmp_path, monkeypatch, capsys):
+    video = tmp_path / "talk.mkv"
+    video.write_bytes(b"media")
+    monkeypatch.setattr(transcribe_module, "find_ffmpeg", lambda: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(transcribe_module, "resolve_backend", lambda _value: "mlx-whisper")
+    monkeypatch.setattr(transcribe_module, "mlx_launcher", lambda: ["/usr/bin/mlx_whisper"])
+    monkeypatch.setattr(media_module, "find_ffprobe", lambda _path=None: "/usr/bin/ffprobe")
+    monkeypatch.setattr(
+        media_module.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                '{"streams":['
+                '{"index":1,"tags":{"language":"spa","title":"Lat"}},'
+                '{"index":2,"tags":{"language":"eng","title":"English"}}]}'
+            ),
+            stderr="",
+        ),
+    )
+
+    run_transcribe(
+        TranscribeOptions(
+            input_path=video,
+            output_dir=tmp_path / "out",
+            output_format="srt",
+            language="en",
+            backend="mlx-whisper",
+        ),
+        dry_run=True,
+    )
+
+    output = capsys.readouterr().out
+    assert "/usr/bin/mlx_whisper" in output
+    assert "talk.wav" in output
+    assert "--output-name talk" in output
+    assert "-map 0:2" in output
 
 
 def test_resolve_model_defaults_per_mode():
@@ -77,6 +302,79 @@ def test_resolve_model_rejects_turbo_for_translation():
 def test_expected_output_path():
     assert expected_output_path(make_options(output_format="srt")) == Path("/media/out/talk.srt")
     assert expected_output_path(make_options(output_format="all")) == Path("/media/out/talk.txt")
+
+
+def test_refined_transcription_writes_srt_and_normalized_words_json(tmp_path, monkeypatch):
+    video = tmp_path / "talk.mp4"
+    video.write_bytes(b"media")
+    output_dir = tmp_path / "out"
+    monkeypatch.setattr(transcribe_module, "find_ffmpeg", lambda: Path("/usr/bin/ffmpeg"))
+    monkeypatch.setattr(transcribe_module, "resolve_backend", lambda _requested: "openai-whisper")
+
+    def whisper(command, **_kwargs):
+        if "-select_streams" in command:
+            return SimpleNamespace(
+                returncode=0,
+                stdout='{"streams":[{"index":1,"codec_name":"aac","channels":2}]}',
+                stderr="",
+            )
+        raw_output_dir = Path(command[command.index("--output_dir") + 1])
+        raw_output_dir.mkdir(parents=True, exist_ok=True)
+        (raw_output_dir / "talk.json").write_text(
+            '{"language":"en","segments":[{"words":['
+            '{"word":" Hello","start":0.0,"end":0.5},'
+            '{"word":" world.","start":0.5,"end":1.0}]}]}',
+            encoding="utf-8",
+        )
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(transcribe_module.subprocess, "run", whisper)
+
+    output = run_transcribe(
+        TranscribeOptions(
+            input_path=video,
+            output_dir=output_dir,
+            output_format="srt",
+            backend="openai-whisper",
+            refine_subtitles=True,
+        )
+    )
+
+    assert output == output_dir / "talk.srt"
+    assert parse_srt(output)[0].text == "Hello world."
+    assert (output_dir / "talk.words.json").is_file()
+    assert not (output_dir / "talk.json").exists()
+
+
+def test_refinement_rejects_non_srt_output_before_starting_whisper(tmp_path):
+    video = tmp_path / "talk.mp4"
+    video.write_bytes(b"media")
+
+    with pytest.raises(TranscribeError, match="requires --format srt"):
+        run_transcribe(
+            TranscribeOptions(
+                input_path=video,
+                output_dir=tmp_path,
+                output_format="txt",
+                refine_subtitles=True,
+            )
+        )
+
+
+def test_refinement_rejects_raw_arguments_that_override_its_required_json(tmp_path):
+    video = tmp_path / "talk.mp4"
+    video.write_bytes(b"media")
+
+    with pytest.raises(TranscribeError, match="conflicts with --refine-subtitles"):
+        run_transcribe(
+            TranscribeOptions(
+                input_path=video,
+                output_dir=tmp_path,
+                output_format="srt",
+                refine_subtitles=True,
+                extra_args=["--output_format", "srt"],
+            )
+        )
 
 
 def test_parse_secrets_text_handles_export_quotes_and_comments():
