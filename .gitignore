@@ -9,3 +9,5 @@ output/
 *.debug/
 *.dub-cache/
 *.partial.jsonl
+toy-story-5-subtitles/models/
+toy-story-5-subtitles/work/

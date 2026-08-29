@@ -4,6 +4,9 @@
 
 做技术决定时的实测数据和取舍记在 [NOTES.md](NOTES.md),这里只讲怎么用。
 
+版本演进与各阶段用法见 [CHANGELOG.md](CHANGELOG.md)；快速浏览见
+[版本时间线](docs/version-timeline.md)。
+
 ## 快速开始
 
 第一次用先装依赖,只做一次:

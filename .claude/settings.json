@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(uv run video-txt *)",
+      "Bash(uv run --python 3.12 video-txt *)",
+      "Bash(.venv/bin/video-txt *)",
+      "Bash(uv run python -c \"from video_txt.translate import loaded_local_model; print(loaded_local_model('http://localhost:1234/v1'))\")",
+      "Bash(ffprobe *)"
+    ]
+  }
+}
