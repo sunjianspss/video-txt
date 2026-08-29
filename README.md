@@ -389,7 +389,7 @@ uv run video-txt dub "$V" --provider lmstudio
 
 | 想要 | 加这个参数 |
 | --- | --- |
-| 只留音乐和环境声(推荐) | `--separate-bgm`,先 `uv sync --extra separate`。Demucs 把原声里的人声抠掉,音乐、掌声、环境声全音量保留,不跟配音打架。首次要下模型、分离要几分钟,结果缓存后重跑秒过 |
+| 只留音乐和环境声(推荐) | `--separate-bgm`,先 `uv sync --extra separate`。Demucs 把原声里的人声抠掉,音乐、掌声、环境声全音量保留,不跟配音打架。首次要下模型、分离要几分钟,结果缓存后重跑秒过。抠出来的人声干轨会留下,克隆音色时用它剪参考片段 |
 | 保留完整原声垫底 | `--keep-bgm`,整条原声(含原人声)压到 15%,太轻用 `--bgm-volume 0.25` 调 |
 | 换音色 | `--voice zh-CN-YunxiNeural` |
 | 整体语速 | `--rate +10%` 或 `--rate -10%` |
@@ -453,6 +453,9 @@ uv run video-txt dub "$V" --provider lmstudio --tts-engine index-tts \
 
 - 参考音频自动从源语言字幕里剪(3–12 秒连续说话),存进 `你的视频.dub-cache/reference/`。
   想自己指定用 `--clone-reference my.wav`,旁边放一个 `my.txt` 写清楚这段音频说了什么。
+- **配乐大的片子加上 `--separate-bgm`**:分离出来的人声干轨会用来剪参考片段,克隆到的是人声
+  本身,不是人声加背景音乐。文件名带 `-clean`,和从混音剪的参考分开存。没开这个参数(或缓存里
+  还没有干轨)就照旧从原始混音剪。
 - **慢,而且没法并发。** 本地推理,一集剧大约是实时的三分之一到一半;
   先 `--dry-run` 看清楚要合成多少段再开跑,别拿长视频试手。
 - 另外两个引擎:`--tts-engine f5-tts` 最省事(`uv sync --extra clone` 装进本项目环境,
@@ -464,7 +467,8 @@ uv run video-txt dub "$V" --provider lmstudio --tts-engine index-tts \
 
 每句语音按内容哈希缓存在 `你的视频.dub-cache/`,重跑只补缺的句子。改 `--keep-bgm`、`--soft-subtitle`
 这类不影响语音本身的参数几乎不花时间;换 `--voice` 或 `--rate` 会让缓存整体失效,等于重新合成一遍。
-`--separate-bgm` 分离出来的背景轨也在这里(`bgm/no_vocals.flac`),`--prune-cache` 不会动它。
+`--separate-bgm` 分离出来的两条轨也在这里(`bgm/no_vocals.flac` 背景、`bgm/vocals.flac` 人声干轨,
+后者用来剪克隆参考),`--prune-cache` 不会动它们。
 
 哈希只认内容、音色和语速,不认句子的位置:手改译文里的某一句、或者在中间插一句,后面的句子照样
 命中缓存;整片重复的台词(片头片尾语这类)也只合成一次。

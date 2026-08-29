@@ -24,6 +24,9 @@ from .media import file_identity
 SEPARATE_MODEL = "htdemucs"
 BGM_DIR_NAME = "bgm"
 STEM_FILENAME = "no_vocals.flac"
+# The other stem of the same split. It is not what --separate-bgm was asked for,
+# but a clone reference cut from it has the speaker without the music.
+VOICE_FILENAME = "vocals.flac"
 CACHE_META_FILENAME = "metadata.json"
 
 
@@ -33,6 +36,10 @@ class SeparateError(RuntimeError):
 
 def separated_bgm_path(cache_dir: Path) -> Path:
     return cache_dir / BGM_DIR_NAME / STEM_FILENAME
+
+
+def separated_voice_path(cache_dir: Path) -> Path:
+    return cache_dir / BGM_DIR_NAME / VOICE_FILENAME
 
 
 def cache_metadata(video: Path) -> dict[str, object] | None:
@@ -108,6 +115,35 @@ def compress_command(stem: Path, *, target: Path, ffmpeg_path: str) -> list[str]
     return [ffmpeg_path, "-y", "-v", "error", "-i", str(stem), "-c:a", "flac", str(target)]
 
 
+def keep_voice_stem(stem: Path, *, target: Path, ffmpeg_path: str) -> Path | None:
+    """Keep the vocal half of the split for cutting clone references from.
+
+    Demucs writes both stems whichever one was asked for, and this one used to go
+    out with the work directory. It is a bonus rather than the point of the run,
+    so a failure to keep it is said out loud and stepped over: the reference then
+    comes from the original mix, the way it always did.
+    """
+    if not stem.is_file():
+        return None
+    temporary = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.part{target.suffix}")
+    completed = subprocess.run(
+        compress_command(stem, target=temporary, ffmpeg_path=ffmpeg_path),
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0 or not temporary.is_file() or temporary.stat().st_size == 0:
+        temporary.unlink(missing_ok=True)
+        detail = (completed.stderr or "").strip()
+        print(
+            f"Could not keep the separated voice track ({detail}); "
+            "reference clips will be cut from the original mix.",
+            file=sys.stderr,
+        )
+        return None
+    temporary.replace(target)
+    return target
+
+
 def ensure_instrumental(video: Path, *, cache_dir: Path, ffmpeg_path: str) -> Path:
     """The original audio with the voices removed, made once and cached.
 
@@ -161,11 +197,16 @@ def ensure_instrumental(video: Path, *, cache_dir: Path, ffmpeg_path: str) -> Pa
             detail = (completed.stderr or "").strip()
             raise SeparateError(f"Could not compress the background track: {detail}")
         temporary_target.replace(target)
+        keep_voice_stem(
+            stem.with_name("vocals.wav"),
+            target=separated_voice_path(cache_dir),
+            ffmpeg_path=ffmpeg_path,
+        )
         if expected_metadata is not None:
             write_cache_metadata(metadata_path, expected_metadata)
     finally:
-        # Only the finished FLAC is worth keeping: the WAV stems are hundreds of
-        # megabytes, and the vocal stem was never wanted in the first place.
+        # Only the finished FLACs are worth keeping: the WAV stems are hundreds of
+        # megabytes each.
         shutil.rmtree(work_dir / SEPARATE_MODEL, ignore_errors=True)
         source.unlink(missing_ok=True)
         temporary_target.unlink(missing_ok=True)
