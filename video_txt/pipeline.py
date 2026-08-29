@@ -7,6 +7,7 @@ from pathlib import Path
 from .mux import MuxOptions, run_mux
 from .quality import check_transcript
 from .refine import RefineError, load_word_document, word_document_matches_subtitle
+from .reuse import PreviousTranslation
 from .subtitles import parse_srt, translated_subtitle_path
 from .terminology import (
     audit_translation,
@@ -41,6 +42,8 @@ class TranslateStage:
     resume: bool = True
     retranslate: bool = False
     reuse_if_exists: bool = False
+    # An earlier source/translation pair whose unchanged lines are carried over.
+    previous: PreviousTranslation | None = None
 
     def require_config(self) -> TranslationConfig:
         """Load API settings only when this stage actually has work to do."""
@@ -226,6 +229,7 @@ def ensure_translated_subtitle(
         resume=stage.resume,
         dry_run=dry_run,
         overwrite_audit=stage.retranslate,
+        previous=stage.previous,
     )
 
 

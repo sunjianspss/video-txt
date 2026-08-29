@@ -170,6 +170,20 @@ def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: st
         type=Path,
         help="Directory for invalid API response debug files.",
     )
+    group.add_argument(
+        "--reuse",
+        type=Path,
+        metavar="PREVIOUS_SRT",
+        help=(
+            "Previous source .srt this one was repaired from. Lines that read the same keep "
+            "their translation and are not sent to the model again."
+        ),
+    )
+    group.add_argument(
+        "--reuse-translation",
+        type=Path,
+        help="Translation of --reuse. Defaults to '<previous>.<target language>.srt' beside it.",
+    )
     group.add_argument("--note", help="Extra translation note, for example 'keep a casual tone'.")
     group.add_argument(
         "--preserve-term",

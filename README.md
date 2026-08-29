@@ -108,8 +108,19 @@ OpenAI Whisper / MLX Whisper、`--model`、`--initial-prompt`、`--whisper-arg` 
 源字幕始终只读。省略 `-o` 时默认生成 `<字幕名>.repaired.srt`，同时写出
 `<输出名>.retranscription-report.json`，记录核心/提取区间、音轨选择依据、删除和新增的字幕。
 已有生成物默认不覆盖；确认替换时加 `--overwrite`。先加 `--dry-run` 可只查看音频提取、Whisper 和
-替换计划，不写任何文件。v0.7.0 只修原文 SRT，不会修改已有译文；局部翻译与翻译审计更新留到
-v0.7.1。
+替换计划，不写任何文件。
+
+修好原文之后翻译不必从头再来。`--reuse` 指向修复前的原文字幕，读得一样的行直接沿用旧译文，
+只有真正改过的那几行才发给模型：
+
+```bash
+uv run --python 3.12 video-txt translate '/绝对路径/电影.repaired.srt' \
+  --reuse "$S" --provider lmstudio
+```
+
+旧译文默认按命名规则在 `$S` 旁边找（`电影.zh.srt`），不在那儿就用 `--reuse-translation` 指出来。
+匹配只看文字（忽略空白与大小写），所以重新编号、时间轴微调都不影响沿用；同一句话在片中说过多次时，
+取时间上最近的那条译文。终端会打印沿用了多少条、还剩多少条要翻译。`dub`、`run`、`mux` 也认这两个参数。
 
 参考耗时:24 分钟的 480p 视频,CPU 转写 7.5 分钟 + 烧字幕 42 秒,翻译那一步走云端约 30 秒,
 走本机模型看机器和模型大小,慢不少。
@@ -135,6 +146,7 @@ uv sync --extra clone     # 原声克隆(F5-TTS)
 | 已有 `.srt`,先检查质量 | `uv run --python 3.12 video-txt audit '/绝对路径/字幕.srt'` |
 | 已有 `.srt`,安全清理明显坏块 | `uv run --python 3.12 video-txt clean '/绝对路径/字幕.srt' -o '/绝对路径/字幕.clean.srt'` |
 | 只重识别一小段错误字幕 | `uv run --python 3.12 video-txt retranscribe-range "$V" --subtitle source.srt --from 00:19:30 --to 00:20:10` |
+| 修好原文后只翻译变过的行 | `uv run --python 3.12 video-txt translate source.repaired.srt --reuse source.srt` |
 | 固定人名/术语译法并审计译文 | 翻译命令加 `--term-file project.terms.json`,详见 v0.5 |
 | 双语或多音轨影片 | 正常传 `--language en`;选不准时再加 `--audio-stream 2` |
 | 原片底部已有烧死字幕 | 上面那条加 `--hard-subtitle-layout top`,新字幕放顶部,两边各占一头 |

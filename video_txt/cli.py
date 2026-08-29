@@ -66,6 +66,7 @@ from .retranscribe import (
     parse_timecode,
     run_retranscribe,
 )
+from .reuse import PreviousTranslation, ReuseError
 from .separate import SeparateError
 from .subtitles import (
     SubtitleFormatError,
@@ -456,6 +457,7 @@ def build_translate_stage(
         resume=args.resume,
         retranslate=args.retranslate,
         reuse_if_exists=getattr(args, "project_reuse_translation", False),
+        previous=resolve_previous_translation(args, parser),
     )
 
 
@@ -857,6 +859,26 @@ def command_clean(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     return 1 if post_repair.has_errors else 0
 
 
+def resolve_previous_translation(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> PreviousTranslation | None:
+    """The source/translation pair --reuse points at, with the naming rule filled in."""
+    if args.reuse is None:
+        if args.reuse_translation is not None:
+            parser.error("--reuse-translation needs --reuse, the source it was translated from.")
+        return None
+    source = existing_file(parser, args.reuse, "Previous source subtitle")
+    translation = resolved(args.reuse_translation) or translated_subtitle_path(
+        source, args.target_language
+    )
+    if not translation.is_file():
+        parser.error(
+            f"No translation of {source.name} at {translation}. "
+            "Point at it with --reuse-translation."
+        )
+    return PreviousTranslation(source=source, translation=translation)
+
+
 def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     input_path = existing_file(parser, args.input, "Input file")
     if input_path.suffix.lower() != ".srt":
@@ -871,9 +893,12 @@ def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser)
     if report_path.exists() and not args.overwrite and not args.dry_run:
         parser.error(f"Report already exists: {report_path}. Pass --overwrite to replace it.")
 
+    previous = resolve_previous_translation(args, parser)
+
     translate_subtitle_file(
         input_path=input_path,
         output_path=output_path,
+        previous=previous,
         config=build_translation_config(
             args,
             parser,
@@ -1254,6 +1279,7 @@ def main(argv: list[str] | None = None) -> int:
         MuxError,
         ProjectError,
         RetranscribeError,
+        ReuseError,
         SeparateError,
         SubtitleFormatError,
         TerminologyError,
