@@ -32,6 +32,13 @@ MAX_REPORTED_RUNS = 3
 MIN_COVERAGE_SHARE = 0.5
 MIN_JUDGED_MEDIA_DURATION = 300.0
 
+# The other end of the same question: subtitles that keep going after the media
+# has stopped. They belong to a different cut, or the timing was shifted, and
+# whatever they say is lost -- the dub mixes down to the length of the video, and
+# a player has nothing left to show them over. Half a second of rounding at the
+# last cue is normal and says nothing.
+MAX_OVERRUN = 0.5
+
 # Scripts that are obvious on sight. Latin-script languages cannot be told apart this
 # cheaply, so asking for French and getting English goes unnoticed here.
 SCRIPTS: dict[str, tuple[str, re.Pattern[str]]] = {
@@ -338,6 +345,22 @@ def audit_transcript(
     gap = coverage_problem(cues, media_duration) if media_duration is not None else None
     if gap is not None:
         findings.append(AuditFinding(code="low_coverage", message=gap, severity="error"))
+    if media_duration is not None:
+        overrun = overrun_problem(cues, media_duration)
+        if overrun is not None:
+            late = [
+                (position, cue.index)
+                for position, cue in enumerate(cues, start=1)
+                if not cue.is_empty and cue.end_seconds > media_duration + MAX_OVERRUN
+            ]
+            findings.append(
+                AuditFinding(
+                    code="past_media_end",
+                    message=f"{overrun}.",
+                    cue_positions=tuple(position for position, _index in late),
+                    cue_indexes=tuple(index for _position, index in late),
+                )
+            )
     return AuditReport(cue_count=len(cues), findings=tuple(findings))
 
 
@@ -510,6 +533,22 @@ def coverage_problem(cues: list[SubtitleCue], media_duration: float) -> str | No
     return (
         f"the transcript stops at {clock(covered)} but the media runs until "
         f"{clock(media_duration)} -- was the file fully downloaded before transcribing?"
+    )
+
+
+def overrun_problem(cues: list[SubtitleCue], media_duration: float) -> str | None:
+    ends = [cue.end_seconds for cue in cues if not cue.is_empty]
+    if not ends:
+        return None
+    last = max(ends)
+    overrun = last - media_duration
+    if overrun <= MAX_OVERRUN:
+        return None
+    beyond = sum(1 for end in ends if end > media_duration + MAX_OVERRUN)
+    return (
+        f"{beyond} cue(s) end after the media does: the last one at {clock(last)}, "
+        f"{overrun:.2f} seconds past the end of a file that runs {clock(media_duration)} -- "
+        "a dub drops what falls outside the video, and a player never shows it"
     )
 
 

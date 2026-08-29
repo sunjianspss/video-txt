@@ -11,6 +11,7 @@ from video_txt.pipeline import TranscribeStage, ensure_source_subtitle
 from video_txt.quality import (
     check_transcript,
     coverage_problem,
+    overrun_problem,
     stuck_runs,
     transcript_problems,
 )
@@ -101,6 +102,22 @@ def test_a_transcript_reaching_past_halfway_is_fine():
 
 def test_short_clips_are_not_judged_on_coverage():
     assert coverage_problem(cues([("Hi", 0.0, 5.0)]), 200.0) is None
+
+
+def test_subtitles_running_past_the_end_of_the_media_are_called_out():
+    problem = overrun_problem(cues([("Hello", 0.0, 10.0), ("Bye", 100.0, 203.0)]), 200.0)
+    assert problem is not None
+    assert "1 cue(s)" in problem
+    assert "0:03:23" in problem
+    assert "0:03:20" in problem
+
+
+def test_a_last_cue_ending_with_the_media_is_fine():
+    assert overrun_problem(cues([("Bye", 0.0, 200.2)]), 200.0) is None
+
+
+def test_subtitles_shorter_than_the_media_do_not_overrun():
+    assert overrun_problem(cues([("Bye", 0.0, 100.0)]), 200.0) is None
 
 
 def partial_download_transcript(tmp_path: Path) -> Path:

@@ -184,6 +184,22 @@ def test_media_coverage_check_is_a_structured_finding():
     assert "low_coverage" in [finding.code for finding in report.findings]
 
 
+def test_cues_past_the_end_of_the_media_are_a_warning_not_a_blocker():
+    """A subtitle from another cut is worth saying; it is not a broken transcript."""
+    cues = [
+        SubtitleCue("1", "00:24:10,000 --> 00:24:14,000", ["Hello there."]),
+        SubtitleCue("2", "00:48:21,000 --> 00:48:25,000", ["Goodbye now."]),
+    ]
+
+    report = audit_transcript(cues, media_duration=2900.0)
+
+    overrun = [finding for finding in report.findings if finding.code == "past_media_end"]
+    assert len(overrun) == 1
+    assert overrun[0].severity == "warning"
+    assert overrun[0].cue_indexes == ("2",)
+    assert not report.has_errors
+
+
 def test_full_window_dialogue_is_not_removed_when_it_is_not_a_short_phrase():
     cue = SubtitleCue(
         "1",

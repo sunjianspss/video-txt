@@ -239,9 +239,12 @@ def build_messages(
             "Spell out whatever a voice cannot pronounce as written. Percent signs, "
             "currency amounts, maths symbols, units of measure and section labels "
             "become the words the target language says them as, so '30%' and '3(b)' "
-            "must not survive as digits and punctuation. Initialisms that are "
-            "normally said letter by letter, and anything in preserve_terms, stay "
-            "exactly as they are."
+            "must not survive as digits and punctuation. Keep an initialism as "
+            "letters only where a listener in the target language hears those "
+            "letters in ordinary speech, the way Chinese keeps CPU and GPS; where "
+            "the target language says the thing in words instead, use the words, "
+            "so a finance talk's AR and AP are read as the accounts they name. "
+            "Anything in preserve_terms stays exactly as it is."
         )
     if config.terminology and config.terminology.terms:
         rules.append(

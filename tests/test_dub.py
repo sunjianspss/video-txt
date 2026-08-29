@@ -388,6 +388,21 @@ def test_has_speakable_text_tells_words_from_held_pauses():
     assert not has_speakable_text("- ?!")
 
 
+def test_a_single_stray_character_is_not_worth_saying():
+    """Whisper writes 'x' or '0' where it heard a door or a breath."""
+    assert not has_speakable_text("x")
+    assert not has_speakable_text("0")
+    assert not has_speakable_text("1.")
+    assert not has_speakable_text("- x?")
+
+
+def test_a_line_that_is_one_character_of_speech_still_gets_a_voice():
+    assert has_speakable_text("好")
+    assert has_speakable_text("嗯。")
+    assert has_speakable_text("3, 2, 1")
+    assert has_speakable_text("Go!")
+
+
 def test_lines_with_no_words_keep_their_subtitle_but_get_no_voice_clip(
     monkeypatch, tmp_path, capsys
 ):
@@ -428,7 +443,7 @@ def test_lines_with_no_words_keep_their_subtitle_but_get_no_voice_clip(
     run_dub(make_options(subtitle_input=subtitle, video_output=tmp_path / "clip.zh-dubbed.mp4"))
 
     assert spoken == ["第一句。", "第二句。"]
-    assert "Leaving 2 line(s) with no words unvoiced" in capsys.readouterr().out
+    assert "Leaving 2 line(s) with nothing to say unvoiced" in capsys.readouterr().out
 
 
 def test_a_folder_named_for_the_output_is_made_before_ffmpeg_needs_it(monkeypatch, tmp_path):

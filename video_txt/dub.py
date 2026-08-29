@@ -79,6 +79,11 @@ CLIP_PREFIX = "clip-"
 CLIP_SUFFIXES = (".mp3", ".aiff", ".wav")
 PARTIAL_SUFFIX = ".part"
 
+# Scripts where one character already is a word, so a one-character line is
+# speech rather than a stray mark: Chinese, Japanese kana, Korean hangul.
+SYLLABIC_PATTERN = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]")
+WORD_CHARACTER_PATTERN = re.compile(r"\w")
+
 # Engines that can be asked for a faster reading of one line. The others fall
 # back to stretching the waveform, which is what the re-speak exists to avoid.
 # edge-tts takes a rate flag; the cloning engines take a speed multiplier per
@@ -229,8 +234,16 @@ def has_speakable_text(text: str) -> bool:
     musical notes around a song. edge-tts answers those with a NoAudioReceived
     error that would stop the whole run. Such a line still shows on screen as a
     subtitle; it just must not become a voice clip.
+
+    A lone letter or digit is the other kind of line worth passing over: 'x' and
+    '0' are what Whisper writes down when it hears a door or a breath, and a
+    voice saying "ex" over that moment is worse than silence. Counting down
+    survives -- '3, 2, 1' has three of them -- and so does a single Chinese,
+    Japanese or Korean character, which is a whole word.
     """
-    return re.search(r"\w", text) is not None
+    if SYLLABIC_PATTERN.search(text):
+        return True
+    return len(WORD_CHARACTER_PATTERN.findall(text)) > 1
 
 
 def segment_filename(engine: str, text: str, voice: str, rate: str) -> str:
@@ -809,7 +822,10 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
     ]
     unvoiced = sum(1 for _, cue in cues if not has_speakable_text(cue.text))
     if unvoiced:
-        print(f"Leaving {unvoiced} line(s) with no words unvoiced, e.g. '...' held pauses.")
+        print(
+            f"Leaving {unvoiced} line(s) with nothing to say unvoiced, "
+            "e.g. '...' held pauses and stray single characters."
+        )
         cues = [(position, cue) for position, cue in cues if has_speakable_text(cue.text)]
     if not cues:
         raise DubError(f"No spoken lines found in {options.subtitle_input}")
