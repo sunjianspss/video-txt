@@ -34,7 +34,7 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 | 只有几句听错 | `retranscribe-range "$V" --subtitle "$S" --from 00:19:30 --to 00:20:10` | `字幕.repaired.srt` |
 | 只有几句**译**得不对（听对了、译错了） | 写 `revisions.json`，再 `revise '原文.srt' '译文.zh.srt' --revisions r.json` | `译文.zh.revised.srt` |
 | 开翻整季前先建术语表 | `draft-terms "$D"/*.srt -o 剧名.terms.json` | `target` 待填的草稿 |
-| 要原文译文对照（学语言、校对） | 加 `--bilingual`，或 `bilingual '原文.srt' '译文.zh.srt'` | `译文.zh.bilingual.srt` |
+| 原文译文对照（**仅用户明说要双语时**） | 加 `--bilingual`，或 `bilingual '原文.srt' '译文.zh.srt'` | `译文.zh.bilingual.srt` |
 | 先检查字幕质量 | `audit "$S" --media "$V" --language en` | `字幕.audit.json` |
 | 安全清理坏字幕块 | `clean "$S" -o '/绝对路径/字幕.clean.srt'` | 新 `.srt` |
 | 同一部长片要反复精修 | `project init` → `project status` → `project run` | `project.video-txt.json` |
@@ -154,10 +154,13 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
    - 换纯净参考的收益，同一条命令前后对比实测：语速 7.3→8.0 字/秒，需压缩改写的句子 20→9，
      最紧一句 2.63×→1.65×，超出槽位 1 句→0，时间轴漂移 0.4→0.0 秒。
 
-## 双语字幕
+## 双语字幕：只在用户明确要求时才做
 
-用户说"原文也要显示""中英对照""学英语用"——加 `--bilingual`，**不要自己写脚本把两个 `.srt`
-拼起来**：
+**默认单语，不要顺手加。** 用户说"加中文字幕""翻译成中文"，要的就是中文字幕——双语每块两行、
+信息密度翻倍，正常观看时是干扰而不是加分。只有用户明说**"原文也要显示""中英对照""双语字幕"
+"学英语用""校对要看原文"**这类要求时才加 `--bilingual`。拿不准就按单语做完，再问一句要不要原文。
+
+要做的时候**不要自己写脚本把两个 `.srt` 拼起来**：
 
 ```bash
 video-txt run "$V" --bilingual                    # 软字幕成片
@@ -165,9 +168,12 @@ video-txt run "$V" --bilingual --mux-mode hard    # 烧进画面
 video-txt bilingual '原文.srt' '译文.zh.srt'      # 只要文件
 ```
 
-默认译文在上、原文在下（`--order source-first` 反过来）。**烧硬字幕时原文自动小一号 + 半透明**，
-不用另外调参数。合并要求两份字幕块数/序号/时间轴逐条一致，对不上会直接报错——正常流程出来的
-文件天然满足，手改过就先跑 `audit-translation`。
+默认译文在上、原文在下（`--order source-first` 反过来）。**合并后每块恒定两行**：一行译文、
+一行原文，各自语言原有的换行会被压平（原文两行加译文两行会摞成四行，吃掉画面下半部分）。
+个别很长的行渲染时仍会被播放器自动折到第三行，这跟单语字幕一样，交给渲染器。
+
+**烧硬字幕时原文自动小一号 + 半透明**，不用另外调参数。合并要求两份字幕块数/序号/时间轴逐条
+一致，对不上会直接报错——正常流程出来的文件天然满足，手改过就先跑 `audit-translation`。
 
 校对译文时这个特别好用：原文译文并排，一眼能看出哪句译错了，挑出来写进校订文件。
 
