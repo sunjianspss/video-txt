@@ -9,6 +9,12 @@ CLI 入口是 `video-txt`，实现位于 `video_txt/cli.py`。
 - 不要绕过项目 CLI 自行拼接 FFmpeg、Whisper 或翻译命令。
 - 按 `$video-txt` Skill 判断源语言、字幕封装方式、翻译提供商、已有字幕复用和长任务执行方式。
 
+## 翻译整季前
+
+- 先用 `video-txt draft-terms <全季 .srt> -o 术语表.json` 起草术语表，填完每条 `target` 再开翻。
+- 换季复用上一季术语表时加 `--against 旧表.json`：只列新名字，并对与旧词条共用同一个词的新名字告警。
+- 不要手工通读字幕找专有名词，也不要跳过术语表直接逐集翻译。
+
 ## 修改已有译文
 
 - 用户指出某几句译得不对时，写入锚定原文台词的校订文件，再用 `video-txt revise --revisions` 套用。

@@ -10,5 +10,7 @@
   **不要直接编辑 `.srt`，也不要写按字幕编号写死的一次性脚本**——译文是生成物，
   重翻就没了；编号会被上游的 `clean` / `retranscribe-range` 平移，改到别人的台词上。
   格式与规则见 `video-txt` skill 的「改译文」一节。
+- 要翻整季/系列片时：先 `video-txt draft-terms <全季 .srt> -o 术语表.json` 起草术语表、
+  填完 `target` 再开翻。换季复用旧表加 `--against 旧表.json`。
 - 改代码后按 `.claude/skills/verify/SKILL.md` 真跑一遍，不要只跑单测。
 - 用法细节在 [README.md](README.md)，技术取舍的实测数据在 [NOTES.md](NOTES.md)。

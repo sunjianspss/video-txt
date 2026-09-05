@@ -33,6 +33,7 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 | 字幕跨行过长、一次铺满屏 | 加 `--refine-subtitles`（不能和 `--subtitle` 同用） | — |
 | 只有几句听错 | `retranscribe-range "$V" --subtitle "$S" --from 00:19:30 --to 00:20:10` | `字幕.repaired.srt` |
 | 只有几句**译**得不对（听对了、译错了） | 写 `revisions.json`，再 `revise '原文.srt' '译文.zh.srt' --revisions r.json` | `译文.zh.revised.srt` |
+| 开翻整季前先建术语表 | `draft-terms "$D"/*.srt -o 剧名.terms.json` | `target` 待填的草稿 |
 | 先检查字幕质量 | `audit "$S" --media "$V" --language en` | `字幕.audit.json` |
 | 安全清理坏字幕块 | `clean "$S" -o '/绝对路径/字幕.clean.srt'` | 新 `.srt` |
 | 同一部长片要反复精修 | `project init` → `project status` → `project run` | `project.video-txt.json` |
@@ -77,16 +78,24 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 5. **是剧集/系列片、要翻不止一集吗**——是就**先写术语表，再开翻**。逐集独立翻译时模型没有跨集记忆，
    人名各集不一，同一集里也会混用（实测 Barry S01 无术语表：E04 出现「巴里」18 次、`Barry` 10 次；
    E03「莎莉」2 次、`Sally` 11 次）。
-   开翻前先扫一遍原文字幕，把反复出现的人名、地名、机构名、称呼列成一份 JSON 术语表，全季共用一份，
-   每集都带同一个 `--term-file`（格式见 README「项目术语表与翻译审计」）：
+   开翻前要有一份全季共用的术语表，每集都带同一个 `--term-file`。**这一步不用手读，`draft-terms` 会扫**——
+   它按「句中大写、几乎不写小写」认专有名词，把全季候选按出现次数排出来，`target` 一律留空等你填：
    ```bash
-   T='/绝对路径/剧名.terms.json'   # {"schema":"video-txt.terminology","version":1,"terms":[
-                                   #   {"source":"Barry","target":"巴里","match":"word"},
-                                   #   {"source":"NoHo Hank","target":"诺霍·汉克","match":"phrase"}]}
+   T='/绝对路径/剧名.terms.json'
+   uv run --python 3.12 video-txt draft-terms "$D"/*.srt -o "$T" --source-language en
+   # 填完每条 target，删掉不值得立目的。target 为空时 load_terminology 会直接报错，草稿不会被误用
    for f in "$D"/*.mkv; do
      uv run --python 3.12 video-txt translate "${f%.*}.srt" --provider lmstudio --term-file "$T"
    done
    ```
+   每条候选带 `count` 和两条 `examples`，够直接判断该译成什么、值不值得立目。
+   **同名异写它会自己发现**并互相填进 `aliases`——实测 Toy Story 5 的字幕把同一角色拼成 `Jesse`(31 次)
+   和 `Jessie`(26 次) 两种，人工表只有后者。
+   **草稿是起点不是终点。** 实测 Barry S02 全季（4717 条字幕、8 集，`--min-count 8`）扫出 30 个候选，
+   命中人工表 26/44，噪声 3 个；Toy Story 5（1683 条，`--min-count 3`）扫出 28 个，命中 7/11。
+   **漏的全是低频名字**——Toy Story 漏的 4 条全片只出现 1–2 次（Monty 只说过一次），频率扫描
+   找不到也不该编。反过来它扫出了人工表漏掉的真名字（Forky、Dolly、Zerg、Cleveland）。
+   所以扫完仍要过一遍片里台词少但重要的配角。整季用 `--min-count 8` 左右，单片用默认 3。
    单词人名用 `match: "word"`（`Barry` 不会误中 `Barrymore`），多词名用 `"phrase"`；已经流传的错译放
    `aliases`，审计会按 error 拦下来。
    术语表在**每个批次**的 prompt 里都要重复一遍，而 `--provider lmstudio` 的 `--batch-chars` 默认只有
@@ -99,6 +108,13 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
    全译成了「瑞恩·麦迪逊」——张冠李戴，4 处，而且两个名字在 S02 原文里**都真的出现**，删掉旧词条也不对，
    必须给新名字**单独立目**（`Aaron Ryan`→亚伦·瑞恩）。所以复用的正确做法是：抽完新季原文后，
    拿旧术语表的词过滤一遍高频专有名词，把**未覆盖的新名字补成新词条**，旧映射一字不改（跨季才一致）。
+   这一步交给 `--against`：旧表已覆盖的名字自动略去，只列新名字，并对**和旧词条共用一个词**的新名字
+   直接打警告——`Aaron Ryan` 撞 `Ryan Madison` 正是这条规则要抓的：
+   ```bash
+   uv run --python 3.12 video-txt draft-terms "$D2"/*.srt -o /tmp/s02.new.json \
+     --against '/绝对路径/剧名.terms.json'
+   ```
+   把填好的新词条并进旧表，**旧映射一个字都不要动**。
    这类错误审计能抓（`glossary_target_missing` 是 error，命令返回非零），**别看到非零就当误报放过**——
    实测 S02 三集报错，两条是真错（`Aaron Ryan` 张冠李戴、`Sasha` 被译成「莎莉」串成了另一个角色），
    一条是异写（Esther 写成「埃斯特」）。

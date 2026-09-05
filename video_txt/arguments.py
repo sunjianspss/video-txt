@@ -19,6 +19,7 @@ from .diarize import (
 from .diarize import (
     DEFAULT_TOKEN_ENV,
 )
+from .draft import DEFAULT_MAX_TERMS, DEFAULT_MIN_COUNT
 from .dub import ENGINES
 from .env import DEFAULT_SECRETS_FILE
 from .mux import HARD_LAYOUTS
@@ -635,6 +636,52 @@ def build_audit_command(parser: argparse.ArgumentParser) -> None:
         "--overwrite",
         action="store_true",
         help="Overwrite an existing JSON report.",
+    )
+
+
+def build_draft_terms_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "subtitles",
+        type=Path,
+        nargs="+",
+        help="Source-language .srt files to scan. Pass a whole season at once.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="Draft terminology JSON to write. Every 'target' comes back blank.",
+    )
+    parser.add_argument(
+        "--against",
+        type=Path,
+        metavar="TERMS_JSON",
+        help=(
+            "Glossary already in use. Names it covers are left out, and a new name that "
+            "shares a word with one of its entries is flagged as at risk of being pulled in."
+        ),
+    )
+    parser.add_argument(
+        "--min-count",
+        type=int,
+        default=DEFAULT_MIN_COUNT,
+        help=f"How often a name must appear to be proposed. Defaults to {DEFAULT_MIN_COUNT}.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_MAX_TERMS,
+        help=f"Most candidates to propose. Defaults to {DEFAULT_MAX_TERMS}.",
+    )
+    parser.add_argument("--source-language", help="Written into the draft, for example en.")
+    parser.add_argument(
+        "--target-language",
+        default=DEFAULT_TARGET_LANGUAGE,
+        help=f"Written into the draft. Defaults to {DEFAULT_TARGET_LANGUAGE}.",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing draft file."
     )
 
 

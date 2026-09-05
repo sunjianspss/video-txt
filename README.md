@@ -262,6 +262,48 @@ uv run --python 3.12 video-txt dub "$V" --provider lmstudio --language en --audi
 如果流水线已经有同名原文字幕,它仍会保护并复用旧文件;要按新音轨重转,同时加 `--retranscribe`。
 不确定选择结果时先加 `--dry-run`,它只显示音轨、提取命令和 Whisper 命令。
 
+## 术语表起草(v0.8)
+
+术语表要在开翻前写好，但读一整季字幕找专有名词是没人愿意开始的活。`draft-terms` 把这步机械化：
+
+```bash
+uv run --python 3.12 video-txt draft-terms '/绝对路径/剧集目录'/*.srt \
+  -o '/绝对路径/剧名.terms.json' --source-language en
+```
+
+判断专有名词不靠停用词表，靠字幕自己的写法：**一个名字会出现在句子中间且仍然大写，而且几乎不会
+被写成小写**；`Well` / `But` 只在句首大写，`hope` 满篇都是小写。英语无条件大写的那几个词
+（`I`、`OK`）单列一份名单排除。
+
+产物就是一份 terminology 文件，只是每条 `target` **留空**：
+
+```json
+{
+  "source": "Jesse", "target": "", "match": "word", "count": 31,
+  "examples": ["This way, you'll never lose me, Jesse.", "Hello, Jesse, hello."],
+  "aliases": ["Jessie"],
+  "draft_warning": "The subtitles also spell this Jessie. ..."
+}
+```
+
+`target` 为空时 `load_terminology` 直接报错，所以**没填完的草稿不会被误当成术语表用**。填完
+`target`、删掉不值得立目的条目，就是可用的 `--term-file`；`count` 和 `examples` 是多余字段，
+加载时忽略，留着当依据也无妨。
+
+相差一个字母的两个拼写会被认成同一个名字的异写，互相写进 `aliases`——实测某部片的字幕把同一角色
+拼成 `Jesse`(31 次) 和 `Jessie`(26 次)。
+
+**换季复用旧表**用 `--against`：旧表已覆盖的名字自动略去，只列新名字，并对和旧词条**共用一个词**的
+新名字打警告（这正是 `Aaron Ryan` 被旧词条 `Ryan Madison` 吸附那类错误的来源）：
+
+```bash
+uv run --python 3.12 video-txt draft-terms '/新一季目录'/*.srt -o /tmp/new.json \
+  --against '/绝对路径/剧名.terms.json'
+```
+
+`--min-count`（默认 3）控制一个名字要出现几次才提案，`--limit`（默认 60）封顶。
+**它找不到只说过一两次的名字**，那不是漏，是频率扫描的边界——扫完仍要过一遍片里台词少但重要的角色。
+
 ## 项目术语表与翻译审计(v0.5)
 
 电影人名、产品名和行业术语不要靠每一批模型临场决定。为项目建立一份 JSON 术语表:

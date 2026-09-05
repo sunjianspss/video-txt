@@ -14,6 +14,7 @@ from . import __version__
 from .arguments import (
     build_audit_command,
     build_clean_command,
+    build_draft_terms_command,
     build_dub_command,
     build_mux_command,
     build_project_command,
@@ -39,6 +40,7 @@ from .diarize import (
     SpeakerTurn,
     ensure_speakers,
 )
+from .draft import draft_terminology, draft_to_dict
 from .dub import DubError, DubOptions, default_dubbed_output, run_dub
 from .env import CredentialError, resolve_api_key, resolve_optional_key
 from .fit import FitOptions
@@ -825,6 +827,64 @@ def command_translation_audit(args: argparse.Namespace, parser: argparse.Argumen
     return 0 if report.is_clean else 1
 
 
+def command_draft_terms(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    subtitles = [
+        existing_file(parser, path, "Subtitle file") for path in args.subtitles
+    ]
+    for path in subtitles:
+        if path.suffix.lower() != ".srt":
+            parser.error(f"Expected an .srt file, got: {path.name}")
+    if args.min_count < 1:
+        parser.error("--min-count must be 1 or greater")
+    if args.limit < 1:
+        parser.error("--limit must be 1 or greater")
+
+    existing_terms = None
+    against = None
+    if args.against:
+        against = existing_file(parser, args.against, "Terminology file")
+        existing_terms = load_terminology(against)
+
+    output = resolved(args.output)
+    assert output is not None
+    if output in {*subtitles, against}:
+        parser.error("--output must be a new path; the draft never replaces an input file.")
+    if output.exists() and not args.overwrite:
+        parser.error(f"Draft already exists: {output}. Pass --overwrite to replace it.")
+
+    cues = [cue for path in subtitles for cue in parse_srt(path)]
+    draft = draft_terminology(
+        cues,
+        existing=existing_terms,
+        min_count=args.min_count,
+        max_terms=args.limit,
+    )
+    write_json(
+        output,
+        draft_to_dict(
+            draft,
+            source_language=args.source_language,
+            target_language=args.target_language,
+        ),
+    )
+
+    print(
+        f"Scanned {draft.scanned_cues} cues in {len(subtitles)} subtitle file(s); "
+        f"proposing {len(draft.candidates)} name(s)."
+    )
+    if draft.already_covered:
+        print(f"Already in {against}: {len(draft.already_covered)} name(s), left out.")
+    for candidate in draft.candidates:
+        if candidate.warning:
+            print(f"  {candidate.source}: {candidate.warning}", file=sys.stderr)
+    print(f"Draft: {output}")
+    print(
+        "Every 'target' is blank, so the file will not load as a glossary until they are "
+        "filled in. Delete the names that are not worth an entry, then pass it as --term-file."
+    )
+    return 0
+
+
 def command_clean(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     subtitle = existing_file(parser, args.input, "Subtitle file")
     if subtitle.suffix.lower() != ".srt":
@@ -1319,6 +1379,12 @@ COMMANDS = (
         "Compare source and translated subtitles for structure and terminology defects.",
         build_translation_audit_command,
         command_translation_audit,
+    ),
+    Command(
+        "draft-terms",
+        "Propose a project glossary from the names a source subtitle keeps using.",
+        build_draft_terms_command,
+        command_draft_terms,
     ),
     Command(
         "clean",
