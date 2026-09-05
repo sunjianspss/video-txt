@@ -35,6 +35,7 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 | 只有几句**译**得不对（听对了、译错了） | 写 `revisions.json`，再 `revise '原文.srt' '译文.zh.srt' --revisions r.json` | `译文.zh.revised.srt` |
 | 开翻整季前先建术语表 | `draft-terms "$D"/*.srt -o 剧名.terms.json` | `target` 待填的草稿 |
 | 原文译文对照（**仅用户明说要双语时**） | 加 `--bilingual`，或 `bilingual '原文.srt' '译文.zh.srt'` | `译文.zh.bilingual.srt` |
+| 要片子的配乐/背景音乐 | `music "$V"`，只要干净段加 `--clean` | `视频.music/` 下若干 .flac |
 | 先检查字幕质量 | `audit "$S" --media "$V" --language en` | `字幕.audit.json` |
 | 安全清理坏字幕块 | `clean "$S" -o '/绝对路径/字幕.clean.srt'` | 新 `.srt` |
 | 同一部长片要反复精修 | `project init` → `project status` → `project run` | `project.video-txt.json` |
@@ -153,6 +154,37 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
      `<视频>.dub-cache/bgm/vocals.flac` 这条干声里切，参考里不会带配乐。
    - 换纯净参考的收益，同一条命令前后对比实测：语速 7.3→8.0 字/秒，需压缩改写的句子 20→9，
      最紧一句 2.63×→1.65×，超出槽位 1 句→0，时间轴漂移 0.4→0.0 秒。
+
+## 提配乐 / 背景音乐
+
+用户说"把这片子的配乐提出来""要背景音乐""这段音乐单独存一下"——走 `video-txt music`，
+**不要自己拼 demucs 或 ffmpeg**：
+
+```bash
+uv run --python 3.12 video-txt music '/绝对路径/电影.mkv'            # 找出所有音乐段
+uv run --python 3.12 video-txt music "$V" --clean --min-duration 15  # 只要没人说话的干净段
+uv run --python 3.12 video-txt music "$V" --stems                    # 顺带导出全部分轨
+```
+
+产物是若干归一化的 `.flac` 加一份 `.music.json`，每段带 `voice_share`（多少比例被人声盖着）。
+**要拿去用在别的视频里就加 `--clean`**：分离器在对白最响的地方瑕疵最多，只有没人说话的段落
+听起来才不露馅。
+
+**慢，第一次要跑分离**（几分钟）。但缓存和配音共用——片子如果跑过 `--separate-bgm` 就是秒出。
+`run_in_background` 跑，别卡住会话。
+
+### 它不判断有没有人在唱
+
+分离器听到的只是"人声"，**唱和说一律进同一条轨**。用"人声占比高"猜歌曲实测会把一段 71 秒的对话
+判成歌，所以工具不会仅凭音频给任何一段贴"歌曲"标签。用户要切某首插曲时只有两条路：
+
+1. **自己给范围**：`--from 00:31:07 --to 00:34:20 --source mix`（歌要从原始混音切，
+   没有唱的歌不是歌）
+2. **指一份人工字幕**：`--subtitle` 会读里面 `♪` 标记的唱词来定位。**只有官方字幕轨有这个标记**
+   ——实测 Barry S02E01 有 17 个 ♪ 块连成一首完整插曲，而 Whisper 转写稿 1683 块里一个都没有。
+
+所以用户要提插曲时，**先按第 0 条探一下有没有官方字幕轨**；没有就问他歌大概在第几分钟，
+用 `--from/--to`。别假装能自动找出来。
 
 ## 双语字幕：只在用户明确要求时才做
 

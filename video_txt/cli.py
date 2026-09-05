@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
@@ -17,6 +18,7 @@ from .arguments import (
     build_clean_command,
     build_draft_terms_command,
     build_dub_command,
+    build_music_command,
     build_mux_command,
     build_project_command,
     build_retranscribe_range_command,
@@ -51,7 +53,22 @@ from .draft import draft_terminology, draft_to_dict
 from .dub import DubError, DubOptions, default_dubbed_output, run_dub
 from .env import CredentialError, resolve_api_key, resolve_optional_key
 from .fit import FitOptions
-from .media import MediaError, parse_video_size, probe_audio_streams, select_audio_stream
+from .media import (
+    MediaError,
+    find_ffmpeg,
+    parse_video_size,
+    probe_audio_streams,
+    select_audio_stream,
+)
+from .music import (
+    MusicError,
+    MusicPiece,
+    extract_command,
+    find_music,
+    loudness_envelope,
+    piece_filename,
+    sung_spans,
+)
 from .mux import MuxError, MuxOptions, default_video_output, run_mux
 from .pipeline import (
     TranscribeStage,
@@ -87,7 +104,13 @@ from .revise import (
     revised_subtitle_path,
     revision_report_path_for,
 )
-from .separate import SeparateError
+from .separate import (
+    SeparateError,
+    ensure_instrumental,
+    ensure_stems,
+    separated_bgm_path,
+    separated_voice_path,
+)
 from .subtitles import (
     SubtitleFormatError,
     language_code,
@@ -836,6 +859,132 @@ def command_translation_audit(args: argparse.Namespace, parser: argparse.Argumen
     return 0 if report.is_clean else 1
 
 
+def default_music_dir(media: Path) -> Path:
+    return media.with_name(f"{media.stem}.music")
+
+
+def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    media = existing_file(parser, args.media, "Media file")
+    output_dir = resolved(args.output_dir) or default_music_dir(media)
+    cache_dir = resolved(args.cache_dir) or media.with_name(f"{media.stem}.dub-cache")
+    if args.min_duration <= 0:
+        parser.error("--min-duration must be greater than 0")
+    named = args.from_time is not None or args.to_time is not None
+    if named and (args.from_time is None or args.to_time is None):
+        parser.error("--from and --to must be passed together.")
+    ffmpeg_path = find_ffmpeg(explicit=None)
+
+    print(f"Media: {media}")
+    print(f"Separated audio cache: {cache_dir}")
+    print(f"Music: {output_dir}")
+    if args.dry_run and not cache_dir.is_dir():
+        print("Would separate the soundtrack, then search it for music (dry run).")
+        return 0
+
+    # The dub's own cache, reused: a film already separated for --separate-bgm
+    # costs nothing here.
+    instrumental = ensure_instrumental(media, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path)
+    voice = separated_voice_path(cache_dir)
+    if not voice.is_file():
+        raise MusicError(
+            f"The separated voice track is missing: {voice}. It is what says which "
+            f"stretches nobody talks over. Delete {separated_bgm_path(cache_dir).parent} "
+            "and run again to rebuild both."
+        )
+
+    if named:
+        pieces = [
+            MusicPiece(
+                start=parse_timecode(args.from_time),
+                end=parse_timecode(args.to_time),
+                voice_share=0.0,
+                peak_lufs=0.0,
+                labelled="named",
+            )
+        ]
+        sources = {0: media if args.source == "mix" else instrumental}
+    else:
+        print("Measuring the soundtrack...")
+        pieces = find_music(
+            loudness_envelope(instrumental, ffmpeg_path=ffmpeg_path),
+            loudness_envelope(voice, ffmpeg_path=ffmpeg_path),
+            music_floor=args.music_floor,
+            voice_floor=args.voice_floor,
+            min_duration=args.min_duration,
+            clean_only=args.clean,
+        )
+        sources = dict.fromkeys(range(len(pieces)), instrumental)
+        if args.subtitle:
+            songs = sung_spans(parse_srt(existing_file(parser, args.subtitle, "Subtitle file")))
+            print(f"Songs marked in the subtitle: {len(songs)}")
+            # A song is cut from the soundtrack itself: without its singing it is
+            # not the song, and the singing is the half separation takes out.
+            for song in songs:
+                sources[len(pieces)] = media
+                pieces.append(song)
+
+    stems: dict[str, Path] = {}
+    if args.stems and not args.dry_run:
+        stems = ensure_stems(
+            media, model=args.model, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
+        )
+
+    print(f"Pieces found: {len(pieces)}")
+    for number, piece in enumerate(pieces, start=1):
+        print(
+            f"  {number:02d}  {piece.kind:15s} {piece.clock_range} "
+            f"({piece.duration:6.1f}s, voice {piece.voice_share:.0%})"
+        )
+    if args.dry_run:
+        print(f"Would write {len(pieces)} file(s) to: {output_dir}")
+        return 0
+    if not pieces:
+        print("Nothing long enough to write out. Lower --min-duration to widen the search.")
+        return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written: list[dict[str, object]] = []
+    for number, piece in enumerate(pieces, start=1):
+        target = output_dir / piece_filename(media, number, piece)
+        if target.exists() and not args.overwrite:
+            parser.error(f"Music file already exists: {target}. Pass --overwrite to replace it.")
+        completed = subprocess.run(
+            extract_command(
+                sources.get(number - 1, instrumental),
+                piece,
+                output=target,
+                ffmpeg_path=ffmpeg_path,
+                normalize=not args.raw_levels,
+            ),
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0 or not target.is_file():
+            raise MusicError(f"Could not cut {target.name}: {(completed.stderr or '').strip()}")
+        written.append({**piece.to_dict(), "file": target.name})
+
+    report = output_dir / f"{media.stem}.music.json"
+    write_json(
+        report,
+        {
+            "schema": "video-txt.music",
+            "version": 1,
+            "media": str(media),
+            "instrumental": str(instrumental),
+            "stems": {name: str(path) for name, path in stems.items()},
+            "normalized": not args.raw_levels,
+            "piece_count": len(written),
+            "pieces": written,
+        },
+    )
+    print(f"Wrote {len(written)} music file(s) to: {output_dir}")
+    print(f"Whole-film instrumental: {instrumental}")
+    if stems:
+        print(f"Stems: {', '.join(sorted(stems))} in {next(iter(stems.values())).parent}")
+    print(f"Report: {report}")
+    return 0
+
+
 def command_bilingual(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     source = existing_file(parser, args.source, "Source subtitle")
     translation = existing_file(parser, args.translation, "Translated subtitle")
@@ -1419,6 +1568,12 @@ COMMANDS = (
         command_translation_audit,
     ),
     Command(
+        "music",
+        "Separate a soundtrack and cut the music out of it as playable files.",
+        build_music_command,
+        command_music,
+    ),
+    Command(
         "bilingual",
         "Merge a source and a translated .srt into one subtitle carrying both.",
         build_bilingual_command,
@@ -1506,6 +1661,7 @@ def main(argv: list[str] | None = None) -> int:
         DiarizeError,
         DubError,
         MediaError,
+        MusicError,
         MuxError,
         ProjectError,
         RetranscribeError,

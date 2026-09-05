@@ -23,7 +23,13 @@ from .diarize import (
 from .draft import DEFAULT_MAX_TERMS, DEFAULT_MIN_COUNT
 from .dub import ENGINES
 from .env import DEFAULT_SECRETS_FILE
+from .music import (
+    MIN_PIECE_SECONDS,
+    MUSIC_FLOOR_LUFS,
+    VOICE_FLOOR_LUFS,
+)
 from .mux import HARD_LAYOUTS
+from .separate import DEFAULT_STEM_MODEL, STEM_MODELS
 from .timeline import VOICE_UNITS
 from .transcribe import BACKENDS, OUTPUT_FORMATS
 from .voices import DEFAULT_VOICE
@@ -655,6 +661,86 @@ def add_bilingual_arguments(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_ORDER,
         help=f"Which language reads first. Defaults to {DEFAULT_ORDER}.",
     )
+
+
+def build_music_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("media", type=Path, help="Video or audio file to take the music from.")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        help="Where the music files go. Defaults to '<media>.music' beside the media.",
+    )
+    parser.add_argument(
+        "--subtitle",
+        type=Path,
+        help=(
+            "Source subtitle. Lines marked with a musical note name the songs, which the "
+            "audio alone cannot tell from dialogue. Optional."
+        ),
+    )
+    parser.add_argument("--from", dest="from_time", help="Extract one range instead of searching.")
+    parser.add_argument("--to", dest="to_time", help="End of that range, as HH:MM:SS.")
+    parser.add_argument(
+        "--source",
+        choices=("instrumental", "mix"),
+        default="instrumental",
+        help=(
+            "What a named range is cut from. instrumental has the dialogue removed; "
+            "mix is the soundtrack as it is, which is what a song needs."
+        ),
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help=(
+            "Keep only the stretches nobody talks over. Separation leaves its worst "
+            "artefacts where the dialogue was loudest."
+        ),
+    )
+    parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=MIN_PIECE_SECONDS,
+        help=f"Shortest piece worth writing out. Defaults to {MIN_PIECE_SECONDS:g} seconds.",
+    )
+    parser.add_argument(
+        "--music-floor",
+        type=float,
+        default=MUSIC_FLOOR_LUFS,
+        help=f"Loudness above which music counts as playing. Defaults to {MUSIC_FLOOR_LUFS:g}.",
+    )
+    parser.add_argument(
+        "--voice-floor",
+        type=float,
+        default=VOICE_FLOOR_LUFS,
+        help=f"Loudness above which a voice counts as audible. Defaults to {VOICE_FLOOR_LUFS:g}.",
+    )
+    parser.add_argument(
+        "--stems",
+        action="store_true",
+        help="Also separate and keep every stem the model produces.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=sorted(STEM_MODELS),
+        default=DEFAULT_STEM_MODEL,
+        help=f"Separation model used by --stems. Defaults to {DEFAULT_STEM_MODEL}.",
+    )
+    parser.add_argument(
+        "--raw-levels",
+        action="store_true",
+        help="Keep each piece at its original level instead of normalizing it for playback.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="Where the separated audio is cached. Defaults to '<media>.dub-cache'.",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace music files already written."
+    )
+    add_dry_run(parser, "Report the pieces that were found without writing any audio.")
 
 
 def build_bilingual_command(parser: argparse.ArgumentParser) -> None:
