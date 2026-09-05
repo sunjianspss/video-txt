@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .bilingual import DEFAULT_ORDER, ORDERS
 from .constants import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_BATCH_CHARS,
@@ -639,6 +640,43 @@ def build_audit_command(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_bilingual_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--bilingual",
+        action="store_true",
+        help=(
+            "Keep the original under the translation. Burned in, the original is "
+            "smaller and dimmer than the line above it."
+        ),
+    )
+    parser.add_argument(
+        "--bilingual-order",
+        choices=ORDERS,
+        default=DEFAULT_ORDER,
+        help=f"Which language reads first. Defaults to {DEFAULT_ORDER}.",
+    )
+
+
+def build_bilingual_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("source", type=Path, help="Path to the source-language .srt file.")
+    parser.add_argument("translation", type=Path, help="Path to the translated .srt file.")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Bilingual .srt path. Defaults to '<translation>.bilingual.srt'.",
+    )
+    parser.add_argument(
+        "--order",
+        choices=ORDERS,
+        default=DEFAULT_ORDER,
+        help=f"Which language reads first. Defaults to {DEFAULT_ORDER}.",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing bilingual subtitle."
+    )
+
+
 def build_draft_terms_command(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "subtitles",
@@ -797,6 +835,7 @@ def build_mux_command(parser: argparse.ArgumentParser) -> None:
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
     add_mux_arguments(parser)
     add_revision_argument(parser)
+    add_bilingual_arguments(parser)
     add_dry_run(parser, "Print the translation plan and ffmpeg command without running them.")
 
 
@@ -808,6 +847,7 @@ def build_run_command(parser: argparse.ArgumentParser) -> None:
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
     add_mux_arguments(parser)
     add_revision_argument(parser)
+    add_bilingual_arguments(parser)
     add_dry_run(
         parser, "Print every stage's plan without transcribing, calling the API or running ffmpeg."
     )

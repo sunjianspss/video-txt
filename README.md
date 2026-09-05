@@ -448,6 +448,38 @@ mux: stale — upstream revise is stale
 锚点时间漂移超过 5 秒会打印提醒但不阻断:重新识别本来就会让台词挪动一两秒,漂移到几分钟才值得
 怀疑是匹配错了行。
 
+## 双语字幕(v0.8)
+
+原文和译文一起上屏。学语言的人两行都读，校对译文的人不看原文根本没法判断一句译得对不对——
+而这两件事都不该靠开两个文件来回滚动。
+
+```bash
+uv run --python 3.12 video-txt bilingual source.srt source.zh.srt
+# → source.zh.bilingual.srt，默认译文在上、原文在下
+```
+
+`--order source-first` 把原文放上面。两份字幕都只读，输出必须是新路径。
+
+流水线里加 `--bilingual`，翻译（以及校订）之后自动合并，合并结果就是被封装/烧录的那一份：
+
+```bash
+uv run --python 3.12 video-txt run "$V" --bilingual                     # 软字幕
+uv run --python 3.12 video-txt run "$V" --bilingual --mux-mode hard     # 硬字幕
+uv run --python 3.12 video-txt mux "$V" source.srt --bilingual
+```
+
+**烧硬字幕时原文会自动压小压淡**——字号 0.72 倍、半透明，读起来是第二行而不是和译文抢注意力。
+软字幕交给播放器，两行等大。
+
+两份字幕必须是同一份字幕：块数、序号、时间轴逐条一致，对不上直接报错而不是猜。
+这正是 `translate` 保证、`audit-translation` 检查的东西，所以正常流程出来的文件天然满足。
+
+**每种语言各压成一行。** 原文两行加译文两行会摞成四行、吃掉半个画面；那两个换行是各自语言
+对行宽的决定，并排放到一起就不成立了。
+
+一个提醒：双语字幕每块两行、行也更宽，拿 `video-txt audit` 去查会报 `too_many_lines` 和
+`line_too_wide`。那是对的——双语字幕本来就比单语密。要审计就审合并之前的那一份。
+
 ## .mkv 电影:只做外挂字幕
 
 4K 电影动辄十几 GB,烧硬字幕要把整部片子重新编码,画质有损还要等一个多小时。外挂字幕零成本:

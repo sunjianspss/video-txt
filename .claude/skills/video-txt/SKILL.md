@@ -34,6 +34,7 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 | 只有几句听错 | `retranscribe-range "$V" --subtitle "$S" --from 00:19:30 --to 00:20:10` | `字幕.repaired.srt` |
 | 只有几句**译**得不对（听对了、译错了） | 写 `revisions.json`，再 `revise '原文.srt' '译文.zh.srt' --revisions r.json` | `译文.zh.revised.srt` |
 | 开翻整季前先建术语表 | `draft-terms "$D"/*.srt -o 剧名.terms.json` | `target` 待填的草稿 |
+| 要原文译文对照（学语言、校对） | 加 `--bilingual`，或 `bilingual '原文.srt' '译文.zh.srt'` | `译文.zh.bilingual.srt` |
 | 先检查字幕质量 | `audit "$S" --media "$V" --language en` | `字幕.audit.json` |
 | 安全清理坏字幕块 | `clean "$S" -o '/绝对路径/字幕.clean.srt'` | 新 `.srt` |
 | 同一部长片要反复精修 | `project init` → `project status` → `project run` | `project.video-txt.json` |
@@ -152,6 +153,26 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
      `<视频>.dub-cache/bgm/vocals.flac` 这条干声里切，参考里不会带配乐。
    - 换纯净参考的收益，同一条命令前后对比实测：语速 7.3→8.0 字/秒，需压缩改写的句子 20→9，
      最紧一句 2.63×→1.65×，超出槽位 1 句→0，时间轴漂移 0.4→0.0 秒。
+
+## 双语字幕
+
+用户说"原文也要显示""中英对照""学英语用"——加 `--bilingual`，**不要自己写脚本把两个 `.srt`
+拼起来**：
+
+```bash
+video-txt run "$V" --bilingual                    # 软字幕成片
+video-txt run "$V" --bilingual --mux-mode hard    # 烧进画面
+video-txt bilingual '原文.srt' '译文.zh.srt'      # 只要文件
+```
+
+默认译文在上、原文在下（`--order source-first` 反过来）。**烧硬字幕时原文自动小一号 + 半透明**，
+不用另外调参数。合并要求两份字幕块数/序号/时间轴逐条一致，对不上会直接报错——正常流程出来的
+文件天然满足，手改过就先跑 `audit-translation`。
+
+校对译文时这个特别好用：原文译文并排，一眼能看出哪句译错了，挑出来写进校订文件。
+
+**别拿 `audit` 去查双语字幕**：每块两行、行也更宽，必然报 `too_many_lines` 和 `line_too_wide`。
+双语本来就比单语密，要审计就审合并之前那一份。
 
 ## 改译文：只改在校订文件里，绝不直接改 `.srt`
 

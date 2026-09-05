@@ -5,6 +5,12 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .bilingual import (
+    DEFAULT_ORDER,
+    bilingual_cues,
+    bilingual_subtitle_path,
+    merge_subtitles,
+)
 from .mux import MuxOptions, run_mux
 from .quality import check_transcript
 from .refine import RefineError, load_word_document, word_document_matches_subtitle
@@ -323,6 +329,37 @@ def ensure_revised_subtitle(
     return output
 
 
+def ensure_bilingual_subtitle(
+    source_subtitle: Path,
+    translated_subtitle: Path,
+    *,
+    bilingual: bool,
+    order: str,
+    dry_run: bool = False,
+    label: str | None = None,
+) -> Path:
+    """Put the original back under the translation, on one timeline.
+
+    Last of the subtitle stages, because it merges whatever the translation has
+    become -- fitted, revised -- with the source it was made from.
+    """
+    if not bilingual:
+        return translated_subtitle
+
+    prefix = stage_prefix(label)
+    output = bilingual_subtitle_path(translated_subtitle)
+    if dry_run or not (source_subtitle.is_file() and translated_subtitle.is_file()):
+        print(f"{prefix}Bilingual: would write {output} ({order})")
+        return output if not dry_run else translated_subtitle
+
+    merged = merge_subtitles(
+        parse_srt(source_subtitle), parse_srt(translated_subtitle), order=order
+    )
+    write_srt(output, bilingual_cues(merged))
+    print(f"{prefix}Bilingual: {len(merged)} cue(s) in both languages -> {output}")
+    return output
+
+
 def run_pipeline(
     *,
     video: Path,
@@ -332,6 +369,8 @@ def run_pipeline(
     translate_stage: TranslateStage,
     mux_options_for: Callable[[Path], MuxOptions],
     revisions: Path | None = None,
+    bilingual: bool = False,
+    bilingual_order: str = DEFAULT_ORDER,
     dry_run: bool = False,
 ) -> Path:
     source_subtitle = ensure_source_subtitle(
@@ -349,6 +388,13 @@ def run_pipeline(
         translated_subtitle,
         revisions=revisions,
         terminology=translate_stage.config.terminology,
+        dry_run=dry_run,
+    )
+    translated_subtitle = ensure_bilingual_subtitle(
+        source_subtitle,
+        translated_subtitle,
+        bilingual=bilingual,
+        order=bilingual_order,
         dry_run=dry_run,
     )
     options = mux_options_for(translated_subtitle)

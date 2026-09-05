@@ -13,6 +13,7 @@ from pathlib import Path
 from . import __version__
 from .arguments import (
     build_audit_command,
+    build_bilingual_command,
     build_clean_command,
     build_draft_terms_command,
     build_dub_command,
@@ -24,6 +25,12 @@ from .arguments import (
     build_transcribe_command,
     build_translate_command,
     build_translation_audit_command,
+)
+from .bilingual import (
+    BilingualError,
+    bilingual_cues,
+    bilingual_subtitle_path,
+    merge_subtitles,
 )
 from .clone import CLONE_ENGINES, CloneError, CloneOptions, is_rate, speed_from_rate
 from .constants import (
@@ -49,6 +56,7 @@ from .mux import MuxError, MuxOptions, default_video_output, run_mux
 from .pipeline import (
     TranscribeStage,
     TranslateStage,
+    ensure_bilingual_subtitle,
     ensure_revised_subtitle,
     ensure_source_subtitle,
     ensure_translated_subtitle,
@@ -375,6 +383,7 @@ def build_mux_options(
         crf=args.crf,
         preset=args.preset,
         video_size=parse_video_size(args.video_size) if args.video_size else None,
+        bilingual=args.bilingual,
         ffmpeg_path=args.ffmpeg_path,
     )
 
@@ -827,6 +836,26 @@ def command_translation_audit(args: argparse.Namespace, parser: argparse.Argumen
     return 0 if report.is_clean else 1
 
 
+def command_bilingual(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    source = existing_file(parser, args.source, "Source subtitle")
+    translation = existing_file(parser, args.translation, "Translated subtitle")
+    for label, path in (("Source", source), ("Translation", translation)):
+        if path.suffix.lower() != ".srt":
+            parser.error(f"{label} must be an .srt file, got: {path.name}")
+
+    output = resolved(args.output) or bilingual_subtitle_path(translation)
+    if output in {source, translation}:
+        parser.error("--output must be a new path; bilingual never overwrites an input file.")
+    if output.exists() and not args.overwrite:
+        parser.error(f"Output already exists: {output}. Pass --overwrite to replace it.")
+
+    merged = merge_subtitles(parse_srt(source), parse_srt(translation), order=args.order)
+    write_srt(output, bilingual_cues(merged))
+    print(f"Bilingual: {len(merged)} cue(s) in both languages ({args.order})")
+    print(f"Wrote: {output}")
+    return 0
+
+
 def command_draft_terms(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     subtitles = [
         existing_file(parser, path, "Subtitle file") for path in args.subtitles
@@ -1081,6 +1110,13 @@ def command_mux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         terminology=stage.config.terminology,
         dry_run=args.dry_run,
     )
+    translated = ensure_bilingual_subtitle(
+        subtitle,
+        translated,
+        bilingual=args.bilingual,
+        order=args.bilingual_order,
+        dry_run=args.dry_run,
+    )
     options = build_mux_options(args, video=video, subtitle=translated, video_output=video_output)
     output = run_mux(options, dry_run=args.dry_run)
     if not args.dry_run:
@@ -1113,6 +1149,8 @@ def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
             args, video=video, subtitle=translated, video_output=video_output
         ),
         revisions=resolved(args.revisions),
+        bilingual=args.bilingual,
+        bilingual_order=args.bilingual_order,
         dry_run=args.dry_run,
     )
     if not args.dry_run:
@@ -1381,6 +1419,12 @@ COMMANDS = (
         command_translation_audit,
     ),
     Command(
+        "bilingual",
+        "Merge a source and a translated .srt into one subtitle carrying both.",
+        build_bilingual_command,
+        command_bilingual,
+    ),
+    Command(
         "draft-terms",
         "Propose a project glossary from the names a source subtitle keeps using.",
         build_draft_terms_command,
@@ -1465,6 +1509,7 @@ def main(argv: list[str] | None = None) -> int:
         MuxError,
         ProjectError,
         RetranscribeError,
+        BilingualError,
         ReuseError,
         RevisionError,
         SeparateError,
