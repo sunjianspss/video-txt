@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,8 +9,10 @@ from .mux import MuxOptions, run_mux
 from .quality import check_transcript
 from .refine import RefineError, load_word_document, word_document_matches_subtitle
 from .reuse import PreviousTranslation
-from .subtitles import parse_srt, translated_subtitle_path
+from .revise import apply_revisions, load_revisions, revised_subtitle_path
+from .subtitles import parse_srt, translated_subtitle_path, write_srt
 from .terminology import (
+    Terminology,
     audit_translation,
     translation_audit_path_for,
     write_translation_audit_report,
@@ -233,6 +236,93 @@ def ensure_translated_subtitle(
     )
 
 
+def ensure_revised_subtitle(
+    source_subtitle: Path,
+    translated_subtitle: Path,
+    *,
+    revisions: Path | None,
+    terminology: Terminology | None = None,
+    dry_run: bool = False,
+    label: str | None = None,
+) -> Path:
+    """Put the hand-corrected lines back on top of a freshly translated subtitle.
+
+    The translation is regenerated on every run; the corrections are not. They
+    are reapplied here rather than edited into the translation, so that the file
+    a person maintains stays the one they wrote, and a retranslation costs them
+    nothing.
+
+    The revised subtitle is the one that gets muxed or spoken, so it is the one
+    worth auditing. `translate` already wrote a report about its own output; this
+    one describes what actually ships, with the hand-finalized lines marked as
+    signed off rather than counted against it.
+    """
+    if revisions is None:
+        return translated_subtitle
+
+    prefix = stage_prefix(label)
+    revision_set = load_revisions(revisions)
+    if not (source_subtitle.is_file() and translated_subtitle.is_file()):
+        # A dry run reaches here with nothing on disk yet: the anchors cannot be
+        # checked, but the file itself has already been read and validated.
+        print(
+            f"{prefix}Revise: would apply {len(revision_set.revisions)} "
+            f"hand-corrected line(s) from {revisions}"
+        )
+        return translated_subtitle
+
+    source_cues = parse_srt(source_subtitle)
+    result = apply_revisions(source_cues, parse_srt(translated_subtitle), revision_set)
+    for item in result.drifted:
+        print(
+            f"{prefix}Anchor moved: cue {item.cue_index} is now {item.drift:.1f}s from "
+            f"where {item.revision.source!r} used to be.",
+            file=sys.stderr,
+        )
+    output = revised_subtitle_path(translated_subtitle)
+    if dry_run:
+        print(
+            f"{prefix}Revise: would restore {result.changed_count} hand-corrected "
+            f"line(s) -> {output}"
+        )
+        return translated_subtitle
+
+    write_srt(output, result.cues)
+    already = len(result.already_current)
+    print(
+        f"{prefix}Revise: restored {result.changed_count} hand-corrected line(s)"
+        + (f", {already} already current" if already else "")
+        + f" -> {output}"
+    )
+
+    audit = audit_translation(
+        source_cues,
+        result.cues,
+        terminology,
+        revised={item.position for item in result.applied},
+    )
+    report_path = write_translation_audit_report(
+        source_path=source_subtitle,
+        translation_path=output,
+        terminology=terminology,
+        audit=audit,
+        overwrite=True,
+    )
+    accepted = audit.summary["accepted"]
+    print(
+        f"{prefix}Translation audit: {audit.summary['error']} errors, "
+        f"{audit.summary['warning']} warnings"
+        + (f", {accepted} accepted on revised lines" if accepted else "")
+        + f" -> {report_path}"
+    )
+    if audit.has_errors:
+        raise TranslationError(
+            f"The revised translation failed audit with {audit.summary['error']} error(s). "
+            f"Correct the line in {revisions}, fix the terminology, or review: {report_path}"
+        )
+    return output
+
+
 def run_pipeline(
     *,
     video: Path,
@@ -241,6 +331,7 @@ def run_pipeline(
     transcribe_stage: TranscribeStage,
     translate_stage: TranslateStage,
     mux_options_for: Callable[[Path], MuxOptions],
+    revisions: Path | None = None,
     dry_run: bool = False,
 ) -> Path:
     source_subtitle = ensure_source_subtitle(
@@ -252,6 +343,13 @@ def run_pipeline(
     )
     translated_subtitle = ensure_translated_subtitle(
         source_subtitle, stage=translate_stage, dry_run=dry_run
+    )
+    translated_subtitle = ensure_revised_subtitle(
+        source_subtitle,
+        translated_subtitle,
+        revisions=revisions,
+        terminology=translate_stage.config.terminology,
+        dry_run=dry_run,
     )
     options = mux_options_for(translated_subtitle)
     print(f"[3/3] Mux: {options.mux_mode} subtitles -> {options.video_output}")

@@ -7,7 +7,12 @@ import pytest
 
 from video_txt import cli as cli_module
 from video_txt.cli import main
-from video_txt.project import build_project_state, inspect_project, write_json
+from video_txt.project import (
+    build_project_state,
+    inspect_project,
+    project_legacy_argv,
+    write_json,
+)
 from video_txt.terminology import translation_audit_path_for
 
 
@@ -218,6 +223,143 @@ def test_project_status_marks_only_translation_and_downstream_after_terms_change
     assert "translate: stale — terminology changed" in output
     assert "mux: stale — upstream translate is stale" in output
     assert "tts: disabled for this workflow" in output
+
+
+def test_editing_revisions_makes_the_finished_video_stale_but_never_the_translation(
+    tmp_path, capsys
+):
+    """The point of a revise stage of its own. Folded into `translate`, correcting
+    one line would retranslate the whole film -- hours of inference to restore a
+    sentence somebody already typed."""
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    revisions = tmp_path / "revisions.json"
+    revisions.write_text(
+        json.dumps(
+            {
+                "schema": "video-txt.revisions",
+                "version": 1,
+                "revisions": [{"source": "Where is Jessie?", "text": "翠丝在哪里？"}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    project_file = tmp_path / "project.video-txt.json"
+    assert (
+        main(
+            [
+                "project",
+                "init",
+                str(video),
+                "-o",
+                str(project_file),
+                "--provider",
+                "deepseek",
+                "--revisions",
+                str(revisions),
+            ]
+        )
+        == 0
+    )
+
+    inspection = inspect_project(project_file)
+    inspection.paths["source_subtitle"].write_text("source", encoding="utf-8")
+    inspection.paths["translated_subtitle"].write_text("translation", encoding="utf-8")
+    inspection.paths["translation_audit"].write_text("{}", encoding="utf-8")
+    inspection.paths["revised_subtitle"].write_text("revised", encoding="utf-8")
+    inspection.paths["video_output"].write_bytes(b"muxed")
+    inspection = inspect_project(project_file)
+    write_json(inspection.state_path, build_project_state(inspection))
+    assert main(["project", "status", str(project_file)]) == 0
+    capsys.readouterr()
+
+    revisions.write_text(
+        json.dumps(
+            {
+                "schema": "video-txt.revisions",
+                "version": 1,
+                "revisions": [
+                    {"source": "Where is Jessie?", "text": "翠丝在哪里？"},
+                    {"source": "Oh, good.", "text": "太好了。"},
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    assert main(["project", "status", str(project_file)]) == 1
+    output = capsys.readouterr().out
+    assert "translate: current" in output
+    assert "revise: stale — revisions changed" in output
+    assert "mux: stale — upstream revise is stale" in output
+
+
+def test_a_project_without_revisions_keeps_the_revise_stage_out_of_the_way(tmp_path, capsys):
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    project_file = tmp_path / "project.video-txt.json"
+    argv = ["project", "init", str(video), "-o", str(project_file), "--provider", "deepseek"]
+    assert main(argv) == 0
+
+    assert main(["project", "status", str(project_file)]) == 1
+
+    assert "revise: disabled for this workflow" in capsys.readouterr().out
+
+
+def test_project_run_replays_the_revision_file(tmp_path):
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    revisions = tmp_path / "revisions.json"
+    revisions.write_text(
+        '{"schema":"video-txt.revisions","version":1,"revisions":[]}', encoding="utf-8"
+    )
+    project_file = tmp_path / "project.video-txt.json"
+    main(
+        [
+            "project",
+            "init",
+            str(video),
+            "-o",
+            str(project_file),
+            "--provider",
+            "deepseek",
+            "--revisions",
+            str(revisions),
+        ]
+    )
+
+    argv = project_legacy_argv(inspect_project(project_file), dry_run=True)
+
+    assert "--revisions" in argv
+    assert argv[argv.index("--revisions") + 1] == str(revisions.resolve())
+
+
+def test_project_init_reads_the_revision_file_before_writing_the_project(tmp_path):
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    revisions = tmp_path / "revisions.json"
+    revisions.write_text('{"schema":"nope","version":1,"revisions":[]}', encoding="utf-8")
+    project_file = tmp_path / "project.video-txt.json"
+
+    assert (
+        main(
+            [
+                "project",
+                "init",
+                str(video),
+                "-o",
+                str(project_file),
+                "--provider",
+                "deepseek",
+                "--revisions",
+                str(revisions),
+            ]
+        )
+        == 1
+    )
+    assert not project_file.exists()
 
 
 def test_project_status_marks_only_mux_after_subtitle_style_change(tmp_path, capsys):

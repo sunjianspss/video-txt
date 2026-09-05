@@ -18,6 +18,7 @@ from .arguments import (
     build_mux_command,
     build_project_command,
     build_retranscribe_range_command,
+    build_revise_command,
     build_run_command,
     build_transcribe_command,
     build_translate_command,
@@ -46,6 +47,7 @@ from .mux import MuxError, MuxOptions, default_video_output, run_mux
 from .pipeline import (
     TranscribeStage,
     TranslateStage,
+    ensure_revised_subtitle,
     ensure_source_subtitle,
     ensure_translated_subtitle,
     run_pipeline,
@@ -67,6 +69,14 @@ from .retranscribe import (
     run_retranscribe,
 )
 from .reuse import PreviousTranslation, ReuseError
+from .revise import (
+    RevisionError,
+    apply_revisions,
+    load_revisions,
+    plan_revisions,
+    revised_subtitle_path,
+    revision_report_path_for,
+)
 from .separate import SeparateError
 from .subtitles import (
     SubtitleFormatError,
@@ -786,7 +796,17 @@ def command_translation_audit(args: argparse.Namespace, parser: argparse.Argumen
     if report_path.exists() and not args.overwrite:
         parser.error(f"Report already exists: {report_path}. Pass --overwrite to replace it.")
 
-    report = audit_translation(parse_srt(source), parse_srt(translation), terminology)
+    source_cues = parse_srt(source)
+    revised: set[int] = set()
+    if args.revisions:
+        revisions_path = existing_file(parser, args.revisions, "Revision file")
+        if report_path == revisions_path:
+            parser.error("The JSON report cannot replace the revision file.")
+        revised = set(plan_revisions(source_cues, load_revisions(revisions_path).revisions))
+
+    report = audit_translation(
+        source_cues, parse_srt(translation), terminology, revised=revised
+    )
     write_translation_audit_report(
         source_path=source,
         translation_path=translation,
@@ -796,7 +816,11 @@ def command_translation_audit(args: argparse.Namespace, parser: argparse.Argumen
         overwrite=args.overwrite,
     )
     noun = "finding" if len(report.findings) == 1 else "findings"
-    print(f"Translation audit: {len(report.findings)} {noun}")
+    accepted = report.summary["accepted"]
+    print(
+        f"Translation audit: {len(report.findings)} {noun}"
+        + (f", {accepted} accepted on hand-revised lines" if accepted else "")
+    )
     print(f"Report: {report_path}")
     return 0 if report.is_clean else 1
 
@@ -857,6 +881,65 @@ def command_clean(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     if not post_repair.is_clean:
         print(f"Manual review still needed: {len(post_repair.findings)} findings", file=sys.stderr)
     return 1 if post_repair.has_errors else 0
+
+
+def command_revise(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    source = existing_file(parser, args.source, "Source subtitle")
+    translation = existing_file(parser, args.translation, "Translated subtitle")
+    revisions_path = existing_file(parser, args.revisions, "Revision file")
+    for label, path in (("Source", source), ("Translation", translation)):
+        if path.suffix.lower() != ".srt":
+            parser.error(f"{label} must be an .srt file, got: {path.name}")
+
+    output = resolved(args.output) or revised_subtitle_path(translation)
+    report_path = resolved(args.report) or revision_report_path_for(output)
+    inputs = {source, translation, revisions_path}
+    if output in inputs:
+        parser.error("--output must be a new path; revise never overwrites an input file.")
+    if report_path in inputs | {output}:
+        parser.error("The JSON report must not replace an input subtitle or the output.")
+    for label, path in (("Output file", output), ("Report", report_path)):
+        if path.exists() and not args.overwrite and not args.dry_run:
+            parser.error(f"{label} already exists: {path}. Pass --overwrite to replace it.")
+
+    revision_set = load_revisions(revisions_path)
+    result = apply_revisions(parse_srt(source), parse_srt(translation), revision_set)
+
+    for item in result.drifted:
+        print(
+            f"Anchor moved: cue {item.cue_index} is now {item.drift:.1f}s from where "
+            f"{item.revision.source!r} used to be.",
+            file=sys.stderr,
+        )
+    if args.dry_run:
+        for item in result.applied:
+            state = "would change" if item.changed else "already current"
+            print(f"  cue {item.cue_index} ({state}): {item.before!r} -> {item.after!r}")
+        print(f"Would write: {output}")
+        print(f"Would report: {report_path}")
+        return 0
+
+    write_srt(output, result.cues)
+    write_json(
+        report_path,
+        {
+            "schema": "video-txt.revision-report",
+            "version": 1,
+            "source": str(source),
+            "translation": str(translation),
+            "revisions": str(revisions_path),
+            "output": str(output),
+            **result.to_dict(),
+        },
+    )
+    already = len(result.already_current)
+    print(
+        f"Revised: {output} ({result.changed_count} of {len(result.applied)} line(s) changed"
+        + (f", {already} already current" if already else "")
+        + ")"
+    )
+    print(f"Report: {report_path}")
+    return 0
 
 
 def resolve_previous_translation(
@@ -931,6 +1014,13 @@ def command_mux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         args, parser, require_key=not args.dry_run, output_path=subtitle_output
     )
     translated = ensure_translated_subtitle(subtitle, stage=stage, dry_run=args.dry_run, label=None)
+    translated = ensure_revised_subtitle(
+        subtitle,
+        translated,
+        revisions=resolved(args.revisions),
+        terminology=stage.config.terminology,
+        dry_run=args.dry_run,
+    )
     options = build_mux_options(args, video=video, subtitle=translated, video_output=video_output)
     output = run_mux(options, dry_run=args.dry_run)
     if not args.dry_run:
@@ -962,6 +1052,7 @@ def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         mux_options_for=lambda translated: build_mux_options(
             args, video=video, subtitle=translated, video_output=video_output
         ),
+        revisions=resolved(args.revisions),
         dry_run=args.dry_run,
     )
     if not args.dry_run:
@@ -1014,6 +1105,13 @@ def command_dub(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         stage=translate_stage,
         dry_run=args.dry_run,
         label=f"[{stages - 1}/{stages}]",
+    )
+    translated = ensure_revised_subtitle(
+        source_subtitle,
+        translated,
+        revisions=resolved(args.revisions),
+        terminology=translate_stage.config.terminology,
+        dry_run=args.dry_run,
     )
 
     print(f"[{stages}/{stages}] Dub: {args.tts_engine} {dub_voicing(args)}")
@@ -1175,11 +1273,19 @@ def command_project(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             source_language=args.source_language,
             target_language=args.target_language,
         )
+    revisions_file = (
+        existing_file(parser, args.revisions, "Revision file") if args.revisions else None
+    )
+    if revisions_file is not None:
+        # Read it now: a malformed revision file is worth hearing about while the
+        # project is being set up, not on the run that was meant to use it.
+        load_revisions(revisions_file)
     payload = create_project_config(
         project_path=project_path,
         video=video,
         args=args,
         term_file=term_file,
+        revisions_file=revisions_file,
         subtitle=subtitle,
     )
     write_project_json(project_path, payload)
@@ -1219,6 +1325,12 @@ COMMANDS = (
         "Write a new .srt with only high-confidence safe repairs applied.",
         build_clean_command,
         command_clean,
+    ),
+    Command(
+        "revise",
+        "Apply hand-corrected lines to a translated .srt, anchored on the source text.",
+        build_revise_command,
+        command_revise,
     ),
     Command(
         "transcribe",
@@ -1288,6 +1400,7 @@ def main(argv: list[str] | None = None) -> int:
         ProjectError,
         RetranscribeError,
         ReuseError,
+        RevisionError,
         SeparateError,
         SubtitleFormatError,
         TerminologyError,

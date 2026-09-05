@@ -32,6 +32,7 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 | 已有 `.srt`，只想翻译 | `translate '/绝对路径/字幕.srt' --provider lmstudio` | `字幕.zh.srt` |
 | 字幕跨行过长、一次铺满屏 | 加 `--refine-subtitles`（不能和 `--subtitle` 同用） | — |
 | 只有几句听错 | `retranscribe-range "$V" --subtitle "$S" --from 00:19:30 --to 00:20:10` | `字幕.repaired.srt` |
+| 只有几句**译**得不对（听对了、译错了） | 写 `revisions.json`，再 `revise '原文.srt' '译文.zh.srt' --revisions r.json` | `译文.zh.revised.srt` |
 | 先检查字幕质量 | `audit "$S" --media "$V" --language en` | `字幕.audit.json` |
 | 安全清理坏字幕块 | `clean "$S" -o '/绝对路径/字幕.clean.srt'` | 新 `.srt` |
 | 同一部长片要反复精修 | `project init` → `project status` → `project run` | `project.video-txt.json` |
@@ -111,10 +112,134 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
      「布洛克」，串到巴里的艺名 Barry Block 上）——这两类走 `aliases` + `--overwrite` 补跑，有效。
    - **漏译**（`Lindsay` 整个名字不见，译文只剩前半句）——`aliases` **救不了**：规范化是把错误形态替换成
      批准形态，而译文里根本没有可替换的目标。重跑也会**原样复现**同一处漏译（实测 E04 跑两遍都漏在同一块），
-     只能定点把那一块补回来。
+     只能定点补——**写进校订文件**（见下面「改译文」），别直接改 `.srt`，也别写一次性脚本。
    **`--overwrite` 是重新掷骰子，不是纯修复。** 实测 E04 补跑后 error 从 1 条变成 2 条：旧的漏译没修好，
    又新掷出一个异写（`Elena`→「埃莱娜」）。所以问题只剩零星几处时，**定点修比重跑整集更稳也更快**；
    重跑只留给「补了别名、且该集确实有多处异写」的场合。
+
+6. **要做多说话人配音吗**——`--diarize` 的声学分割在配乐大的片子上**不可信，别拿它的结果直接开跑**。
+   实测（2 分 43 秒的 ChatGPT 演示合集，人机对话，背景音乐从头铺到尾）：`--speakers 2` 把几个不同的
+   真人和 ChatGPT 的应答混进同一个标签；放开让它自己数得到 4 个说话人，仍然把**一整句应答从中间
+   劈成两个标签**。台词内容才是可靠依据——谁在提要求、谁在应答，读一遍原文一目了然。做法：
+   - 先正常跑一次拿到 `<视频>.speakers.json`，再**按台词内容重写 `turns`**。最省事的写法是
+     **一块字幕一条 turn**，直接用字幕自己的时间范围，标签写成 `HUMAN` / `ASSISTANT` 这种有意义的
+     名字（`assign_speakers` 按重叠时长取多数，跨角色的块归给占比大的那一方）。
+   - **`version` / `model` / `cache_key` 一个字都别动**，否则下次运行会重新跑 pyannote 把手改覆盖掉；
+     重跑时 `--speakers` 等参数也要和 `cache_key` 里记的一致，不一致同样会重算。
+   - **字幕块数变了（做过 `retranscribe-range`）必须按新时间轴重建 `speakers.json`**，
+     旧 turn 的时间对不上新块，角色会整段错位。
+   - **自动切的参考片段会混进对方的声音。** `pick_reference_window` 按"同一说话人的连续块"找 3–12 秒
+     窗口，分割一错参考里就同时有两个人——实测两段参考各自都夹着对方一句，等于拿混合体克隆了两次，
+     两个音色听着差不多而且都偏慢。**开跑前先 `cat` 一遍 `<视频>.dub-cache/reference/*.txt`**，
+     确认那段话只有一个角色在说；不是就用 `--clone-reference 角色=片段.wav` 手工指定
+     （旁边放同名 `.txt` 写清这段说了什么）。配 `--separate-bgm` 时从
+     `<视频>.dub-cache/bgm/vocals.flac` 这条干声里切，参考里不会带配乐。
+   - 换纯净参考的收益，同一条命令前后对比实测：语速 7.3→8.0 字/秒，需压缩改写的句子 20→9，
+     最紧一句 2.63×→1.65×，超出槽位 1 句→0，时间轴漂移 0.4→0.0 秒。
+
+## 改译文：只改在校订文件里，绝不直接改 `.srt`
+
+用户说"第 3 句意思反了""这里应该是 XX 不是 YY"——**不要打开 `.zh.srt` 改，也不要写一次性脚本**。
+译文是生成物，下一次 `--retranslate` 或换个模型重跑就全没了；按字幕编号写死的脚本更危险：
+`clean` 删一条幻觉、`retranscribe-range` 拼一段，下面所有编号都平移，修订会**静默地**写到别人的
+台词上。实测一份 1683 条的电影字幕，上游只删 3 条，34 条按编号写死的修订全部错行，没有任何提示：
+
+```
+原 #110      -> 现 #108   'You can take today to figure out how to'   ← 锚定原文，跟着台词走
+按编号写 #110 -> 'having...'                                           ← 错行
+```
+
+正确做法是一份**锚定原文台词**的 JSON：
+
+```json
+{
+  "schema": "video-txt.revisions",
+  "version": 1,
+  "source_language": "en",
+  "target_language": "zh-CN",
+  "revisions": [
+    { "source": "Where is Jessie?",
+      "at": "00:31:07,120",
+      "text": "翠丝在哪里？",
+      "note": "模型把 Jessie 串成了另一个角色" }
+  ]
+}
+```
+
+写条目的规矩：
+
+- `source` **从原文 `.srt` 里原样复制**那一行，不要自己回译、不要把两块合成一条。大小写和空白不敏感，
+  但内容必须是原文里真实存在的一行。
+- `at` 是那一行在原文 `.srt` 里的**开始时间戳**，同样原样复制。只有同一句台词全片说过多次时才**必须**填，
+  但**建议每条都填**：既能当书签跳转，也能挡住以后新增重复台词造成的歧义。
+- `text` 是定稿译文，`\n` 表示字幕内换行。
+- `note` 写清为什么改，下次重跑时你自己会需要它。
+
+跑：
+
+```bash
+uv run --python 3.12 video-txt revise '/绝对路径/原文.srt' '/绝对路径/译文.zh.srt' \
+  --revisions '/绝对路径/revisions.json'
+# → 译文.zh.revised.srt + 译文.zh.revised.revision-report.json
+```
+
+原文和译文都**只读**，输出必须是新路径。流水线里直接加 `--revisions`，翻译之后自动套回去，
+**重翻多少次都不丢**：
+
+```bash
+video-txt run "$V" --term-file "$T" --revisions "$R"
+video-txt dub "$V" --term-file "$T" --revisions "$R"
+video-txt mux "$V" '原文.srt'  --revisions "$R"
+```
+
+### 报错怎么读
+
+- **`anchors to a line that is not in the source subtitle`**——原文变了（重转写过，或 `clean` 删了那块）。
+  去新原文里找到对应那行，把 `source`（和 `at`）更新成现在的写法。**不要**为了让命令跑过去就删掉这条修订。
+- **`is said N times ... Add "at"`**——这句台词全片说过多遍。报错会列出候选时间戳，挑对应的填进 `at`。
+- **`both correct cue N`**——两条修订锚到同一句了，留对的那条。
+- **`already_current`（不是报错）**——这行译文已经和定稿一致，说明模型自己译对了，这条可以从文件里删掉。
+- **`Anchor moved: cue N is now Xs from ...`（警告，不阻断）**——台词位置挪了。挪一两秒是重识别的正常现象；
+  挪到几分钟就要怀疑匹配错了行，去核对一下。
+
+**锚点匹配不上一律是硬错误，不会静默跳过。** 这是这个格式存在的理由：一份悄悄失效的校订文件比没有更糟，
+命令照样返回 0，而每一条人工定稿都退回成了模型的说法。
+
+### 和术语表怎么分工
+
+- **同一个词永远这么译** → 术语表 `--term-file`。人名、地名、机构名、设备名。
+- **这一句的意思错了** → 校订文件 `--revisions`。剧情语义、反话、语气、跨块错位重排、`aliases` 救不了的漏译。
+
+口诀：能写成「X 一律译成 Y」的进术语表；只对这一句成立的进校订文件。
+术语表能自动套到全片全季，校订文件不能也不该。
+
+### 审计知道哪些行是人工定稿的
+
+`revise` 跑完会**重新审计**，写出 `<译文>.revised.translation-audit.json`——这份描述的是真正出片的文件。
+人工校订过的行，若命中 `glossary_target_missing` / `glossary_alias` / `source_text_residue` /
+`source_text_unchanged` / `translation_unusually_long` 这五类**启发式**判断，会标成 `accepted`：
+照样列在报告里，但不计入 error/warning，也不再拦下流水线——那一行已经有人读过并做了决定。
+
+**结构性错误（块数、序号、时间轴、空译文）永远不会被标 accepted**：校订只换一句的文字，造不成这些错，
+出现了就是别处出了问题。
+
+只审计、不改文件时也能带上：
+
+```bash
+video-txt audit-translation '原文.srt' '译文.zh.srt' --term-file "$T" --revisions "$R"
+```
+
+### 长片/整季：写进项目文件
+
+`project init` 加 `--revisions`，`project run` 就会自动带上。**改校订文件只让 `revise` 和成片过期，
+不会让 `translate` 过期**——修一行不会触发整片重译（这正是 `revise` 单独成一个阶段的原因）。
+`project status` 直接看得到：
+
+```
+translate: current
+revise: stale — revisions changed
+mux: stale — upstream revise is stale
+```
 
 ## 执行方式
 
@@ -123,7 +248,8 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 - 已存在的阶段会自动跳过，改字幕样式重跑很便宜。强制重做才用 `--retranscribe` / `--retranslate` / `--overwrite-video`，且只在用户明说时加。
 - 转写完会自动体检（重复空转、语种不符、只覆盖前半段）。体检不过就停下来报给用户，别接着白翻一遍。
 - **整季/多集翻完，收尾跑一遍自己的全季自检，别只信每集的 `translation-audit.json`。** 两个理由：一是
-  **手改过字幕后那份报告就过期了**（它是 `translate` 当时写的，不会跟着你的编辑更新）；二是**逐块审计
+  **手改过字幕后那份报告就过期了**（它是 `translate` 当时写的，不会跟着你的编辑更新）——
+  走 `--revisions` 就没有这个问题，`revise` 阶段会对真正出片的那份重新审计；二是**逐块审计
   查不出跨块错位**——实测 S03E07 模型把 cue 5、6 合并成一句，导致 cue 6–9 的中文整体比台词**提前一格**，
   到 cue 11 才自己对回来：术语一条没少、每块单看都通顺、审计 0 error，但播放时字幕和口型对不上。
   自检查两样：
@@ -131,7 +257,22 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
   2. **术语落位**——原文块含词条、而同块译文没有批准写法的，挑出来逐条看上下文。
   第 2 项**误报很多，必须看完上下文再定性**：中英语序不同，名字合法地落在相邻块是常态（实测 S03 剩下
   八处提示全是这种，"…提供一些道歉的选项，巴里。" 接 "信手拈来。" 连起来读是对的，不用改）；
-  但**连续几块都对不上**就是真错位，按 S03E07 那样重排译文、**时间轴一格不动**。
+  但**连续几块都对不上**就是真错位，按 S03E07 那样重排译文、**时间轴一格不动**——重排结果写进校订文件。
+- **装可选依赖必须一次装全。** `uv sync --extra X` 会把**不在本次列表里的可选依赖卸掉**——实测单独
+  `uv sync --extra diarize` 把已经装好的 demucs 和 edge-tts 剪没了，紧接着那条带 `--separate-bgm`
+  的命令跑完分离说话人才报缺依赖退出，白等一趟。要哪几个就写在同一行：
+  `uv sync --extra dub --extra separate --extra diarize`。
+- **pyannote 的 Hugging Face 门禁是三个仓库，不是两个。** 除了 `segmentation-3.0` 和
+  `speaker-diarization-3.1`，pyannote 4.x 会把 3.1 内部重定向到
+  `pyannote/speaker-diarization-community-1`，那个要**单独再点一次同意**，三个都过了才 load 得动。
+  读 token 但没接受条款报的是 **403**（"not in the authorized list"），没 token 才是 401——
+  看到 403 别以为 token 坏了。全程免费，gated 不等于收费。
+- **`retranscribe-range` 不加 `--refine-subtitles`，常常原样复现同一处分块错位。** 实测重识别一段
+  被劈在半句上的字幕（"…that it's just / slightly damaged…"），词一个没听错，**分块位置和上次
+  一模一样**——问题出在 Whisper 的解码窗口，不在识别。加 `--refine-subtitles` 用词级时间戳重建块
+  边界才真正解决（实测 130 个词重排成 13 块，最长 5.7 秒）。修完还要**手工看一眼首块**：
+  `--padding` 会把上一块的尾巴连带重识别一遍，第一块常常重复上一块结尾的几个词，不删就会出现
+  连着两块说同一句话。
 - 报告结果时，把生成的文件按绝对路径列出来。
 
 ## 需要更细的参数

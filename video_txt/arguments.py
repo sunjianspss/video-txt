@@ -201,6 +201,23 @@ def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: st
     )
 
 
+def add_revision_argument(parser: argparse.ArgumentParser) -> None:
+    """Hand-corrected lines, restored after every translation.
+
+    Not part of add_translation_arguments: `project init` builds its own record
+    of every stage, and a flag it accepted but did not write down would be lost
+    without a word.
+    """
+    parser.add_argument(
+        "--revisions",
+        type=Path,
+        help=(
+            "Revision JSON of hand-corrected lines. Reapplied after translating, so a "
+            "retranslation never loses them. Anchored on the source text, not cue numbers."
+        ),
+    )
+
+
 def add_transcribe_arguments(
     parser: argparse.ArgumentParser, *, standalone: bool, include_transcript_check: bool = True
 ) -> None:
@@ -625,6 +642,14 @@ def build_translation_audit_command(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("source", type=Path, help="Path to the source-language .srt file.")
     parser.add_argument("translation", type=Path, help="Path to the translated .srt file.")
     parser.add_argument(
+        "--revisions",
+        type=Path,
+        help=(
+            "Revision JSON naming the hand-finalized lines. Findings on those lines are "
+            "reported but no longer counted against the file."
+        ),
+    )
+    parser.add_argument(
         "--term-file",
         type=Path,
         help="Optional project terminology JSON used to verify approved translations.",
@@ -663,6 +688,34 @@ def build_clean_command(parser: argparse.ArgumentParser) -> None:
     add_dry_run(parser, "Show the safe repairs without writing output files.")
 
 
+def build_revise_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("source", type=Path, help="Path to the source-language .srt file.")
+    parser.add_argument("translation", type=Path, help="Path to the translated .srt to correct.")
+    parser.add_argument(
+        "--revisions",
+        type=Path,
+        required=True,
+        help="Revision JSON holding hand-corrected lines and the source lines they belong to.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Corrected .srt path. Defaults to '<translation>.revised.srt'.",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path. Defaults to '<output>.revision-report.json'.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite generated output and report files, never an input subtitle.",
+    )
+    add_dry_run(parser, "Show which cue each revision lands on without writing files.")
+
+
 def build_translate_command(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("input", type=Path, help="Path to the source .srt file.")
     parser.add_argument(
@@ -696,6 +749,7 @@ def build_mux_command(parser: argparse.ArgumentParser) -> None:
     )
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
     add_mux_arguments(parser)
+    add_revision_argument(parser)
     add_dry_run(parser, "Print the translation plan and ffmpeg command without running them.")
 
 
@@ -706,6 +760,7 @@ def build_run_command(parser: argparse.ArgumentParser) -> None:
     add_transcribe_arguments(parser, standalone=False)
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
     add_mux_arguments(parser)
+    add_revision_argument(parser)
     add_dry_run(
         parser, "Print every stage's plan without transcribing, calling the API or running ffmpeg."
     )
@@ -720,6 +775,7 @@ def build_dub_command(parser: argparse.ArgumentParser) -> None:
     add_clone_arguments(parser)
     add_transcribe_arguments(parser, standalone=False)
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
+    add_revision_argument(parser)
     add_dry_run(parser, "Print every stage's plan without synthesizing speech or running ffmpeg.")
 
 
@@ -744,6 +800,7 @@ def build_project_command(parser: argparse.ArgumentParser) -> None:
     )
     add_transcribe_arguments(init, standalone=False)
     add_translation_arguments(init, debug_flag="--translation-debug-dir")
+    add_revision_argument(init)
     add_mux_arguments(init)
     add_voice_arguments(init, include_shared_arguments=False)
     add_speaker_arguments(init)
