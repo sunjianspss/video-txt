@@ -130,6 +130,31 @@ def test_only_the_changed_lines_are_translated_again(srt, fake_api, tmp_path):
     ]
 
 
+def test_carried_over_lines_are_not_reported_as_a_resumed_run(srt, fake_api, tmp_path, capsys):
+    """--reuse is not a resume. Counting the carried-over lines as resumed work
+    claims a partial file that was never written."""
+    previous_translation = tmp_path / "clip.zh.srt"
+    write_srt(previous_translation, list(parse_srt_text(
+        "\n\n".join(
+            f"{index}\n00:00:{index:02d},000 --> 00:00:{index + 1:02d},000\n旧译文 {index}"
+            for index in range(1, 7)
+        )
+    )))
+    repaired = tmp_path / "clip.repaired.srt"
+    repaired.write_text(SOURCE.replace("line 4", "what was really said") + "\n", encoding="utf-8")
+
+    translate_subtitle_file(
+        input_path=repaired,
+        output_path=tmp_path / "out.srt",
+        config=make_config(),
+        previous=PreviousTranslation(source=srt, translation=previous_translation),
+    )
+
+    output = capsys.readouterr().out
+    assert "Reusing: 5 unchanged block(s)" in output
+    assert "Resuming:" not in output
+
+
 def test_carried_over_lines_are_the_context_the_new_ones_are_translated_in(
     srt, fake_api, tmp_path
 ):

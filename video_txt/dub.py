@@ -609,8 +609,11 @@ def fit_subtitle_to_timeline(
     write_srt(fitted_path, fitted_cues)
     print(f"  Wrote the fitted subtitles to: {fitted_path}")
 
+    # Only the lines that came in: rebuilding from the file would hand back the
+    # ones run_dub set aside as having nothing to say, and they would be spoken.
+    voiced = {position for position, _ in cues}
     updated = [
-        (position, cue) for position, cue in enumerate(fitted_cues, start=1) if not cue.is_empty
+        (position, cue) for position, cue in enumerate(fitted_cues, start=1) if position in voiced
     ]
     return updated, fitted_path
 

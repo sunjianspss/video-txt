@@ -1150,6 +1150,14 @@ def command_project(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         return 0
     if args.project_action != "init":
         parser.error(f"Unknown project action: {args.project_action}")
+    # The same checks the workflow's own command runs, run now: `project run`
+    # replays this configuration as that command, so a combination it would
+    # reject has to be caught while it is being typed, not a stage later.
+    if args.workflow == "dub":
+        validate_fit_options(parser, args)
+        validate_voice_options(parser, args)
+    else:
+        validate_hard_subtitle_options(parser, args)
     project_path = resolved(args.output)
     assert project_path is not None
     if project_path.exists() and not args.overwrite:

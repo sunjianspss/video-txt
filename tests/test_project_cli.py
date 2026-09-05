@@ -3,10 +3,60 @@ from __future__ import annotations
 import hashlib
 import json
 
+import pytest
+
 from video_txt import cli as cli_module
 from video_txt.cli import main
 from video_txt.project import build_project_state, inspect_project, write_json
 from video_txt.terminology import translation_audit_path_for
+
+
+def test_project_init_refuses_what_the_dub_workflow_would_refuse(tmp_path):
+    """`project run` replays a dub project as the dub command. A combination that
+    command rejects has to fail here, not one stage and one config file later."""
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie-content")
+    project_file = tmp_path / "project.video-txt.json"
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "project",
+                "init",
+                str(video),
+                "-o",
+                str(project_file),
+                "--workflow",
+                "dub",
+                "--tts-engine",
+                "index-tts",
+                "--voice",
+                "zh-CN-YunxiNeural",
+            ]
+        )
+
+    assert not project_file.exists()
+
+
+def test_project_init_refuses_what_the_run_workflow_would_refuse(tmp_path):
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie-content")
+    project_file = tmp_path / "project.video-txt.json"
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "project",
+                "init",
+                str(video),
+                "-o",
+                str(project_file),
+                "--hard-subtitle-box-opacity",
+                "5",
+            ]
+        )
+
+    assert not project_file.exists()
 
 
 def test_project_init_writes_relative_content_fingerprints_without_secrets(

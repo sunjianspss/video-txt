@@ -635,10 +635,11 @@ def translate_cues(
         translations.update(reused)
 
     if partial_store is not None:
-        translations.update(partial_store.load())
-        reused = sum(1 for cue_id, _ in pending if cue_id in translations)
-        if reused:
-            print(f"Resuming: {reused}/{len(pending)} subtitle blocks already translated.")
+        stored = partial_store.load()
+        translations.update(stored)
+        resumed = sum(1 for cue_id, _ in pending if cue_id in stored)
+        if resumed:
+            print(f"Resuming: {resumed}/{len(pending)} subtitle blocks already translated.")
 
     todo = [(cue_id, cue) for cue_id, cue in pending if cue_id not in translations]
     if not todo:
