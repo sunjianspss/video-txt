@@ -200,6 +200,59 @@ def test_a_cut_piece_is_faded_at_both_ends_and_levelled_for_playback():
     assert command[command.index("-t") + 1] == "30.000"
 
 
+def test_a_piece_cut_from_a_video_carries_no_picture():
+    """Songs are cut straight out of the video. flac and mp3 refuse a video
+    stream, so this only showed up once m4a was an option -- and then with 720p
+    of h264 inside an audio file."""
+    piece = MusicPiece(start=0.0, end=10.0, voice_share=0.0, peak_lufs=-20.0)
+
+    command = extract_command(
+        Path("/episode.mkv"), piece, output=Path("/b.m4a"), ffmpeg_path="ffmpeg"
+    )
+
+    assert "-vn" in command
+
+
+def test_a_piece_is_written_back_at_the_rate_it_was_read_at():
+    """loudnorm works internally at 192 kHz and hands that to the encoder. A
+    44.1 kHz stem came out as a 192 kHz, 24-bit file four times the size,
+    carrying not one extra bit of information."""
+    piece = MusicPiece(start=0.0, end=10.0, voice_share=0.0, peak_lufs=-20.0)
+
+    command = extract_command(
+        Path("/a.flac"),
+        piece,
+        output=Path("/b.flac"),
+        ffmpeg_path="ffmpeg",
+        sample_rate=44100,
+    )
+
+    assert command[command.index("-ar") + 1] == "44100"
+    assert command[command.index("-sample_fmt") + 1] == "s16"
+
+
+def test_each_format_names_its_own_file_and_encoder():
+    piece = MusicPiece(start=0.0, end=10.0, voice_share=0.0, peak_lufs=-20.0)
+    media = Path("/v/Movie.mkv")
+
+    for audio_format, codec, suffix in (
+        ("flac", "flac", ".flac"),
+        ("m4a", "aac", ".m4a"),
+        ("mp3", "libmp3lame", ".mp3"),
+        ("alac", "alac", ".m4a"),
+    ):
+        name = piece_filename(media, 1, piece, audio_format=audio_format)
+        command = extract_command(
+            Path("/a.flac"),
+            piece,
+            output=Path("/b") / name,
+            ffmpeg_path="ffmpeg",
+            audio_format=audio_format,
+        )
+        assert name.endswith(suffix), name
+        assert command[command.index("-c:a") + 1] == codec
+
+
 def test_raw_levels_leaves_the_piece_at_the_level_it_was_played_at():
     piece = MusicPiece(start=0.0, end=10.0, voice_share=0.0, peak_lufs=-20.0)
 

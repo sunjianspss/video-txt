@@ -68,6 +68,22 @@ CLEAN_VOICE_SHARE = 0.10
 
 EDGE_FADE = 0.05
 LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
+# loudnorm works internally at 192 kHz and hands that to the encoder, which turns
+# a 44.1 kHz stem into a file four times the size carrying no more information.
+# The dub already guards against this; so does every cut made here.
+FALLBACK_SAMPLE_RATE = 48000
+
+# FLAC keeps the separated audio exactly as it came out, which matters because
+# this is working audio: it goes into somebody's video and gets encoded again,
+# and a lossy file re-encoded is a second generation of loss. The lossy formats
+# are here for the other reason somebody wants these files -- listening to them.
+FORMATS = {
+    "flac": ("flac", None, "flac"),
+    "m4a": ("aac", "192k", "m4a"),
+    "mp3": ("libmp3lame", "192k", "mp3"),
+    "alac": ("alac", None, "m4a"),
+}
+DEFAULT_FORMAT = "flac"
 # A sung line is marked this way in subtitles written by people. Whisper does not
 # write it, which is why this is an optional hint and never a requirement.
 LYRIC_MARK = "♪"
@@ -273,8 +289,11 @@ def sung_spans(
     return spans
 
 
-def piece_filename(media: Path, number: int, piece: MusicPiece) -> str:
-    return f"{media.stem}.music-{number:02d}.{piece.kind}.{clock(piece.start)}.flac"
+def piece_filename(
+    media: Path, number: int, piece: MusicPiece, *, audio_format: str = DEFAULT_FORMAT
+) -> str:
+    suffix = FORMATS[audio_format][2]
+    return f"{media.stem}.music-{number:02d}.{piece.kind}.{clock(piece.start)}.{suffix}"
 
 
 def extract_command(
@@ -284,14 +303,21 @@ def extract_command(
     output: Path,
     ffmpeg_path: str,
     normalize: bool = True,
+    sample_rate: int | None = None,
+    audio_format: str = DEFAULT_FORMAT,
 ) -> list[str]:
     """Cut one piece out, faded at both ends so it does not open with a click."""
+    codec, bitrate, _suffix = FORMATS[audio_format]
     filters = [
         f"afade=t=in:st=0:d={EDGE_FADE}",
         f"afade=t=out:st={max(0.0, piece.duration - EDGE_FADE):.3f}:d={EDGE_FADE}",
     ]
     if normalize:
         filters.append(LOUDNORM_FILTER)
+    quality = ["-b:a", bitrate] if bitrate else []
+    # Written back at the rate it was read at. Without this loudnorm's internal
+    # 192 kHz reaches the encoder and quadruples the file for nothing.
+    depth = ["-sample_fmt", "s16"] if codec in {"flac", "alac"} else []
     return [
         ffmpeg_path,
         "-y",
@@ -303,9 +329,17 @@ def extract_command(
         f"{piece.duration:.3f}",
         "-i",
         str(source),
+        # A song is cut straight out of the video file. Without this the picture
+        # rides along into any container that will hold it -- flac and mp3 drop
+        # it, m4a keeps 720p of it in what is supposed to be an audio file.
+        "-vn",
         "-af",
         ",".join(filters),
+        "-ar",
+        str(sample_rate or FALLBACK_SAMPLE_RATE),
+        *depth,
         "-c:a",
-        "flac",
+        codec,
+        *quality,
         str(output),
     ]

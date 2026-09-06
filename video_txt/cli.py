@@ -58,6 +58,7 @@ from .media import (
     find_ffmpeg,
     parse_video_size,
     probe_audio_streams,
+    probe_sample_rate,
     select_audio_stream,
 )
 from .music import (
@@ -948,10 +949,13 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
 
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[dict[str, object]] = []
+    rates: dict[Path, int | None] = {}
     for number, (piece, source) in enumerate(found, start=1):
-        target = output_dir / piece_filename(media, number, piece)
+        target = output_dir / piece_filename(media, number, piece, audio_format=args.audio_format)
         if target.exists() and not args.overwrite:
             parser.error(f"Music file already exists: {target}. Pass --overwrite to replace it.")
+        if source not in rates:
+            rates[source] = probe_sample_rate(source, ffmpeg_path=ffmpeg_path)
         completed = subprocess.run(
             extract_command(
                 source,
@@ -959,6 +963,8 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
                 output=target,
                 ffmpeg_path=ffmpeg_path,
                 normalize=not args.raw_levels,
+                sample_rate=rates[source],
+                audio_format=args.audio_format,
             ),
             capture_output=True,
             text=True,
@@ -976,6 +982,7 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             "media": str(media),
             "instrumental": str(instrumental),
             "stems": {name: str(path) for name, path in stems.items()},
+            "format": args.audio_format,
             "normalized": not args.raw_levels,
             "piece_count": len(written),
             "pieces": written,

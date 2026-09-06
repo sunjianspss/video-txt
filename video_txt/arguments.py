@@ -24,6 +24,8 @@ from .draft import DEFAULT_MAX_TERMS, DEFAULT_MIN_COUNT
 from .dub import ENGINES
 from .env import DEFAULT_SECRETS_FILE
 from .music import (
+    DEFAULT_FORMAT,
+    FORMATS,
     MIN_PIECE_SECONDS,
     MUSIC_FLOOR_LUFS,
     VOICE_FLOOR_LUFS,
@@ -726,6 +728,17 @@ def build_music_command(parser: argparse.ArgumentParser) -> None:
         choices=sorted(STEM_MODELS),
         default=DEFAULT_STEM_MODEL,
         help=f"Separation model used by --stems. Defaults to {DEFAULT_STEM_MODEL}.",
+    )
+    parser.add_argument(
+        "--format",
+        dest="audio_format",
+        choices=sorted(FORMATS),
+        default=DEFAULT_FORMAT,
+        help=(
+            f"Audio format for each piece. Defaults to {DEFAULT_FORMAT}, which keeps the "
+            "separated audio exactly as it came out; m4a and mp3 are far smaller and play "
+            "anywhere; alac is lossless in a container Apple Music will import."
+        ),
     )
     parser.add_argument(
         "--raw-levels",
