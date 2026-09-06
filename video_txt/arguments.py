@@ -26,12 +26,13 @@ from .env import DEFAULT_SECRETS_FILE
 from .music import (
     DEFAULT_FORMAT,
     FORMATS,
+    MIN_MUSICALITY,
     MIN_PIECE_SECONDS,
     MUSIC_FLOOR_LUFS,
     VOICE_FLOOR_LUFS,
 )
 from .mux import HARD_LAYOUTS
-from .separate import DEFAULT_STEM_MODEL, STEM_MODELS
+from .separate import STEM_MODELS
 from .timeline import VOICE_UNITS
 from .transcribe import BACKENDS, OUTPUT_FORMATS
 from .voices import DEFAULT_VOICE
@@ -693,6 +694,17 @@ def build_music_command(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--min-musicality",
+        type=float,
+        default=MIN_MUSICALITY,
+        help=(
+            "How much of a piece must have two pitched instruments sounding together "
+            f"before it counts as music. Defaults to {MIN_MUSICALITY:g}. Without this a "
+            "film's footsteps, traffic and room tone all come back as music. 0 keeps "
+            "everything the loudness found and skips separating the stems."
+        ),
+    )
+    parser.add_argument(
         "--clean",
         action="store_true",
         help=(
@@ -726,8 +738,11 @@ def build_music_command(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--model",
         choices=sorted(STEM_MODELS),
-        default=DEFAULT_STEM_MODEL,
-        help=f"Separation model used by --stems. Defaults to {DEFAULT_STEM_MODEL}.",
+        default="htdemucs_6s",
+        help=(
+            "Separation model. Defaults to htdemucs_6s, which is the one that pulls "
+            "guitar and piano out on their own -- the music test needs them."
+        ),
     )
     parser.add_argument(
         "--format",

@@ -62,6 +62,7 @@ from .media import (
     select_audio_stream,
 )
 from .music import (
+    PITCHED_STEMS,
     MusicError,
     MusicPiece,
     extract_command,
@@ -109,6 +110,7 @@ from .separate import (
     SeparateError,
     ensure_instrumental,
     ensure_stems,
+    mix_instrumental,
     separated_bgm_path,
     separated_voice_path,
 )
@@ -882,10 +884,35 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
         print("Would separate the soundtrack, then search it for music (dry run).")
         return 0
 
-    # The dub's own cache, reused: a film already separated for --separate-bgm
-    # costs nothing here.
-    instrumental = ensure_instrumental(media, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path)
+    gated = args.min_musicality > 0
+    if gated and args.model != "htdemucs_6s":
+        parser.error(
+            "--min-musicality needs --model htdemucs_6s: the test asks whether two pitched "
+            "instruments sound together, and only that model separates guitar and piano. "
+            "Pass --min-musicality 0 to keep everything the loudness found instead."
+        )
+
+    stems: dict[str, Path] = {}
+    if gated or args.stems:
+        stems = ensure_stems(
+            media, model=args.model, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
+        )
+
+    # The dub's own cache first: a film already separated for --separate-bgm costs
+    # nothing here. Failing that the instrumental is mixed back from the stems,
+    # which saves separating the same soundtrack a second time.
+    instrumental = separated_bgm_path(cache_dir)
     voice = separated_voice_path(cache_dir)
+    if instrumental.is_file() and voice.is_file():
+        print(f"Reusing the separated background track: {instrumental.name}")
+    elif stems:
+        instrumental = mix_instrumental(
+            stems, target=instrumental, ffmpeg_path=ffmpeg_path
+        )
+        voice = stems["vocals"]
+    else:
+        instrumental = ensure_instrumental(media, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path)
+        voice = separated_voice_path(cache_dir)
     if not voice.is_file():
         raise MusicError(
             f"The separated voice track is missing: {voice}. It is what says which "
@@ -911,6 +938,11 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             print(f"Songs marked in the subtitle: {len(songs)}")
 
         print("Measuring the soundtrack...")
+        pitched = [
+            loudness_envelope(stems[name], ffmpeg_path=ffmpeg_path)
+            for name in PITCHED_STEMS
+            if name in stems
+        ]
         # The songs are found first and masked out of the search, so a song does
         # not come back a second time inside the longer stretch around it.
         pieces = find_music(
@@ -921,18 +953,18 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             min_duration=args.min_duration,
             clean_only=args.clean,
             exclude=[(song.start, song.end) for song in songs],
+            pitched=pitched,
+            min_musicality=args.min_musicality,
         )
         found = [(piece, instrumental) for piece in pieces]
         # A song is cut from the soundtrack itself: without its singing it is not
-        # the song, and the singing is the half separation takes out.
-        found += [(song, media) for song in songs]
+        # the song, and the singing is the half separation takes out. A person
+        # marked these, so they skip the music test -- but a one-second scrap of
+        # one is still not worth writing out.
+        found += [
+            (song, media) for song in songs if song.duration >= args.min_duration
+        ]
         found.sort(key=lambda pair: pair[0].start)
-
-    stems: dict[str, Path] = {}
-    if args.stems and not args.dry_run:
-        stems = ensure_stems(
-            media, model=args.model, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
-        )
 
     print(f"Pieces found: {len(found)}")
     for number, (piece, _source) in enumerate(found, start=1):

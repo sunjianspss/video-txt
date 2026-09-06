@@ -66,6 +66,22 @@ MIN_PIECE_SECONDS = 20.0
 # What counts as "nobody talks over this" for --clean.
 CLEAN_VOICE_SHARE = 0.10
 
+# Separation puts everything that is not a voice into one instrumental, and a
+# film is full of things that are not voices: footsteps, traffic, room tone, a
+# door. Loudness alone cannot tell those from music -- listened to, twelve of
+# fourteen pieces found that way on a real episode were background noise.
+#
+# What music has and a noise does not is more than one pitched instrument
+# sounding at the same time. Drums are deliberately not among these: Demucs puts
+# transients there, so footsteps and impacts arrive as drums and one background
+# stretch measured 77% "drums" while carrying no music at all.
+PITCHED_STEMS = ("bass", "guitar", "piano")
+SIMULTANEOUS_PITCHED = 2
+# Share of a piece that has to sound like music for the piece to be music.
+# Measured over two episodes: the two pieces a listener called music scored 45%
+# and 99%, the loudest thing that was not music scored 24%.
+MIN_MUSICALITY = 0.25
+
 EDGE_FADE = 0.05
 LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 # loudnorm works internally at 192 kHz and hands that to the encoder, which turns
@@ -106,6 +122,9 @@ class MusicPiece:
     end: float
     voice_share: float
     peak_lufs: float
+    # How much of it has two pitched instruments going at once. None when the
+    # stems were not separated and the question was not asked.
+    musicality: float | None = None
     # Set only from outside the audio: a named range, or a subtitle's sung lines.
     labelled: str | None = None
 
@@ -131,6 +150,7 @@ class MusicPiece:
             "clock": self.clock_range,
             "kind": self.kind,
             "voice_share": round(self.voice_share, 3),
+            "musicality": round(self.musicality, 3) if self.musicality is not None else None,
             "peak_lufs": round(self.peak_lufs, 1),
         }
 
@@ -198,6 +218,21 @@ def runs_of(flags: list[bool], *, bridge: int) -> list[tuple[int, int]]:
     return runs
 
 
+def musicality(pitched: Sequence[list[float]], first: int, last: int, *, floor: float) -> float:
+    """Share of the window where two pitched instruments sound together."""
+    if len(pitched) < SIMULTANEOUS_PITCHED or last <= first:
+        return 0.0
+    span = range(first, min(last, min(len(envelope) for envelope in pitched)))
+    if not span:
+        return 0.0
+    together = sum(
+        1
+        for index in span
+        if sum(envelope[index] > floor for envelope in pitched) >= SIMULTANEOUS_PITCHED
+    )
+    return together / len(span)
+
+
 def find_music(
     instrumental: list[float],
     voice: list[float],
@@ -208,6 +243,8 @@ def find_music(
     min_duration: float = MIN_PIECE_SECONDS,
     clean_only: bool = False,
     exclude: Sequence[tuple[float, float]] = (),
+    pitched: Sequence[list[float]] = (),
+    min_musicality: float = 0.0,
 ) -> list[MusicPiece]:
     """Every stretch long enough to be a piece of music.
 
@@ -219,6 +256,10 @@ def find_music(
     subtitle sits inside whatever the audio finds around it, and writing both
     puts the same music on disk twice. Masking before the runs are grouped also
     keeps each remaining piece's own measurements honest.
+
+    `pitched` holds the separated pitched stems. With them a piece is kept only
+    when `min_musicality` of it has two of them sounding together, which is what
+    separates a music cue from a street, a room or a door.
     """
     if len(instrumental) != len(voice):
         shortest = min(len(instrumental), len(voice))
@@ -244,12 +285,16 @@ def find_music(
         if end - start < min_duration:
             continue
         window = speaking[first:last]
+        score = musicality(pitched, first, last, floor=music_floor) if pitched else None
+        if score is not None and score < min_musicality:
+            continue
         pieces.append(
             MusicPiece(
                 start=start,
                 end=end,
                 voice_share=(sum(window) / len(window)) if window else 0.0,
                 peak_lufs=max(instrumental[first:last], default=SILENT_LUFS),
+                musicality=score,
             )
         )
     return pieces

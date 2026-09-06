@@ -7,6 +7,7 @@ import pytest
 from video_txt.music import (
     CLEAN_VOICE_SHARE,
     MEASURE_INTERVAL,
+    MIN_MUSICALITY,
     MusicPiece,
     clock,
     extract_command,
@@ -87,6 +88,63 @@ def test_clean_does_not_bridge_across_somebody_talking():
 
     assert len(clean) == 2
     assert all(p.voice_share == 0.0 for p in clean)
+
+
+def test_loud_is_not_the_same_as_musical():
+    """Separation puts everything that is not a voice into the instrumental, and a
+    film is full of that: footsteps, traffic, a door. Listened to, twelve of the
+    fourteen pieces loudness alone found on a real episode were background noise."""
+    instrumental = envelope((60, LOUD))
+    voice = envelope((60, SILENT))
+    one_instrument = [envelope((60, LOUD)), envelope((60, SILENT)), envelope((60, SILENT))]
+
+    noise = find_music(
+        instrumental, voice, min_duration=20.0, pitched=one_instrument, min_musicality=0.25
+    )
+    everything = find_music(instrumental, voice, min_duration=20.0)
+
+    assert [(p.start, p.end) for p in everything] == [(0.0, 60.0)]
+    assert noise == []
+
+
+def test_two_pitched_instruments_sounding_together_is_what_music_is():
+    instrumental = envelope((60, LOUD))
+    voice = envelope((60, SILENT))
+    band = [envelope((60, LOUD)), envelope((60, LOUD)), envelope((60, SILENT))]
+
+    pieces = find_music(
+        instrumental, voice, min_duration=20.0, pitched=band, min_musicality=MIN_MUSICALITY
+    )
+
+    assert [(p.start, p.end) for p in pieces] == [(0.0, 60.0)]
+    assert pieces[0].musicality == pytest.approx(1.0)
+
+
+def test_a_cue_that_plays_for_part_of_the_stretch_still_counts():
+    """The score does not run wall to wall. Measured on the piece a listener
+    picked out: 45% of it had two instruments going, and it is music."""
+    instrumental = envelope((60, LOUD))
+    voice = envelope((60, SILENT))
+    half = [
+        envelope((30, LOUD), (30, SILENT)),
+        envelope((30, LOUD), (30, SILENT)),
+        envelope((60, SILENT)),
+    ]
+
+    pieces = find_music(
+        instrumental, voice, min_duration=20.0, pitched=half, min_musicality=0.25
+    )
+
+    assert len(pieces) == 1
+    assert pieces[0].musicality == pytest.approx(0.5)
+
+
+def test_without_the_stems_nothing_is_judged_on_musicality():
+    instrumental = envelope((60, LOUD))
+
+    pieces = find_music(instrumental, envelope((60, SILENT)), min_duration=20.0)
+
+    assert pieces[0].musicality is None
 
 
 def test_no_piece_is_ever_called_a_song_from_the_audio():

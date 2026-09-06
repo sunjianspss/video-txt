@@ -135,6 +135,47 @@ def stem_paths(cache_dir: Path, model: str) -> dict[str, Path]:
     return {name: directory / f"{name}.flac" for name in STEM_MODELS[model]}
 
 
+def mix_instrumental(
+    stems: dict[str, Path], *, target: Path, ffmpeg_path: str, exclude: str = "vocals"
+) -> Path:
+    """Everything except the voice, summed back into one track.
+
+    Saves a second Demucs run: a caller that already has the full split does not
+    need the two-stem pass to get the instrumental as well.
+    """
+    parts = [path for name, path in sorted(stems.items()) if name != exclude]
+    if not parts:
+        raise SeparateError("Nothing to mix: the separation produced only a voice stem.")
+    if target.is_file() and target.stat().st_size > 0:
+        return target
+    inputs = [argument for path in parts for argument in ("-i", str(path))]
+    temporary = target.with_name(f".{target.stem}.{uuid.uuid4().hex}.part{target.suffix}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    completed = subprocess.run(
+        [
+            ffmpeg_path,
+            "-y",
+            "-v",
+            "error",
+            *inputs,
+            "-filter_complex",
+            f"amix=inputs={len(parts)}:normalize=0",
+            "-c:a",
+            "flac",
+            str(temporary),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0 or not temporary.is_file():
+        temporary.unlink(missing_ok=True)
+        raise SeparateError(
+            f"Could not mix the instrumental from the stems: {(completed.stderr or '').strip()}"
+        )
+    temporary.replace(target)
+    return target
+
+
 def ensure_stems(
     video: Path, *, model: str = DEFAULT_STEM_MODEL, cache_dir: Path, ffmpeg_path: str
 ) -> dict[str, Path]:
