@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,6 +56,11 @@ BRIDGE_SECONDS = 2.5
 # Under --clean a gap is somebody talking, not a rest, so almost nothing bridges
 # it: a piece that promises nobody talks over it has to keep that promise.
 CLEAN_BRIDGE_SECONDS = 0.5
+# Sung lines are subtitled sparsely -- an instrumental bar, a breath, a verse
+# nobody wrote down -- so the gaps between them are much wider than a gap in the
+# audio. Measured on one episode's song: 3 to 4 seconds between every pair of
+# lines, which the audio bridge would have cut into six fragments of one song.
+SUNG_BRIDGE_SECONDS = 12.0
 # Shorter than this is a sting or a scene transition, not something to play.
 MIN_PIECE_SECONDS = 20.0
 # What counts as "nobody talks over this" for --clean.
@@ -65,6 +71,11 @@ LOUDNORM_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
 # A sung line is marked this way in subtitles written by people. Whisper does not
 # write it, which is why this is an optional hint and never a requirement.
 LYRIC_MARK = "♪"
+# The same mark on its own means only that music is playing -- a sting, a scene
+# change, a radio in the background. Measured across one season: 72 of the 128
+# short marked cues carry no words at all. A song is the ones with words in them.
+WORD_PATTERN = re.compile(r"\w")
+MIN_LYRIC_CHARACTERS = 2
 
 
 class MusicError(RuntimeError):
@@ -180,20 +191,33 @@ def find_music(
     bridge: float = BRIDGE_SECONDS,
     min_duration: float = MIN_PIECE_SECONDS,
     clean_only: bool = False,
+    exclude: Sequence[tuple[float, float]] = (),
 ) -> list[MusicPiece]:
     """Every stretch long enough to be a piece of music.
 
     `clean_only` keeps just the stretches nobody talks over, which are the ones
     separation renders without artefacts and the only ones worth dropping into
     somebody else's video.
+
+    `exclude` masks out what has already been claimed -- a song located from the
+    subtitle sits inside whatever the audio finds around it, and writing both
+    puts the same music on disk twice. Masking before the runs are grouped also
+    keeps each remaining piece's own measurements honest.
     """
     if len(instrumental) != len(voice):
         shortest = min(len(instrumental), len(voice))
         instrumental, voice = instrumental[:shortest], voice[:shortest]
     speaking = [level > voice_floor for level in voice]
+    claimed = [False] * len(instrumental)
+    for start, end in exclude:
+        for index in range(
+            max(0, int(start / MEASURE_INTERVAL)),
+            min(len(claimed), round(end / MEASURE_INTERVAL)),
+        ):
+            claimed[index] = True
     playing = [
-        level > music_floor and not (clean_only and talking)
-        for level, talking in zip(instrumental, speaking, strict=True)
+        level > music_floor and not taken and not (clean_only and talking)
+        for level, talking, taken in zip(instrumental, speaking, claimed, strict=True)
     ]
     if clean_only:
         bridge = min(bridge, CLEAN_BRIDGE_SECONDS)
@@ -215,14 +239,24 @@ def find_music(
     return pieces
 
 
-def sung_spans(cues: list[SubtitleCue], *, bridge: float = BRIDGE_SECONDS) -> list[MusicPiece]:
+def is_sung(cue: SubtitleCue) -> bool:
+    """Whether this line is somebody singing words, not just a note in the margin."""
+    if LYRIC_MARK not in cue.text:
+        return False
+    lyric = cue.text.replace(LYRIC_MARK, " ")
+    return len(WORD_PATTERN.findall(lyric)) >= MIN_LYRIC_CHARACTERS
+
+
+def sung_spans(
+    cues: list[SubtitleCue], *, bridge: float = SUNG_BRIDGE_SECONDS
+) -> list[MusicPiece]:
     """Songs, from the lines a person marked as sung.
 
     Only subtitles written by people carry these marks; Whisper writes none, so
     an empty result means the subtitle is silent on the question, never that the
     film has no songs in it.
     """
-    marked = [cue for cue in cues if LYRIC_MARK in cue.text]
+    marked = [cue for cue in cues if is_sung(cue)]
     if not marked:
         return []
 

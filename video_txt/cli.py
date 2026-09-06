@@ -892,19 +892,26 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             "and run again to rebuild both."
         )
 
+    # Each piece travels with the file it gets cut out of.
+    found: list[tuple[MusicPiece, Path]] = []
     if named:
-        pieces = [
-            MusicPiece(
-                start=parse_timecode(args.from_time),
-                end=parse_timecode(args.to_time),
-                voice_share=0.0,
-                peak_lufs=0.0,
-                labelled="named",
-            )
-        ]
-        sources = {0: media if args.source == "mix" else instrumental}
+        piece = MusicPiece(
+            start=parse_timecode(args.from_time),
+            end=parse_timecode(args.to_time),
+            voice_share=0.0,
+            peak_lufs=0.0,
+            labelled="named",
+        )
+        found.append((piece, media if args.source == "mix" else instrumental))
     else:
+        songs: list[MusicPiece] = []
+        if args.subtitle:
+            songs = sung_spans(parse_srt(existing_file(parser, args.subtitle, "Subtitle file")))
+            print(f"Songs marked in the subtitle: {len(songs)}")
+
         print("Measuring the soundtrack...")
+        # The songs are found first and masked out of the search, so a song does
+        # not come back a second time inside the longer stretch around it.
         pieces = find_music(
             loudness_envelope(instrumental, ffmpeg_path=ffmpeg_path),
             loudness_envelope(voice, ffmpeg_path=ffmpeg_path),
@@ -912,16 +919,13 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             voice_floor=args.voice_floor,
             min_duration=args.min_duration,
             clean_only=args.clean,
+            exclude=[(song.start, song.end) for song in songs],
         )
-        sources = dict.fromkeys(range(len(pieces)), instrumental)
-        if args.subtitle:
-            songs = sung_spans(parse_srt(existing_file(parser, args.subtitle, "Subtitle file")))
-            print(f"Songs marked in the subtitle: {len(songs)}")
-            # A song is cut from the soundtrack itself: without its singing it is
-            # not the song, and the singing is the half separation takes out.
-            for song in songs:
-                sources[len(pieces)] = media
-                pieces.append(song)
+        found = [(piece, instrumental) for piece in pieces]
+        # A song is cut from the soundtrack itself: without its singing it is not
+        # the song, and the singing is the half separation takes out.
+        found += [(song, media) for song in songs]
+        found.sort(key=lambda pair: pair[0].start)
 
     stems: dict[str, Path] = {}
     if args.stems and not args.dry_run:
@@ -929,28 +933,28 @@ def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
             media, model=args.model, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
         )
 
-    print(f"Pieces found: {len(pieces)}")
-    for number, piece in enumerate(pieces, start=1):
+    print(f"Pieces found: {len(found)}")
+    for number, (piece, _source) in enumerate(found, start=1):
         print(
             f"  {number:02d}  {piece.kind:15s} {piece.clock_range} "
             f"({piece.duration:6.1f}s, voice {piece.voice_share:.0%})"
         )
     if args.dry_run:
-        print(f"Would write {len(pieces)} file(s) to: {output_dir}")
+        print(f"Would write {len(found)} file(s) to: {output_dir}")
         return 0
-    if not pieces:
+    if not found:
         print("Nothing long enough to write out. Lower --min-duration to widen the search.")
         return 1
 
     output_dir.mkdir(parents=True, exist_ok=True)
     written: list[dict[str, object]] = []
-    for number, piece in enumerate(pieces, start=1):
+    for number, (piece, source) in enumerate(found, start=1):
         target = output_dir / piece_filename(media, number, piece)
         if target.exists() and not args.overwrite:
             parser.error(f"Music file already exists: {target}. Pass --overwrite to replace it.")
         completed = subprocess.run(
             extract_command(
-                sources.get(number - 1, instrumental),
+                source,
                 piece,
                 output=target,
                 ffmpeg_path=ffmpeg_path,

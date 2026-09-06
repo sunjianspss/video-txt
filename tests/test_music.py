@@ -11,6 +11,7 @@ from video_txt.music import (
     clock,
     extract_command,
     find_music,
+    is_sung,
     piece_filename,
     runs_of,
     sung_spans,
@@ -113,10 +114,63 @@ def test_songs_come_from_the_lines_a_person_marked_as_sung():
     assert all(s.kind == "song" for s in spans)
 
 
+def test_a_note_on_its_own_marks_music_playing_not_somebody_singing():
+    """Measured across one season: 72 of the 128 short marked cues carry no words.
+    They mean a sting or a radio in the background, and cutting them out gives two
+    seconds of nothing."""
+    lyric, marker = parse_srt_text(
+        "1\n00:00:01,000 --> 00:00:03,000\n♪ Love is all we need ♪\n\n"
+        "2\n00:00:05,000 --> 00:00:07,000\n♪♪\n"
+    )
+
+    assert is_sung(lyric)
+    assert not is_sung(marker)
+
+
+def test_one_song_stays_one_song_across_the_gaps_between_its_lines():
+    """Sung lines are subtitled sparsely. Measured on a real episode the gaps run
+    three to four seconds, which the audio bridge would cut into six fragments."""
+    cues = parse_srt_text(
+        "1\n00:32:45,000 --> 00:32:54,000\n♪ There's going to be a revival ♪\n\n"
+        "2\n00:32:57,000 --> 00:33:05,000\n♪ Everybody gonna jump and shout ♪\n\n"
+        "3\n00:33:08,000 --> 00:33:16,000\n♪ All your sisters and your brothers ♪\n"
+    )
+
+    spans = sung_spans(cues)
+
+    assert len(spans) == 1
+    assert spans[0].duration == pytest.approx(31.0)
+
+
 def test_a_subtitle_with_no_marks_says_nothing_about_songs():
     """Whisper never writes them, so an empty answer means the subtitle is silent
     on the question -- not that the film has no songs."""
     assert sung_spans(parse_srt_text("1\n00:00:01,000 --> 00:00:02,000\nHello.\n")) == []
+
+
+def test_a_song_is_not_handed_back_again_inside_the_music_around_it():
+    """Measured on a real episode: the song the subtitle placed at 32:45 sat
+    inside a 130-second stretch the audio found, and both were written out --
+    the same music twice, 45 MB and 26 MB of it."""
+    instrumental = envelope((120, LOUD))
+    voice = envelope((120, SILENT))
+
+    without = find_music(instrumental, voice, min_duration=20.0)
+    around = find_music(instrumental, voice, min_duration=20.0, exclude=[(40.0, 80.0)])
+
+    assert [(p.start, p.end) for p in without] == [(0.0, 120.0)]
+    assert [(p.start, p.end) for p in around] == [(0.0, 40.0), (80.0, 120.0)]
+
+
+def test_what_is_left_beside_a_song_keeps_its_own_measurements():
+    """Masking before the runs are grouped, rather than trimming afterwards, is
+    what keeps each remaining piece measured over itself."""
+    instrumental = envelope((120, LOUD))
+    voice = envelope((40, SILENT), (40, LOUD), (40, SILENT))
+
+    pieces = find_music(instrumental, voice, min_duration=20.0, exclude=[(40.0, 80.0)])
+
+    assert all(piece.voice_share == 0.0 for piece in pieces)
 
 
 def test_a_piece_is_named_for_when_it_starts_and_what_it_is():
