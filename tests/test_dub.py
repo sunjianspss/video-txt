@@ -31,7 +31,7 @@ from video_txt.dub import (
     synthesize_segments,
 )
 from video_txt.fit import FitOptions
-from video_txt.subtitles import SubtitleCue, parse_srt_text
+from video_txt.subtitles import SubtitleCue, parse_srt, parse_srt_text
 from video_txt.timeline import PlacedSegment
 from video_txt.translate import TranslationConfig
 from video_txt.voices import VoiceChoice, VoicePlan
@@ -292,6 +292,55 @@ def test_the_fit_times_the_clips_the_dub_will_actually_speak(tmp_path, monkeypat
     )
 
     assert spoken == [SPLIT_SENTENCE_SPOKEN]
+
+
+def test_fit_subtitle_to_timeline_leaves_the_wordless_lines_out_of_the_rewrite(
+    tmp_path, monkeypatch
+):
+    """run_dub sets aside lines with nothing to say. Rebuilding the cue list from
+    the fitted file would hand them back, and the engine would be asked to speak
+    a held pause -- the very error the filter exists to prevent."""
+    subtitle = tmp_path / "clip.zh.srt"
+    subtitle.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n这是一句很长很长很长的台词。\n\n"
+        "2\n00:00:02,000 --> 00:00:03,000\n……\n\n"
+        "3\n00:00:04,000 --> 00:00:05,000\n第二句。\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setattr(dub_module, "find_ffprobe", lambda *_a, **_k: "ffprobe")
+    monkeypatch.setattr(
+        dub_module,
+        "synthesize_segments",
+        lambda lines, *_a, **_k: [Path(f"/cache/{p}-{len(t)}.mp3") for p, t in lines],
+    )
+    monkeypatch.setattr(
+        dub_module,
+        "probe_durations",
+        lambda paths, **_k: [int(path.stem.split("-")[1]) / 2 for path in paths],
+    )
+    monkeypatch.setattr(
+        fit_module,
+        "request_shorter_texts",
+        lambda requests, **_k: {request.position: "短" * request.max_chars for request in requests},
+    )
+
+    options = make_options(subtitle_input=subtitle)
+    cues = [
+        (position, cue)
+        for position, cue in enumerate(parse_srt(subtitle), start=1)
+        if has_speakable_text(cue.text)
+    ]
+    fit = FitOptions(
+        translation=TranslationConfig(base_url="https://x.test", api_key="k", model="m")
+    )
+    updated, fitted_path = fit_subtitle_to_timeline(
+        cues, options, fit=fit, cache_dir=tmp_path / "cache", ffmpeg_path="ffmpeg"
+    )
+
+    assert [position for position, _ in updated] == [1, 3]
+    # The pause still reaches the screen: only the voice track skips it.
+    assert "……" in fitted_path.read_text(encoding="utf-8")
 
 
 def test_fit_subtitle_to_timeline_keeps_the_original_file_when_nothing_overruns(

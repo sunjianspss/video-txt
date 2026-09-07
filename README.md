@@ -108,20 +108,39 @@ OpenAI Whisper / MLX Whisper、`--model`、`--initial-prompt`、`--whisper-arg` 
 源字幕始终只读。省略 `-o` 时默认生成 `<字幕名>.repaired.srt`，同时写出
 `<输出名>.retranscription-report.json`，记录核心/提取区间、音轨选择依据、删除和新增的字幕。
 已有生成物默认不覆盖；确认替换时加 `--overwrite`。先加 `--dry-run` 可只查看音频提取、Whisper 和
-替换计划，不写任何文件。v0.7.0 只修原文 SRT，不会修改已有译文；局部翻译与翻译审计更新留到
-v0.7.1。
+替换计划，不写任何文件。
+
+修好原文之后翻译不必从头再来。`--reuse` 指向修复前的原文字幕，读得一样的行直接沿用旧译文，
+只有真正改过的那几行才发给模型：
+
+```bash
+uv run --python 3.12 video-txt translate '/绝对路径/电影.repaired.srt' \
+  --reuse "$S" --provider lmstudio
+```
+
+旧译文默认按命名规则在 `$S` 旁边找（`电影.zh.srt`），不在那儿就用 `--reuse-translation` 指出来。
+匹配只看文字（忽略空白与大小写），所以重新编号、时间轴微调都不影响沿用；同一句话在片中说过多次时，
+取时间上最近的那条译文。终端会打印沿用了多少条、还剩多少条要翻译。`dub`、`run`、`mux` 也认这两个参数。
 
 参考耗时:24 分钟的 480p 视频,CPU 转写 7.5 分钟 + 烧字幕 42 秒,翻译那一步走云端约 30 秒,
 走本机模型看机器和模型大小,慢不少。
 
 可选功能按需装,首次运行还要下模型权重:
 
+| `--extra` | 装的是什么 |
+| --- | --- |
+| `dub` | 中文配音(edge-tts) |
+| `separate` | 配音时保留背景音乐和环境声(Demucs 人声分离) |
+| `mlx` | Apple Silicon GPU 转写,比 CPU 快数倍,另下 1.5G 权重 |
+| `diarize` | 多说话人分离(pyannote) |
+| `clone` | 原声克隆(F5-TTS) |
+
+**要哪几个就写在同一行,别分几次装。** `uv sync` 每次都把环境对齐到本次给的 `--extra` 列表,
+不在列表里的会被**卸掉**——单独跑一条 `uv sync --extra diarize` 会把之前装好的 Demucs 和 edge-tts
+剪掉,下一条带 `--separate-bgm` 的命令才发现缺依赖:
+
 ```bash
-uv sync --extra dub       # 中文配音(edge-tts)
-uv sync --extra separate  # 配音时保留背景音乐和环境声(Demucs 人声分离)
-uv sync --extra mlx       # Apple Silicon GPU 转写,比 CPU 快数倍,另下 1.5G 权重
-uv sync --extra diarize   # 多说话人分离(pyannote)
-uv sync --extra clone     # 原声克隆(F5-TTS)
+uv sync --extra dub --extra separate --extra diarize
 ```
 
 ## 按场景选命令
@@ -135,6 +154,7 @@ uv sync --extra clone     # 原声克隆(F5-TTS)
 | 已有 `.srt`,先检查质量 | `uv run --python 3.12 video-txt audit '/绝对路径/字幕.srt'` |
 | 已有 `.srt`,安全清理明显坏块 | `uv run --python 3.12 video-txt clean '/绝对路径/字幕.srt' -o '/绝对路径/字幕.clean.srt'` |
 | 只重识别一小段错误字幕 | `uv run --python 3.12 video-txt retranscribe-range "$V" --subtitle source.srt --from 00:19:30 --to 00:20:10` |
+| 修好原文后只翻译变过的行 | `uv run --python 3.12 video-txt translate source.repaired.srt --reuse source.srt` |
 | 固定人名/术语译法并审计译文 | 翻译命令加 `--term-file project.terms.json`,详见 v0.5 |
 | 双语或多音轨影片 | 正常传 `--language en`;选不准时再加 `--audio-stream 2` |
 | 原片底部已有烧死字幕 | 上面那条加 `--hard-subtitle-layout top`,新字幕放顶部,两边各占一头 |
@@ -242,6 +262,48 @@ uv run --python 3.12 video-txt dub "$V" --provider lmstudio --language en --audi
 如果流水线已经有同名原文字幕,它仍会保护并复用旧文件;要按新音轨重转,同时加 `--retranscribe`。
 不确定选择结果时先加 `--dry-run`,它只显示音轨、提取命令和 Whisper 命令。
 
+## 术语表起草(v0.8)
+
+术语表要在开翻前写好，但读一整季字幕找专有名词是没人愿意开始的活。`draft-terms` 把这步机械化：
+
+```bash
+uv run --python 3.12 video-txt draft-terms '/绝对路径/剧集目录'/*.srt \
+  -o '/绝对路径/剧名.terms.json' --source-language en
+```
+
+判断专有名词不靠停用词表，靠字幕自己的写法：**一个名字会出现在句子中间且仍然大写，而且几乎不会
+被写成小写**；`Well` / `But` 只在句首大写，`hope` 满篇都是小写。英语无条件大写的那几个词
+（`I`、`OK`）单列一份名单排除。
+
+产物就是一份 terminology 文件，只是每条 `target` **留空**：
+
+```json
+{
+  "source": "Jesse", "target": "", "match": "word", "count": 31,
+  "examples": ["This way, you'll never lose me, Jesse.", "Hello, Jesse, hello."],
+  "aliases": ["Jessie"],
+  "draft_warning": "The subtitles also spell this Jessie. ..."
+}
+```
+
+`target` 为空时 `load_terminology` 直接报错，所以**没填完的草稿不会被误当成术语表用**。填完
+`target`、删掉不值得立目的条目，就是可用的 `--term-file`；`count` 和 `examples` 是多余字段，
+加载时忽略，留着当依据也无妨。
+
+相差一个字母的两个拼写会被认成同一个名字的异写，互相写进 `aliases`——实测某部片的字幕把同一角色
+拼成 `Jesse`(31 次) 和 `Jessie`(26 次)。
+
+**换季复用旧表**用 `--against`：旧表已覆盖的名字自动略去，只列新名字，并对和旧词条**共用一个词**的
+新名字打警告（这正是 `Aaron Ryan` 被旧词条 `Ryan Madison` 吸附那类错误的来源）：
+
+```bash
+uv run --python 3.12 video-txt draft-terms '/新一季目录'/*.srt -o /tmp/new.json \
+  --against '/绝对路径/剧名.terms.json'
+```
+
+`--min-count`（默认 3）控制一个名字要出现几次才提案，`--limit`（默认 60）封顶。
+**它找不到只说过一两次的名字**，那不是漏，是频率扫描的边界——扫完仍要过一遍片里台词少但重要的角色。
+
 ## 项目术语表与翻译审计(v0.5)
 
 电影人名、产品名和行业术语不要靠每一批模型临场决定。为项目建立一份 JSON 术语表:
@@ -297,6 +359,180 @@ uv run --python 3.12 video-txt audit-translation source.srt source.zh.srt \
 
 术语表可省略,此时仍检查原文/译文数量、序号、时间轴、空译文、整句残留原文和异常长度。
 报告已经存在时显式加 `--overwrite`;两份字幕始终只读。
+
+## 人工校订层(v0.8)
+
+术语表管的是「同一个词永远这么译」。管不了的是逐句的剧情语义:模型把 explore 译成了「探险」,
+把一句反话译成了正话——这些只有人读一遍才能发现,而它们是整个项目里最贵的文本。
+
+改进译文文件里是留不住的:译文是生成物,下一次 `--retranslate` 就没了。所以校订单独存一份 JSON,
+**锚定在原文台词上,而不是字幕编号上**:
+
+```json
+{
+  "schema": "video-txt.revisions",
+  "version": 1,
+  "source_language": "en",
+  "target_language": "zh-CN",
+  "revisions": [
+    {
+      "source": "You can take today to figure out how to",
+      "at": "00:10:33,280",
+      "text": "今天你可以先摸索",
+      "note": "模型把 figure out 译成了「弄明白」"
+    }
+  ]
+}
+```
+
+`source` 是原文那一行,大小写和空白不敏感。`at` 是它在原文字幕里的开始时间,只在同一句台词
+全片说过多次时才必须填(不填而有歧义会报错并列出候选时间);填上也无妨,可以当书签用。
+`text` 是定稿译文,`\n` 表示字幕内换行。`note` 只给人看。
+
+为什么不用字幕编号:`clean` 删掉一条幻觉、`retranscribe-range` 拼回一段,下面所有编号都会平移。
+按编号写死的修订会**静默地**写到别人的台词上。锚定原文则跟着台词走:
+
+```bash
+uv run --python 3.12 video-txt revise source.srt source.zh.srt \
+  --revisions revisions.json
+# → source.zh.revised.srt 和 source.zh.revised.revision-report.json
+```
+
+原文和译文都只读,输出必须是新路径。报告里逐条记录落在哪个 cue、改前改后、以及锚点时间漂移了多少。
+
+流水线里加 `--revisions` 就会在翻译之后自动套回去,重翻多少次都不丢:
+
+```bash
+uv run --python 3.12 video-txt run "$V" --term-file "$T" --revisions revisions.json
+uv run --python 3.12 video-txt dub "$V" --term-file "$T" --revisions revisions.json
+uv run --python 3.12 video-txt mux "$V" source.srt --revisions revisions.json
+```
+
+三条硬规则:
+
+- **锚点匹配不上就报错**,绝不静默跳过。一份悄悄失效的校订文件比没有更糟——命令照样报成功,
+  而每一条校订都退回成了模型的说法。
+- **两条修订抢同一句**会报错,不会后写的赢。
+- **重复套用是安全的**。已经是定稿写法的行记为 `already_current`,报告里单独计数;某一行长期
+  `already_current`,说明模型已经能自己译对,可以从文件里删掉了。
+
+套完修订会**重新审计**并写出 `<译文>.revised.translation-audit.json`。这份描述的是真正出片的文件，
+不像 `translate` 当时写的那份会随后续改动过期。人工校订过的行若命中 `glossary_target_missing` /
+`glossary_alias` / `source_text_residue` / `source_text_unchanged` / `translation_unusually_long`
+这五类启发式判断，会标成 `accepted`：照样列在报告里，但不计入 error/warning，也不再拦下流水线——
+那一行已经有人读过并做了决定。结构性错误（块数、序号、时间轴、空译文）**永远不会**被标 accepted：
+校订只替换一句的文字，造不成这些错。
+
+只审计、不改文件时同样可以带上校订文件：
+
+```bash
+uv run --python 3.12 video-txt audit-translation source.srt source.zh.srt \
+  --term-file "$T" --revisions revisions.json
+```
+
+长片和整季写进项目文件，`project run` 自动带上：
+
+```bash
+uv run --python 3.12 video-txt project init "$V" --revisions revisions.json --term-file "$T"
+```
+
+`revise` 在项目里是**独立阶段**，夹在 `translate` 和 `mux` / `tts` 之间。改校订文件只让它和成片过期，
+**不会让 `translate` 过期**——修一行不会触发整片重译：
+
+```
+translate: current
+revise: stale — revisions changed
+mux: stale — upstream revise is stale
+```
+
+锚点时间漂移超过 5 秒会打印提醒但不阻断:重新识别本来就会让台词挪动一两秒,漂移到几分钟才值得
+怀疑是匹配错了行。
+
+## 配乐提取(v0.9)
+
+片子的配乐是混在对白底下的，没有一条现成的轨可以拷。分离能把对白拿掉——`separate` 早就在做——
+但剩下的是一条两小时、中间大段静音的伴奏，不是一组能播的曲子。找出曲子才是这一步的工作。
+
+```bash
+uv run --python 3.12 video-txt music '/绝对路径/电影.mkv'
+# → 电影.music/ 里若干 .flac + 一份 .music.json
+```
+
+判据只用音频，因为**片源可能是网上看到的、旁边没有字幕**。ffmpeg 的 `ebur128` 每 100 毫秒报一次
+瞬时响度（109 分钟的片子不到 2 秒算完），伴奏连续高于底噪的地方就是有音乐。
+
+**光靠响度不够。** 分离器把"不是人声的一切"都放进伴奏，而电影里那一切大半不是音乐：脚步、车流、
+房间底噪、关门。实听验证过，只按响度找出的 14 段里 **12 段是环境声**。
+
+所以还要过一道音乐性判据：**两条有音高的轨（bass / guitar / piano）同时在响**。鼓被特意排除——
+Demucs 把瞬态都放进鼓轨，脚步和撞击会以"鼓"的形式出现，有一段纯环境声的鼓轨占比高达 77%。
+默认要求一段里至少 25% 的时间满足这个条件（`--min-musicality`，给 0 就退回纯响度）。
+这需要六轨分离，所以 `--model` 默认是 `htdemucs_6s`。
+
+每段会报 `voice_share`（多少比例被人声盖着）和 `musicality`。加 `--clean` 只保留**没人说话**的段落：
+分离器在对白最响的地方留下的瑕疵最多，所以这些才是拿去用在别的视频里不露馅的。
+
+```bash
+video-txt music "$V" --clean --min-duration 15    # 只要干净的
+video-txt music "$V" --stems                      # 顺带导出全部分轨
+video-txt music "$V" --from 00:31:07 --to 00:34:20 --source mix   # 只切你指定的一段
+```
+
+**分轨**：`--stems` 用 `htdemucs`（drums/bass/other/vocals）或 `--model htdemucs_6s`
+（再拆出 guitar/piano），各存一份 FLAC 并缓存。
+
+**它不判断有没有人在唱。** 分离器听到的只是"人声"，唱和说一律进同一条轨；用"人声占比高"去猜歌曲
+实测会把一段 71 秒的对话判成歌。所以没有任何一段会仅凭音频被标成歌曲。要切歌只有两条路：
+`--from/--to` 自己给范围，或者 `--subtitle` 指一份**人工字幕**——里面用 `♪` 标了唱词
+（Whisper 转写稿没有这个标记，官方字幕轨才有）。歌曲从**原始混音**里切，因为没有唱的歌不是歌；它占的那段会先从音频搜索里遮掉，
+不会同一段音乐导出两次。
+
+`♪` 那条路只认**有词的**唱词块——裸 `♪♪` 只表示"这里有音乐"，不是歌
+（实测某季 128 个短标记块里 72 个没有词）。唱词块之间有间奏和换气，所以按 12 秒桥接合并成整首。
+
+实测一集 34 分钟的剧集：找出 14 段，其中字幕标注的那首插曲被准确切在 32:45–33:59（73.9 秒，
+-15.9 LUFS）。首次跑约 3 分钟（分离占大头），缓存命中后重跑 18.5 秒。
+
+缓存和配音共用：某片如果已经跑过 `--separate-bgm`，提配乐是秒出。每段默认响度归一到 -16 LUFS
+方便直接播放，两端各 50 毫秒淡入淡出防咔哒；要原始电平加 `--raw-levels`。
+
+**格式**默认 `flac`——这是工作文件，还要再进别人的视频里编码一次，用有损格式等于叠加两代损失。
+只是想听或者要放进手机就换 `--format m4a` / `mp3`（同一首插曲 6.5MB → 1.7MB），
+要无损又要 Apple Music 能导入就用 `--format alac`。输出采样率跟随输入，不做上采样。
+
+## 双语字幕(v0.8)
+
+原文和译文一起上屏。学语言的人两行都读，校对译文的人不看原文根本没法判断一句译得对不对——
+而这两件事都不该靠开两个文件来回滚动。
+
+```bash
+uv run --python 3.12 video-txt bilingual source.srt source.zh.srt
+# → source.zh.bilingual.srt，默认译文在上、原文在下
+```
+
+`--order source-first` 把原文放上面。两份字幕都只读，输出必须是新路径。
+
+流水线里加 `--bilingual`，翻译（以及校订）之后自动合并，合并结果就是被封装/烧录的那一份：
+
+```bash
+uv run --python 3.12 video-txt run "$V" --bilingual                     # 软字幕
+uv run --python 3.12 video-txt run "$V" --bilingual --mux-mode hard     # 硬字幕
+uv run --python 3.12 video-txt mux "$V" source.srt --bilingual
+```
+
+**烧硬字幕时原文会自动压小压淡**——字号 0.72 倍、半透明，读起来是第二行而不是和译文抢注意力。
+软字幕交给播放器，两行等大。
+
+两份字幕必须是同一份字幕：块数、序号、时间轴逐条一致，对不上直接报错而不是猜。
+这正是 `translate` 保证、`audit-translation` 检查的东西，所以正常流程出来的文件天然满足。
+
+**合并后每块恒定两行**：一行译文、一行原文。各自语言原有的换行会被压平——原文两行加译文两行
+会摞成四行、吃掉半个画面，而那两个换行本来只是各自语言对行宽的决定，并排放到一起就不成立了。
+个别很长的行在渲染时仍会被播放器或 ASS 自动折到第三行（实测 1683 块里有 34 块），
+这和单语字幕的行为一致。
+
+一个提醒：双语字幕每块两行、行也更宽，拿 `video-txt audit` 去查会报 `too_many_lines` 和
+`line_too_wide`。那是对的——双语字幕本来就比单语密。要审计就审合并之前的那一份。
 
 ## .mkv 电影:只做外挂字幕
 
@@ -389,7 +625,7 @@ uv run video-txt dub "$V" --provider lmstudio
 
 | 想要 | 加这个参数 |
 | --- | --- |
-| 只留音乐和环境声(推荐) | `--separate-bgm`,先 `uv sync --extra separate`。Demucs 把原声里的人声抠掉,音乐、掌声、环境声全音量保留,不跟配音打架。首次要下模型、分离要几分钟,结果缓存后重跑秒过 |
+| 只留音乐和环境声(推荐) | `--separate-bgm`,先 `uv sync --extra separate`。Demucs 把原声里的人声抠掉,音乐、掌声、环境声全音量保留,不跟配音打架。首次要下模型、分离要几分钟,结果缓存后重跑秒过。抠出来的人声干轨会留下,克隆音色时用它剪参考片段 |
 | 保留完整原声垫底 | `--keep-bgm`,整条原声(含原人声)压到 15%,太轻用 `--bgm-volume 0.25` 调 |
 | 换音色 | `--voice zh-CN-YunxiNeural` |
 | 整体语速 | `--rate +10%` 或 `--rate -10%` |
@@ -420,16 +656,39 @@ export HF_TOKEN=hf_xxx        # 也可以放进凭据文件,见文末「凭据�
 uv run video-txt dub "$V" --provider lmstudio --diarize
 ```
 
-- **首次要过 Hugging Face 门禁。** 模型是 gated 的,得先去
-  [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0) 和
-  [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
-  点同意再拿 token。
+- **首次要过 Hugging Face 门禁,三个仓库都要点同意。** 模型是 gated 的(gated 不等于收费,全程免费),
+  账号要逐个接受条款:
+  [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)、
+  [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1),
+  以及 pyannote 4.x 会把 3.1 内部重定向到的
+  [pyannote/speaker-diarization-community-1](https://huggingface.co/pyannote/speaker-diarization-community-1)。
+  少接受一个就 load 不动。token 没读到报 **401**,读到了但没接受条款报 **403**
+  ("not in the authorized list")——看到 403 是去点同意,不是换 token。
+- **配乐大的片子,别信声学分割的结果。** pyannote 分的是声音像不像,不是谁扮演什么角色。实测一段
+  2 分 43 秒、配乐铺满全片的人机演示合集:`--speakers 2` 把几个不同的真人和助手的应答混进同一个
+  标签,放开自动数得到 4 个说话人、仍然把一整句应答从中间劈成两个标签。这种片子按**台词内容**
+  手改 `你的视频.speakers.json` 更可靠,见下面「手工校正说话人」。
 - **知道有几个人就直接说。** `--speakers 2` 比让它自己猜稳,只知道范围用 `--min-speakers 2
   --max-speakers 4`。猜多了会把同一个人拆成两个音色,很明显。
 - **指定某人的音色:**`--speaker-voice SPEAKER_01=zh-CN-YunxiNeural`,可重复。
   `1=...` 是 `SPEAKER_01=...` 的简写,编号是 pyannote 给的标签、从 0 开始数,
   跟报告里按说话时长排的先后没有关系。名字写错会直接报错,不会静默忽略。
 - 结果落盘在 `你的视频.speakers.json`,重跑直接复用,想重算加 `--rediarize`。
+
+**手工校正说话人。** `speakers.json` 里的 `turns` 是可读的 JSON,可以直接改:
+
+```json
+{"start": 18.391, "end": 18.712, "speaker": "ASSISTANT"}
+```
+
+- 标签随便起名(`HUMAN`、`ASSISTANT`、角色名都行),`--speaker-voice` 和 `--clone-reference`
+  按这个名字对应。
+- 最省事的写法是**一块字幕一条 turn**,直接用字幕自己的时间范围:每块归属明确,
+  跨角色的块按重叠时长归给占比大的那一方。
+- **`version`、`model`、`cache_key` 一个字都别动。** 这三样对不上,下次运行会当缓存失效重新跑
+  pyannote,把手改覆盖掉;重跑时命令行上的 `--speakers` 等参数也要和 `cache_key` 里记的一致。
+- **字幕块数变了要重建。** 做过 `retranscribe-range` 之后块边界全变了,旧 turn 的时间对不上新块,
+  角色会整段错位——按新的字幕时间轴重写一遍。
 
 ### 原声克隆:保留原讲者的声音
 
@@ -452,7 +711,27 @@ uv run video-txt dub "$V" --provider lmstudio --tts-engine index-tts \
 `--clone-repo` 指向那个目录就够了:里面的 `.venv` 和 `checkpoints` 都会自动找到。
 
 - 参考音频自动从源语言字幕里剪(3–12 秒连续说话),存进 `你的视频.dub-cache/reference/`。
-  想自己指定用 `--clone-reference my.wav`,旁边放一个 `my.txt` 写清楚这段音频说了什么。
+  想自己指定用 `--clone-reference my.wav`,旁边放一个 `my.txt` 写清楚这段音频说了什么;
+  配 `--diarize` 时按角色指定:`--clone-reference ASSISTANT=assistant.wav`,可重复。
+- **多说话人时,开跑前先看一眼参考片段的文字。** 参考窗口是按"同一说话人的连续块"找的,
+  说话人分错了参考里就同时有两个人的声音——实测两段参考各自都夹着对方一句,等于拿混合体克隆了
+  两次,两个音色听起来差不多、而且都偏慢。`cat 你的视频.dub-cache/reference/*.txt` 一眼就能看出
+  混没混:
+  ```
+  SPEAKER_01-clean-53000.txt: Make it fun. Right, I can help with that. Can you go to eBay...
+                              ^^^ 提问方              ^^^ 应答方,混了
+  ```
+  混了就自己切一段干净的传进去。开了 `--separate-bgm` 时从 `你的视频.dub-cache/bgm/vocals.flac`
+  这条人声干轨上切,参考里不会带配乐:
+  ```bash
+  ffmpeg -ss 29.66 -t 2.75 -i 你的视频.dub-cache/bgm/vocals.flac \
+    -ac 1 -ar 24000 -c:a pcm_s16le assistant.wav      # 同名 .txt 写清这段说了什么
+  ```
+  换成纯净参考的收益,同一条命令前后对比实测:语速 7.3→8.0 字/秒,需压缩改写的句子 20→9,
+  最紧一句 2.63×→1.65×,超出槽位 1 句→0,时间轴漂移 0.4→0.0 秒。
+- **配乐大的片子加上 `--separate-bgm`**:分离出来的人声干轨会用来剪参考片段,克隆到的是人声
+  本身,不是人声加背景音乐。文件名带 `-clean`,和从混音剪的参考分开存。没开这个参数(或缓存里
+  还没有干轨)就照旧从原始混音剪。
 - **慢,而且没法并发。** 本地推理,一集剧大约是实时的三分之一到一半;
   先 `--dry-run` 看清楚要合成多少段再开跑,别拿长视频试手。
 - 另外两个引擎:`--tts-engine f5-tts` 最省事(`uv sync --extra clone` 装进本项目环境,
@@ -464,7 +743,8 @@ uv run video-txt dub "$V" --provider lmstudio --tts-engine index-tts \
 
 每句语音按内容哈希缓存在 `你的视频.dub-cache/`,重跑只补缺的句子。改 `--keep-bgm`、`--soft-subtitle`
 这类不影响语音本身的参数几乎不花时间;换 `--voice` 或 `--rate` 会让缓存整体失效,等于重新合成一遍。
-`--separate-bgm` 分离出来的背景轨也在这里(`bgm/no_vocals.flac`),`--prune-cache` 不会动它。
+`--separate-bgm` 分离出来的两条轨也在这里(`bgm/no_vocals.flac` 背景、`bgm/vocals.flac` 人声干轨,
+后者用来剪克隆参考),`--prune-cache` 不会动它们。
 
 哈希只认内容、音色和语速,不认句子的位置:手改译文里的某一句、或者在中间插一句,后面的句子照样
 命中缓存;整片重复的台词(片头片尾语这类)也只合成一次。

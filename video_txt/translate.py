@@ -21,6 +21,7 @@ from .constants import (
     DEFAULT_TIMEOUT,
 )
 from .parallel import map_in_parallel
+from .reuse import PreviousTranslation, plan_reuse
 from .subtitles import SubtitleCue, chunk_cues, parse_srt, serialize_srt, write_srt
 from .terminology import (
     Terminology,
@@ -621,17 +622,24 @@ def translate_cues(
     *,
     debug_dir: Path | None = None,
     partial_store: PartialStore | None = None,
+    reused: dict[str, str] | None = None,
 ) -> list[SubtitleCue]:
     pending = [
         (str(position), cue) for position, cue in enumerate(cues, start=1) if not cue.is_empty
     ]
     translations: dict[str, str] = {}
 
+    # Lines an earlier translation already covers. They also give the batches
+    # around them their context, the same way finished batches do.
+    if reused:
+        translations.update(reused)
+
     if partial_store is not None:
-        translations.update(partial_store.load())
-        reused = sum(1 for cue_id, _ in pending if cue_id in translations)
-        if reused:
-            print(f"Resuming: {reused}/{len(pending)} subtitle blocks already translated.")
+        stored = partial_store.load()
+        translations.update(stored)
+        resumed = sum(1 for cue_id, _ in pending if cue_id in stored)
+        if resumed:
+            print(f"Resuming: {resumed}/{len(pending)} subtitle blocks already translated.")
 
     todo = [(cue_id, cue) for cue_id, cue in pending if cue_id not in translations]
     if not todo:
@@ -697,16 +705,29 @@ def translate_subtitle_file(
     resume: bool = True,
     dry_run: bool = False,
     overwrite_audit: bool = False,
+    previous: PreviousTranslation | None = None,
 ) -> Path:
     cues = parse_srt(input_path)
     translatable = [cue for cue in cues if not cue.is_empty]
-    batches = chunk_cues(translatable, config.batch_chars)
+    plan = plan_reuse(cues, previous) if previous is not None else None
+    reused = plan.by_position if plan is not None else {}
+    outstanding = [
+        cue
+        for position, cue in enumerate(cues, start=1)
+        if not cue.is_empty and str(position) not in reused
+    ]
+    batches = chunk_cues(outstanding, config.batch_chars)
 
     print(f"Input: {input_path}")
     print(f"Output: {output_path}")
     print(f"Target language: {config.target_language}")
     print(f"Model: {config.model}")
     print(f"Subtitle blocks: {len(cues)} ({len(translatable)} with text)")
+    if plan is not None:
+        print(
+            f"Reusing: {plan.reused} unchanged block(s) from {plan.previous.translation}, "
+            f"{plan.fresh} left to translate"
+        )
     print(f"Batches: {len(batches)} (about {config.batch_chars} chars each)")
     print(f"Concurrency: {max(1, config.concurrency)}")
     if config.reasoning_effort and config.reasoning_effort != "auto":
@@ -734,6 +755,7 @@ def translate_subtitle_file(
         config,
         debug_dir=debug_dir or auto_debug_dir,
         partial_store=store,
+        reused=reused,
     )
     enforcement = (
         enforce_terminology(cues, translated, config.terminology)

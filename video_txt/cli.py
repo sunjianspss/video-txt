@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
@@ -13,15 +14,25 @@ from pathlib import Path
 from . import __version__
 from .arguments import (
     build_audit_command,
+    build_bilingual_command,
     build_clean_command,
+    build_draft_terms_command,
     build_dub_command,
+    build_music_command,
     build_mux_command,
     build_project_command,
     build_retranscribe_range_command,
+    build_revise_command,
     build_run_command,
     build_transcribe_command,
     build_translate_command,
     build_translation_audit_command,
+)
+from .bilingual import (
+    BilingualError,
+    bilingual_cues,
+    bilingual_subtitle_path,
+    merge_subtitles,
 )
 from .clone import CLONE_ENGINES, CloneError, CloneOptions, is_rate, speed_from_rate
 from .constants import (
@@ -38,14 +49,34 @@ from .diarize import (
     SpeakerTurn,
     ensure_speakers,
 )
+from .draft import draft_terminology, draft_to_dict
 from .dub import DubError, DubOptions, default_dubbed_output, run_dub
 from .env import CredentialError, resolve_api_key, resolve_optional_key
 from .fit import FitOptions
-from .media import MediaError, parse_video_size, probe_audio_streams, select_audio_stream
+from .media import (
+    MediaError,
+    find_ffmpeg,
+    parse_video_size,
+    probe_audio_streams,
+    probe_sample_rate,
+    select_audio_stream,
+)
+from .music import (
+    PITCHED_STEMS,
+    MusicError,
+    MusicPiece,
+    extract_command,
+    find_music,
+    loudness_envelope,
+    piece_filename,
+    sung_spans,
+)
 from .mux import MuxError, MuxOptions, default_video_output, run_mux
 from .pipeline import (
     TranscribeStage,
     TranslateStage,
+    ensure_bilingual_subtitle,
+    ensure_revised_subtitle,
     ensure_source_subtitle,
     ensure_translated_subtitle,
     run_pipeline,
@@ -66,7 +97,23 @@ from .retranscribe import (
     parse_timecode,
     run_retranscribe,
 )
-from .separate import SeparateError
+from .reuse import PreviousTranslation, ReuseError
+from .revise import (
+    RevisionError,
+    apply_revisions,
+    load_revisions,
+    plan_revisions,
+    revised_subtitle_path,
+    revision_report_path_for,
+)
+from .separate import (
+    SeparateError,
+    ensure_instrumental,
+    ensure_stems,
+    mix_instrumental,
+    separated_bgm_path,
+    separated_voice_path,
+)
 from .subtitles import (
     SubtitleFormatError,
     language_code,
@@ -362,6 +409,7 @@ def build_mux_options(
         crf=args.crf,
         preset=args.preset,
         video_size=parse_video_size(args.video_size) if args.video_size else None,
+        bilingual=args.bilingual,
         ffmpeg_path=args.ffmpeg_path,
     )
 
@@ -456,6 +504,7 @@ def build_translate_stage(
         resume=args.resume,
         retranslate=args.retranslate,
         reuse_if_exists=getattr(args, "project_reuse_translation", False),
+        previous=resolve_previous_translation(args, parser),
     )
 
 
@@ -784,7 +833,17 @@ def command_translation_audit(args: argparse.Namespace, parser: argparse.Argumen
     if report_path.exists() and not args.overwrite:
         parser.error(f"Report already exists: {report_path}. Pass --overwrite to replace it.")
 
-    report = audit_translation(parse_srt(source), parse_srt(translation), terminology)
+    source_cues = parse_srt(source)
+    revised: set[int] = set()
+    if args.revisions:
+        revisions_path = existing_file(parser, args.revisions, "Revision file")
+        if report_path == revisions_path:
+            parser.error("The JSON report cannot replace the revision file.")
+        revised = set(plan_revisions(source_cues, load_revisions(revisions_path).revisions))
+
+    report = audit_translation(
+        source_cues, parse_srt(translation), terminology, revised=revised
+    )
     write_translation_audit_report(
         source_path=source,
         translation_path=translation,
@@ -794,9 +853,257 @@ def command_translation_audit(args: argparse.Namespace, parser: argparse.Argumen
         overwrite=args.overwrite,
     )
     noun = "finding" if len(report.findings) == 1 else "findings"
-    print(f"Translation audit: {len(report.findings)} {noun}")
+    accepted = report.summary["accepted"]
+    print(
+        f"Translation audit: {len(report.findings)} {noun}"
+        + (f", {accepted} accepted on hand-revised lines" if accepted else "")
+    )
     print(f"Report: {report_path}")
     return 0 if report.is_clean else 1
+
+
+def default_music_dir(media: Path) -> Path:
+    return media.with_name(f"{media.stem}.music")
+
+
+def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    media = existing_file(parser, args.media, "Media file")
+    output_dir = resolved(args.output_dir) or default_music_dir(media)
+    cache_dir = resolved(args.cache_dir) or media.with_name(f"{media.stem}.dub-cache")
+    if args.min_duration <= 0:
+        parser.error("--min-duration must be greater than 0")
+    named = args.from_time is not None or args.to_time is not None
+    if named and (args.from_time is None or args.to_time is None):
+        parser.error("--from and --to must be passed together.")
+    ffmpeg_path = find_ffmpeg(explicit=None)
+
+    print(f"Media: {media}")
+    print(f"Separated audio cache: {cache_dir}")
+    print(f"Music: {output_dir}")
+    if args.dry_run and not cache_dir.is_dir():
+        print("Would separate the soundtrack, then search it for music (dry run).")
+        return 0
+
+    gated = args.min_musicality > 0
+    if gated and args.model != "htdemucs_6s":
+        parser.error(
+            "--min-musicality needs --model htdemucs_6s: the test asks whether two pitched "
+            "instruments sound together, and only that model separates guitar and piano. "
+            "Pass --min-musicality 0 to keep everything the loudness found instead."
+        )
+
+    stems: dict[str, Path] = {}
+    if gated or args.stems:
+        stems = ensure_stems(
+            media, model=args.model, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
+        )
+
+    # The dub's own cache first: a film already separated for --separate-bgm costs
+    # nothing here. Failing that the instrumental is mixed back from the stems,
+    # which saves separating the same soundtrack a second time.
+    instrumental = separated_bgm_path(cache_dir)
+    voice = separated_voice_path(cache_dir)
+    if instrumental.is_file() and voice.is_file():
+        print(f"Reusing the separated background track: {instrumental.name}")
+    elif stems:
+        instrumental = mix_instrumental(
+            stems, target=instrumental, ffmpeg_path=ffmpeg_path
+        )
+        voice = stems["vocals"]
+    else:
+        instrumental = ensure_instrumental(media, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path)
+        voice = separated_voice_path(cache_dir)
+    if not voice.is_file():
+        raise MusicError(
+            f"The separated voice track is missing: {voice}. It is what says which "
+            f"stretches nobody talks over. Delete {separated_bgm_path(cache_dir).parent} "
+            "and run again to rebuild both."
+        )
+
+    # Each piece travels with the file it gets cut out of.
+    found: list[tuple[MusicPiece, Path]] = []
+    if named:
+        piece = MusicPiece(
+            start=parse_timecode(args.from_time),
+            end=parse_timecode(args.to_time),
+            voice_share=0.0,
+            peak_lufs=0.0,
+            labelled="named",
+        )
+        found.append((piece, media if args.source == "mix" else instrumental))
+    else:
+        songs: list[MusicPiece] = []
+        if args.subtitle:
+            songs = sung_spans(parse_srt(existing_file(parser, args.subtitle, "Subtitle file")))
+            print(f"Songs marked in the subtitle: {len(songs)}")
+
+        print("Measuring the soundtrack...")
+        pitched = [
+            loudness_envelope(stems[name], ffmpeg_path=ffmpeg_path)
+            for name in PITCHED_STEMS
+            if name in stems
+        ]
+        # The songs are found first and masked out of the search, so a song does
+        # not come back a second time inside the longer stretch around it.
+        pieces = find_music(
+            loudness_envelope(instrumental, ffmpeg_path=ffmpeg_path),
+            loudness_envelope(voice, ffmpeg_path=ffmpeg_path),
+            music_floor=args.music_floor,
+            voice_floor=args.voice_floor,
+            min_duration=args.min_duration,
+            clean_only=args.clean,
+            exclude=[(song.start, song.end) for song in songs],
+            pitched=pitched,
+            min_musicality=args.min_musicality,
+        )
+        found = [(piece, instrumental) for piece in pieces]
+        # A song is cut from the soundtrack itself: without its singing it is not
+        # the song, and the singing is the half separation takes out. A person
+        # marked these, so they skip the music test -- but a one-second scrap of
+        # one is still not worth writing out.
+        found += [
+            (song, media) for song in songs if song.duration >= args.min_duration
+        ]
+        found.sort(key=lambda pair: pair[0].start)
+
+    print(f"Pieces found: {len(found)}")
+    for number, (piece, _source) in enumerate(found, start=1):
+        print(
+            f"  {number:02d}  {piece.kind:15s} {piece.clock_range} "
+            f"({piece.duration:6.1f}s, voice {piece.voice_share:.0%})"
+        )
+    if args.dry_run:
+        print(f"Would write {len(found)} file(s) to: {output_dir}")
+        return 0
+    if not found:
+        print("Nothing long enough to write out. Lower --min-duration to widen the search.")
+        return 1
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written: list[dict[str, object]] = []
+    rates: dict[Path, int | None] = {}
+    for number, (piece, source) in enumerate(found, start=1):
+        target = output_dir / piece_filename(media, number, piece, audio_format=args.audio_format)
+        if target.exists() and not args.overwrite:
+            parser.error(f"Music file already exists: {target}. Pass --overwrite to replace it.")
+        if source not in rates:
+            rates[source] = probe_sample_rate(source, ffmpeg_path=ffmpeg_path)
+        completed = subprocess.run(
+            extract_command(
+                source,
+                piece,
+                output=target,
+                ffmpeg_path=ffmpeg_path,
+                normalize=not args.raw_levels,
+                sample_rate=rates[source],
+                audio_format=args.audio_format,
+            ),
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0 or not target.is_file():
+            raise MusicError(f"Could not cut {target.name}: {(completed.stderr or '').strip()}")
+        written.append({**piece.to_dict(), "file": target.name})
+
+    report = output_dir / f"{media.stem}.music.json"
+    write_json(
+        report,
+        {
+            "schema": "video-txt.music",
+            "version": 1,
+            "media": str(media),
+            "instrumental": str(instrumental),
+            "stems": {name: str(path) for name, path in stems.items()},
+            "format": args.audio_format,
+            "normalized": not args.raw_levels,
+            "piece_count": len(written),
+            "pieces": written,
+        },
+    )
+    print(f"Wrote {len(written)} music file(s) to: {output_dir}")
+    print(f"Whole-film instrumental: {instrumental}")
+    if stems:
+        print(f"Stems: {', '.join(sorted(stems))} in {next(iter(stems.values())).parent}")
+    print(f"Report: {report}")
+    return 0
+
+
+def command_bilingual(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    source = existing_file(parser, args.source, "Source subtitle")
+    translation = existing_file(parser, args.translation, "Translated subtitle")
+    for label, path in (("Source", source), ("Translation", translation)):
+        if path.suffix.lower() != ".srt":
+            parser.error(f"{label} must be an .srt file, got: {path.name}")
+
+    output = resolved(args.output) or bilingual_subtitle_path(translation)
+    if output in {source, translation}:
+        parser.error("--output must be a new path; bilingual never overwrites an input file.")
+    if output.exists() and not args.overwrite:
+        parser.error(f"Output already exists: {output}. Pass --overwrite to replace it.")
+
+    merged = merge_subtitles(parse_srt(source), parse_srt(translation), order=args.order)
+    write_srt(output, bilingual_cues(merged))
+    print(f"Bilingual: {len(merged)} cue(s) in both languages ({args.order})")
+    print(f"Wrote: {output}")
+    return 0
+
+
+def command_draft_terms(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    subtitles = [
+        existing_file(parser, path, "Subtitle file") for path in args.subtitles
+    ]
+    for path in subtitles:
+        if path.suffix.lower() != ".srt":
+            parser.error(f"Expected an .srt file, got: {path.name}")
+    if args.min_count < 1:
+        parser.error("--min-count must be 1 or greater")
+    if args.limit < 1:
+        parser.error("--limit must be 1 or greater")
+
+    existing_terms = None
+    against = None
+    if args.against:
+        against = existing_file(parser, args.against, "Terminology file")
+        existing_terms = load_terminology(against)
+
+    output = resolved(args.output)
+    assert output is not None
+    if output in {*subtitles, against}:
+        parser.error("--output must be a new path; the draft never replaces an input file.")
+    if output.exists() and not args.overwrite:
+        parser.error(f"Draft already exists: {output}. Pass --overwrite to replace it.")
+
+    cues = [cue for path in subtitles for cue in parse_srt(path)]
+    draft = draft_terminology(
+        cues,
+        existing=existing_terms,
+        min_count=args.min_count,
+        max_terms=args.limit,
+    )
+    write_json(
+        output,
+        draft_to_dict(
+            draft,
+            source_language=args.source_language,
+            target_language=args.target_language,
+        ),
+    )
+
+    print(
+        f"Scanned {draft.scanned_cues} cues in {len(subtitles)} subtitle file(s); "
+        f"proposing {len(draft.candidates)} name(s)."
+    )
+    if draft.already_covered:
+        print(f"Already in {against}: {len(draft.already_covered)} name(s), left out.")
+    for candidate in draft.candidates:
+        if candidate.warning:
+            print(f"  {candidate.source}: {candidate.warning}", file=sys.stderr)
+    print(f"Draft: {output}")
+    print(
+        "Every 'target' is blank, so the file will not load as a glossary until they are "
+        "filled in. Delete the names that are not worth an entry, then pass it as --term-file."
+    )
+    return 0
 
 
 def command_clean(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -857,6 +1164,85 @@ def command_clean(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
     return 1 if post_repair.has_errors else 0
 
 
+def command_revise(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    source = existing_file(parser, args.source, "Source subtitle")
+    translation = existing_file(parser, args.translation, "Translated subtitle")
+    revisions_path = existing_file(parser, args.revisions, "Revision file")
+    for label, path in (("Source", source), ("Translation", translation)):
+        if path.suffix.lower() != ".srt":
+            parser.error(f"{label} must be an .srt file, got: {path.name}")
+
+    output = resolved(args.output) or revised_subtitle_path(translation)
+    report_path = resolved(args.report) or revision_report_path_for(output)
+    inputs = {source, translation, revisions_path}
+    if output in inputs:
+        parser.error("--output must be a new path; revise never overwrites an input file.")
+    if report_path in inputs | {output}:
+        parser.error("The JSON report must not replace an input subtitle or the output.")
+    for label, path in (("Output file", output), ("Report", report_path)):
+        if path.exists() and not args.overwrite and not args.dry_run:
+            parser.error(f"{label} already exists: {path}. Pass --overwrite to replace it.")
+
+    revision_set = load_revisions(revisions_path)
+    result = apply_revisions(parse_srt(source), parse_srt(translation), revision_set)
+
+    for item in result.drifted:
+        print(
+            f"Anchor moved: cue {item.cue_index} is now {item.drift:.1f}s from where "
+            f"{item.revision.source!r} used to be.",
+            file=sys.stderr,
+        )
+    if args.dry_run:
+        for item in result.applied:
+            state = "would change" if item.changed else "already current"
+            print(f"  cue {item.cue_index} ({state}): {item.before!r} -> {item.after!r}")
+        print(f"Would write: {output}")
+        print(f"Would report: {report_path}")
+        return 0
+
+    write_srt(output, result.cues)
+    write_json(
+        report_path,
+        {
+            "schema": "video-txt.revision-report",
+            "version": 1,
+            "source": str(source),
+            "translation": str(translation),
+            "revisions": str(revisions_path),
+            "output": str(output),
+            **result.to_dict(),
+        },
+    )
+    already = len(result.already_current)
+    print(
+        f"Revised: {output} ({result.changed_count} of {len(result.applied)} line(s) changed"
+        + (f", {already} already current" if already else "")
+        + ")"
+    )
+    print(f"Report: {report_path}")
+    return 0
+
+
+def resolve_previous_translation(
+    args: argparse.Namespace, parser: argparse.ArgumentParser
+) -> PreviousTranslation | None:
+    """The source/translation pair --reuse points at, with the naming rule filled in."""
+    if args.reuse is None:
+        if args.reuse_translation is not None:
+            parser.error("--reuse-translation needs --reuse, the source it was translated from.")
+        return None
+    source = existing_file(parser, args.reuse, "Previous source subtitle")
+    translation = resolved(args.reuse_translation) or translated_subtitle_path(
+        source, args.target_language
+    )
+    if not translation.is_file():
+        parser.error(
+            f"No translation of {source.name} at {translation}. "
+            "Point at it with --reuse-translation."
+        )
+    return PreviousTranslation(source=source, translation=translation)
+
+
 def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     input_path = existing_file(parser, args.input, "Input file")
     if input_path.suffix.lower() != ".srt":
@@ -871,9 +1257,12 @@ def command_translate(args: argparse.Namespace, parser: argparse.ArgumentParser)
     if report_path.exists() and not args.overwrite and not args.dry_run:
         parser.error(f"Report already exists: {report_path}. Pass --overwrite to replace it.")
 
+    previous = resolve_previous_translation(args, parser)
+
     translate_subtitle_file(
         input_path=input_path,
         output_path=output_path,
+        previous=previous,
         config=build_translation_config(
             args,
             parser,
@@ -906,6 +1295,20 @@ def command_mux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         args, parser, require_key=not args.dry_run, output_path=subtitle_output
     )
     translated = ensure_translated_subtitle(subtitle, stage=stage, dry_run=args.dry_run, label=None)
+    translated = ensure_revised_subtitle(
+        subtitle,
+        translated,
+        revisions=resolved(args.revisions),
+        terminology=stage.config.terminology,
+        dry_run=args.dry_run,
+    )
+    translated = ensure_bilingual_subtitle(
+        subtitle,
+        translated,
+        bilingual=args.bilingual,
+        order=args.bilingual_order,
+        dry_run=args.dry_run,
+    )
     options = build_mux_options(args, video=video, subtitle=translated, video_output=video_output)
     output = run_mux(options, dry_run=args.dry_run)
     if not args.dry_run:
@@ -937,6 +1340,9 @@ def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         mux_options_for=lambda translated: build_mux_options(
             args, video=video, subtitle=translated, video_output=video_output
         ),
+        revisions=resolved(args.revisions),
+        bilingual=args.bilingual,
+        bilingual_order=args.bilingual_order,
         dry_run=args.dry_run,
     )
     if not args.dry_run:
@@ -989,6 +1395,13 @@ def command_dub(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
         stage=translate_stage,
         dry_run=args.dry_run,
         label=f"[{stages - 1}/{stages}]",
+    )
+    translated = ensure_revised_subtitle(
+        source_subtitle,
+        translated,
+        revisions=resolved(args.revisions),
+        terminology=translate_stage.config.terminology,
+        dry_run=args.dry_run,
     )
 
     print(f"[{stages}/{stages}] Dub: {args.tts_engine} {dub_voicing(args)}")
@@ -1125,6 +1538,14 @@ def command_project(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         return 0
     if args.project_action != "init":
         parser.error(f"Unknown project action: {args.project_action}")
+    # The same checks the workflow's own command runs, run now: `project run`
+    # replays this configuration as that command, so a combination it would
+    # reject has to be caught while it is being typed, not a stage later.
+    if args.workflow == "dub":
+        validate_fit_options(parser, args)
+        validate_voice_options(parser, args)
+    else:
+        validate_hard_subtitle_options(parser, args)
     project_path = resolved(args.output)
     assert project_path is not None
     if project_path.exists() and not args.overwrite:
@@ -1142,11 +1563,19 @@ def command_project(args: argparse.Namespace, parser: argparse.ArgumentParser) -
             source_language=args.source_language,
             target_language=args.target_language,
         )
+    revisions_file = (
+        existing_file(parser, args.revisions, "Revision file") if args.revisions else None
+    )
+    if revisions_file is not None:
+        # Read it now: a malformed revision file is worth hearing about while the
+        # project is being set up, not on the run that was meant to use it.
+        load_revisions(revisions_file)
     payload = create_project_config(
         project_path=project_path,
         video=video,
         args=args,
         term_file=term_file,
+        revisions_file=revisions_file,
         subtitle=subtitle,
     )
     write_project_json(project_path, payload)
@@ -1182,10 +1611,34 @@ COMMANDS = (
         command_translation_audit,
     ),
     Command(
+        "music",
+        "Separate a soundtrack and cut the music out of it as playable files.",
+        build_music_command,
+        command_music,
+    ),
+    Command(
+        "bilingual",
+        "Merge a source and a translated .srt into one subtitle carrying both.",
+        build_bilingual_command,
+        command_bilingual,
+    ),
+    Command(
+        "draft-terms",
+        "Propose a project glossary from the names a source subtitle keeps using.",
+        build_draft_terms_command,
+        command_draft_terms,
+    ),
+    Command(
         "clean",
         "Write a new .srt with only high-confidence safe repairs applied.",
         build_clean_command,
         command_clean,
+    ),
+    Command(
+        "revise",
+        "Apply hand-corrected lines to a translated .srt, anchored on the source text.",
+        build_revise_command,
+        command_revise,
     ),
     Command(
         "transcribe",
@@ -1251,9 +1704,13 @@ def main(argv: list[str] | None = None) -> int:
         DiarizeError,
         DubError,
         MediaError,
+        MusicError,
         MuxError,
         ProjectError,
         RetranscribeError,
+        BilingualError,
+        ReuseError,
+        RevisionError,
         SeparateError,
         SubtitleFormatError,
         TerminologyError,

@@ -12,6 +12,7 @@ from video_txt.separate import (
     extract_audio_command,
     separate_command,
     separated_bgm_path,
+    separated_voice_path,
 )
 
 
@@ -86,8 +87,12 @@ def test_the_audio_is_extracted_as_plain_stereo_wav():
     assert command[-1] == "/cache/bgm/source.wav"
 
 
-def test_separation_keeps_only_the_compressed_background(tmp_path, monkeypatch):
-    """The WAV stems run to hundreds of megabytes and only the FLAC is ever read again."""
+def test_separation_keeps_both_stems_compressed_and_neither_wav(tmp_path, monkeypatch):
+    """The WAV stems run to hundreds of megabytes; the FLACs are what gets read again.
+
+    The vocal one is kept for cutting clone references from -- demucs writes it
+    either way, and it holds the speaker without the music.
+    """
     monkeypatch.setattr(separate_module, "require_demucs", lambda: None)
 
     def fake_run(command, **_kwargs):
@@ -106,8 +111,34 @@ def test_separation_keeps_only_the_compressed_background(tmp_path, monkeypatch):
 
     assert target == separated_bgm_path(tmp_path)
     assert target.is_file()
+    assert separated_voice_path(tmp_path).is_file()
     assert not (tmp_path / "bgm" / "htdemucs").exists()
     assert not (tmp_path / "bgm" / "source.wav").exists()
+
+
+def test_a_lost_voice_stem_does_not_cost_the_background(tmp_path, monkeypatch, capsys):
+    """The vocal stem is a bonus. Failing to keep it must not fail the separation."""
+    monkeypatch.setattr(separate_module, "require_demucs", lambda: None)
+
+    def fake_run(command, **_kwargs):
+        if "demucs.separate" in command:
+            stem = tmp_path / "bgm" / "htdemucs" / "source" / "no_vocals.wav"
+            stem.parent.mkdir(parents=True, exist_ok=True)
+            stem.write_bytes(b"wav")
+            (stem.parent / "vocals.wav").write_bytes(b"wav")
+        elif Path(command[command.index("-i") + 1]).name == "vocals.wav":
+            return SimpleNamespace(returncode=1, stdout="", stderr="flac: no space left")
+        else:
+            Path(command[-1]).write_bytes(b"data")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(separate_module.subprocess, "run", fake_run)
+
+    target = ensure_instrumental(Path("/v/a.mp4"), cache_dir=tmp_path, ffmpeg_path="ffmpeg")
+
+    assert target.is_file()
+    assert not separated_voice_path(tmp_path).exists()
+    assert "original mix" in capsys.readouterr().err
 
 
 def test_a_failed_split_names_the_step_that_failed(tmp_path, monkeypatch):

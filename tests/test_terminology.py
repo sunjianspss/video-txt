@@ -228,3 +228,63 @@ def test_translation_audit_warns_about_a_multiword_source_fragment_left_behind()
 
     assert [finding.code for finding in report.findings] == ["source_text_residue"]
     assert report.summary["warning"] == 1
+
+
+REVISED_SOURCE = parse_srt_text(
+    "1\n00:00:01,000 --> 00:00:02,000\nWoody grabbed the rope.\n\n"
+    "2\n00:00:03,000 --> 00:00:04,000\nWoody nodded.\n"
+)
+REVISED_TERMS = Terminology(
+    source_language="en",
+    target_language="zh-CN",
+    terms=(Term(source="Woody", target="胡迪", match="word"),),
+)
+
+
+def test_a_hand_revised_line_stops_failing_the_audit_but_is_still_reported():
+    """A person read this line and decided. The heuristic still says its piece --
+    a report that hides what it saw is useless -- but it no longer blocks."""
+    translated = parse_srt_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n他抓住了绳子。\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n胡迪点了点头。\n"
+    )
+
+    unchecked = audit_translation(REVISED_SOURCE, translated, REVISED_TERMS)
+    signed_off = audit_translation(REVISED_SOURCE, translated, REVISED_TERMS, revised={1})
+
+    assert unchecked.has_errors is True
+    assert signed_off.has_errors is False
+    assert signed_off.is_clean is True
+    assert [finding.code for finding in signed_off.findings] == ["glossary_target_missing"]
+    assert signed_off.findings[0].accepted is True
+    assert signed_off.summary == {"error": 0, "warning": 0, "accepted": 1,
+                                  "by_code": {"glossary_target_missing": 1}}
+    assert signed_off.findings[0].to_dict()["accepted"] is True
+
+
+def test_a_structural_defect_is_never_signed_off_by_revising_the_line():
+    """Revisions replace one cue's text. They cannot move a timestamp, so a timing
+    mismatch on a revised line means something else went wrong and still counts."""
+    translated = parse_srt_text(
+        "1\n00:00:01,000 --> 00:00:09,000\n胡迪抓住了绳子。\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n胡迪点了点头。\n"
+    )
+
+    audit = audit_translation(REVISED_SOURCE, translated, REVISED_TERMS, revised={1, 2})
+
+    assert [finding.code for finding in audit.findings] == ["cue_timing_mismatch"]
+    assert audit.findings[0].accepted is False
+    assert audit.has_errors is True
+
+
+def test_signing_off_one_line_leaves_the_others_alone():
+    translated = parse_srt_text(
+        "1\n00:00:01,000 --> 00:00:02,000\n他抓住了绳子。\n\n"
+        "2\n00:00:03,000 --> 00:00:04,000\n他点了点头。\n"
+    )
+
+    audit = audit_translation(REVISED_SOURCE, translated, REVISED_TERMS, revised={1})
+
+    assert audit.summary["error"] == 1
+    assert audit.summary["accepted"] == 1
+    assert audit.has_errors is True

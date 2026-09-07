@@ -6,6 +6,7 @@ import threading
 import pytest
 
 from video_txt import translate as translate_module
+from video_txt.reuse import PreviousTranslation
 from video_txt.subtitles import parse_srt, parse_srt_text, write_srt
 from video_txt.terminology import Term, Terminology
 from video_txt.translate import (
@@ -90,6 +91,92 @@ def test_resume_skips_cues_already_in_the_partial_file(srt, fake_api, tmp_path):
     assert cues[2].text == "译文 line 3"
     requested = {item["id"] for payload in fake_api.requests for item in payload["items"]}
     assert requested == {"3", "4", "5", "6"}
+
+
+def test_only_the_changed_lines_are_translated_again(srt, fake_api, tmp_path):
+    """A repair rewrites a few lines; the rest of the film is already translated."""
+    previous_translation = tmp_path / "clip.zh.srt"
+    write_srt(previous_translation, [
+        cue for cue in parse_srt_text(
+            "\n\n".join(
+                f"{index}\n00:00:{index:02d},000 --> 00:00:{index + 1:02d},000\n旧译文 {index}"
+                for index in range(1, 7)
+            )
+        )
+    ])
+    repaired = tmp_path / "clip.repaired.srt"
+    repaired.write_text(
+        SOURCE.replace("line 3", "what was really said").replace("line 4", "and this too") + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "clip.repaired.zh.srt"
+
+    translate_subtitle_file(
+        input_path=repaired,
+        output_path=output,
+        config=make_config(),
+        previous=PreviousTranslation(source=srt, translation=previous_translation),
+    )
+
+    requested = {item["text"] for payload in fake_api.requests for item in payload["items"]}
+    assert requested == {"what was really said", "and this too"}
+    assert [cue.text for cue in parse_srt(output)] == [
+        "旧译文 1",
+        "旧译文 2",
+        "译文 what was really said",
+        "译文 and this too",
+        "旧译文 5",
+        "旧译文 6",
+    ]
+
+
+def test_carried_over_lines_are_not_reported_as_a_resumed_run(srt, fake_api, tmp_path, capsys):
+    """--reuse is not a resume. Counting the carried-over lines as resumed work
+    claims a partial file that was never written."""
+    previous_translation = tmp_path / "clip.zh.srt"
+    write_srt(previous_translation, list(parse_srt_text(
+        "\n\n".join(
+            f"{index}\n00:00:{index:02d},000 --> 00:00:{index + 1:02d},000\n旧译文 {index}"
+            for index in range(1, 7)
+        )
+    )))
+    repaired = tmp_path / "clip.repaired.srt"
+    repaired.write_text(SOURCE.replace("line 4", "what was really said") + "\n", encoding="utf-8")
+
+    translate_subtitle_file(
+        input_path=repaired,
+        output_path=tmp_path / "out.srt",
+        config=make_config(),
+        previous=PreviousTranslation(source=srt, translation=previous_translation),
+    )
+
+    output = capsys.readouterr().out
+    assert "Reusing: 5 unchanged block(s)" in output
+    assert "Resuming:" not in output
+
+
+def test_carried_over_lines_are_the_context_the_new_ones_are_translated_in(
+    srt, fake_api, tmp_path
+):
+    previous_translation = tmp_path / "clip.zh.srt"
+    write_srt(previous_translation, list(parse_srt_text(
+        "\n\n".join(
+            f"{index}\n00:00:{index:02d},000 --> 00:00:{index + 1:02d},000\n旧译文 {index}"
+            for index in range(1, 7)
+        )
+    )))
+    repaired = tmp_path / "clip.repaired.srt"
+    repaired.write_text(SOURCE.replace("line 4", "what was really said") + "\n", encoding="utf-8")
+
+    translate_subtitle_file(
+        input_path=repaired,
+        output_path=tmp_path / "out.srt",
+        config=make_config(context_cues=2),
+        previous=PreviousTranslation(source=srt, translation=previous_translation),
+    )
+
+    context = [payload["context_before"] for payload in fake_api.requests]
+    assert context and context[0][-1]["translation"] == "旧译文 3"
 
 
 def test_a_batch_the_model_answers_short_is_split_instead_of_asked_again(

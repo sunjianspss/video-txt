@@ -378,8 +378,16 @@ def build_references(
     options: CloneOptions,
     cache_dir: Path,
     ffmpeg_path: str,
+    voice_track: Path | None = None,
 ) -> dict[str, Reference]:
-    """One reference clip per speaker, cut from the video unless one was supplied."""
+    """One reference clip per speaker, cut from the video unless one was supplied.
+
+    voice_track is the separated vocal stem when --separate-bgm has made one. A
+    clip cut from it carries the speaker alone; the same seconds of the original
+    mix carry whatever the score was doing under them, and the clone copies that
+    too.
+    """
+    clean = voice_track if voice_track is not None and voice_track.is_file() else None
     references: dict[str, Reference] = {}
     for speaker in wanted:
         supplied = options.references.get(speaker)
@@ -402,10 +410,15 @@ def build_references(
 
         start, end, text = window
         label = speaker or "main"
-        audio = cache_dir / REFERENCE_DIR_NAME / f"{label}-{round(start * 1000)}.wav"
-        extract_reference(video, start=start, end=end, output=audio, ffmpeg_path=ffmpeg_path)
+        # Two names, so a cache made from the mix is not mistaken for a clean one.
+        stem = f"{label}-clean" if clean is not None else label
+        audio = cache_dir / REFERENCE_DIR_NAME / f"{stem}-{round(start * 1000)}.wav"
+        extract_reference(
+            clean or video, start=start, end=end, output=audio, ffmpeg_path=ffmpeg_path
+        )
         reference_text_path(audio).write_text(text + "\n", encoding="utf-8")
-        print(f"  {label}: {end - start:.1f}s from {start:.1f}s -> {audio.name}")
+        cut_from = "separated voice" if clean is not None else "original mix"
+        print(f"  {label}: {end - start:.1f}s from {start:.1f}s of the {cut_from}")
         references[speaker] = Reference(speaker=speaker, audio=audio, text=text)
 
     return references

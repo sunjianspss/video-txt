@@ -5,7 +5,7 @@ import os
 import re
 import tempfile
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -76,6 +76,12 @@ LANGUAGES: dict[str, tuple[str, str]] = {
     "泰语": ("th", "tha"),
 }
 UNKNOWN_LANGUAGE_CODE = "und"
+
+# A bilingual cue keeps the original under the translation, quieter: small enough
+# to read second, solid enough to read at all.
+SECONDARY_SCALE = 0.72
+# ASS alpha runs &H00& opaque to &HFF& invisible.
+SECONDARY_ALPHA = "&H50&"
 
 TIMING_PATTERN = re.compile(
     r"(?P<start>\d+:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(?P<end>\d+:\d{2}:\d{2}[,.]\d{1,3})"
@@ -333,7 +339,10 @@ def build_ass_subtitle(
     font: str,
     font_size: int,
     margin_v: int,
+    secondary_lines: Sequence[int] = (),
 ) -> str:
+    """`secondary_lines` says, per cue, how many trailing lines are the quieter
+    language. Empty means every line is styled the same, which is one language."""
     alignment = 8 if layout == "top" else 2
     font_size = max(8, font_size)
     margin_v = max(0, margin_v)
@@ -341,9 +350,29 @@ def build_ass_subtitle(
     side_margin = max(20, round(video_width * 0.04))
     font = sanitize_style_value(font) or "PingFang SC"
 
+    trailing = list(secondary_lines) or [0] * len(cues)
+    if len(trailing) != len(cues):
+        raise SubtitleFormatError(
+            f"Got {len(trailing)} secondary-line counts for {len(cues)} cues."
+        )
+    secondary_size = max(8, round(font_size * SECONDARY_SCALE))
+
     events: list[str] = []
-    for cue in cues:
-        text = r"\N".join(escape_ass_text(line) for line in cue.text_lines)
+    for cue, secondary in zip(cues, trailing, strict=True):
+        # Escaped first, so the override braces added here are the only ones the
+        # renderer reads as tags. Secondary lines are always last, so the style
+        # they open runs to the end of the line and needs no reset.
+        rendered = [escape_ass_text(line) for line in cue.text_lines]
+        split = len(rendered) - secondary if secondary else len(rendered)
+        text = r"\N".join(
+            [
+                *rendered[:split],
+                *(
+                    f"{{\\fs{secondary_size}\\alpha{SECONDARY_ALPHA}}}{line}"
+                    for line in rendered[split:]
+                ),
+            ]
+        )
         if not text:
             continue
         match = TIMING_PATTERN.search(cue.timing)
@@ -387,6 +416,7 @@ def write_ass_subtitle(
     font: str,
     font_size: int,
     margin_v: int,
+    secondary_lines: Sequence[int] = (),
 ) -> Path:
     content = build_ass_subtitle(
         cues=cues,
@@ -396,6 +426,7 @@ def write_ass_subtitle(
         font=font,
         font_size=font_size,
         margin_v=margin_v,
+        secondary_lines=secondary_lines,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")

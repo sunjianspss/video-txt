@@ -49,7 +49,12 @@ from .media import (
 )
 from .mux import container_arguments, subtitle_track_arguments
 from .parallel import map_in_parallel
-from .separate import ensure_instrumental, require_demucs, separated_bgm_path
+from .separate import (
+    ensure_instrumental,
+    require_demucs,
+    separated_bgm_path,
+    separated_voice_path,
+)
 from .subtitles import SubtitleCue, language_suffix, parse_srt, write_srt
 from .timeline import (
     build_segments,
@@ -437,6 +442,7 @@ def build_voice_plan(
     speakers: dict[int, str],
     cache_dir: Path,
     ffmpeg_path: str,
+    voice_track: Path | None = None,
 ) -> VoicePlan:
     order = speaker_order(options.turns) or [DEFAULT_SPEAKER]
 
@@ -451,6 +457,7 @@ def build_voice_plan(
             options=options.clone or CloneOptions(engine=options.engine),
             cache_dir=cache_dir,
             ffmpeg_path=ffmpeg_path,
+            voice_track=voice_track,
         )
         model = resolve_model(options.clone or CloneOptions(engine=options.engine))
         choices = {
@@ -602,8 +609,11 @@ def fit_subtitle_to_timeline(
     write_srt(fitted_path, fitted_cues)
     print(f"  Wrote the fitted subtitles to: {fitted_path}")
 
+    # Only the lines that came in: rebuilding from the file would hand back the
+    # ones run_dub set aside as having nothing to say, and they would be spoken.
+    voiced = {position for position, _ in cues}
     updated = [
-        (position, cue) for position, cue in enumerate(fitted_cues, start=1) if not cue.is_empty
+        (position, cue) for position, cue in enumerate(fitted_cues, start=1) if position in voiced
     ]
     return updated, fitted_path
 
@@ -831,8 +841,31 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
         raise DubError(f"No spoken lines found in {options.subtitle_input}")
 
     speakers = assign_speakers(cues, options.turns)
+
+    # Separating before the voices are chosen, not at mux time as it used to be:
+    # the vocal stem it leaves behind is what a clone reference should be cut
+    # from, and the run pays for the separation either way. A video with nothing
+    # to separate is also worth finding out about now rather than after minutes
+    # of synthesis.
+    keep_bgm = options.keep_bgm or options.separate_bgm
+    if keep_bgm and not has_audio_stream(
+        options.video_input, ffprobe_path=find_ffprobe(ffmpeg_path)
+    ):
+        flag = "--separate-bgm" if options.separate_bgm else "--keep-bgm"
+        print(f"Source video has no audio track, so {flag} has nothing to mix.", file=sys.stderr)
+        keep_bgm = False
+    bgm_path = None
+    if options.separate_bgm and keep_bgm:
+        bgm_path = ensure_instrumental(
+            options.video_input, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
+        )
+
     plan = build_voice_plan(
-        options, speakers=speakers, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
+        options,
+        speakers=speakers,
+        cache_dir=cache_dir,
+        ffmpeg_path=ffmpeg_path,
+        voice_track=separated_voice_path(cache_dir),
     )
 
     subtitle_for_mux = options.subtitle_input
@@ -874,20 +907,6 @@ def run_dub(options: DubOptions, *, dry_run: bool = False) -> Path:
         output_path=audio_output,
     )
     report(placed, segments, respoken=respoken)
-
-    keep_bgm = options.keep_bgm or options.separate_bgm
-    if keep_bgm and not has_audio_stream(
-        options.video_input, ffprobe_path=find_ffprobe(ffmpeg_path)
-    ):
-        flag = "--separate-bgm" if options.separate_bgm else "--keep-bgm"
-        print(f"Source video has no audio track, so {flag} has nothing to mix.", file=sys.stderr)
-        keep_bgm = False
-
-    bgm_path = None
-    if options.separate_bgm and keep_bgm:
-        bgm_path = ensure_instrumental(
-            options.video_input, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
-        )
 
     print("Muxing the dubbed voice track into the video...")
     temporary_video = temporary_output_path(options.video_output)

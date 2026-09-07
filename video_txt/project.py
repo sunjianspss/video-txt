@@ -21,6 +21,7 @@ from .constants import (
 from .diarize import speakers_path
 from .dub import default_audio_output, default_cache_dir, default_dubbed_output
 from .mux import default_video_output
+from .revise import revised_subtitle_path
 from .subtitles import translated_subtitle_path
 from .terminology import load_terminology, translation_audit_path_for
 
@@ -58,12 +59,18 @@ class ProjectInspection:
         return any(self.statuses[name].stale for name in self.enabled)
 
 
-STAGE_ORDER = ("transcribe", "translate", "mux", "tts")
+STAGE_ORDER = ("transcribe", "translate", "revise", "mux", "tts")
+# `revise` sits between the translation and everything that consumes it. Editing
+# the revision file has to reach the finished video, but it must never reach the
+# translation: retranslating a whole film to restore one hand-corrected line is
+# exactly the cost this stage exists to avoid. So the revision fingerprint lives
+# here, and mux/tts go stale through the graph rather than through translate.
 STAGE_DEPENDENCIES = {
     "transcribe": (),
     "translate": ("transcribe",),
-    "mux": ("translate",),
-    "tts": ("translate",),
+    "revise": ("translate",),
+    "mux": ("translate", "revise"),
+    "tts": ("translate", "revise"),
 }
 
 
@@ -186,6 +193,7 @@ def create_project_config(
     video: Path,
     args: Any,
     term_file: Path | None,
+    revisions_file: Path | None,
     subtitle: Path | None,
 ) -> dict[str, object]:
     base = project_path.parent.resolve()
@@ -220,6 +228,9 @@ def create_project_config(
     translation_model = args.model or provider.get("model")
     loaded_terminology = load_terminology(term_file) if term_file is not None else None
     terminology = _path_record(term_file, base=base) if term_file is not None else None
+    revisions = (
+        _path_record(revisions_file, base=base) if revisions_file is not None else None
+    )
     translation_debug = (
         resolve_output_path(args.debug_dir, base=base, default=base)
         if args.debug_dir is not None
@@ -234,6 +245,9 @@ def create_project_config(
         "paths": {
             "source_subtitle": relative_path(source_subtitle, base=base),
             "translated_subtitle": relative_path(translated_subtitle, base=base),
+            "revised_subtitle": relative_path(
+                revised_subtitle_path(translated_subtitle), base=base
+            ),
             "translation_audit": relative_path(
                 translation_audit_path_for(translated_subtitle), base=base
             ),
@@ -291,6 +305,7 @@ def create_project_config(
             "note": args.note,
             "preserve_terms": list(dict.fromkeys([*DEFAULT_TERMS, *args.preserve_term])),
             "terminology": terminology,
+            "revisions": revisions,
         },
         "mux": {
             "mode": args.mux_mode,
@@ -447,12 +462,16 @@ def resolve_project_paths(
     }
     paths["video"] = _project_relative_path(base, video.get("path"), field="video.path")
     translation = _required_mapping(config, "translation")
-    terminology = translation.get("terminology")
-    if terminology is not None:
-        if not isinstance(terminology, Mapping):
-            raise ProjectError("Project field 'translation.terminology' must be an object or null.")
-        paths["terminology"] = _project_relative_path(
-            base, terminology.get("path"), field="translation.terminology.path"
+    for field, key in (("terminology", "terminology"), ("revisions", "revisions")):
+        declared_file = translation.get(field)
+        if declared_file is None:
+            continue
+        if not isinstance(declared_file, Mapping):
+            raise ProjectError(
+                f"Project field 'translation.{field}' must be an object or null."
+            )
+        paths[key] = _project_relative_path(
+            base, declared_file.get("path"), field=f"translation.{field}.path"
         )
     return paths
 
@@ -473,11 +492,23 @@ def inspect_project(project_path: Path) -> ProjectInspection:
     speakers = dict(_required_mapping(config, "speakers"))
     voice_clone = dict(_required_mapping(config, "voice_clone"))
     translation.pop("terminology", None)
+    # Not part of the translation settings: what the model is asked for does not
+    # change when a hand-corrected line does.
+    translation.pop("revisions", None)
+
+    workflow = config["workflow"]
+    enabled = {"translate", "mux"} if workflow == "run" else {"translate", "tts"}
+    if transcription.get("enabled", True):
+        enabled.add("transcribe")
+    if "revisions" in paths:
+        enabled.add("revise")
 
     video_sha = _optional_sha256(paths["video"])
     source_sha = _optional_sha256(paths.get("source_subtitle"))
     translation_sha = _optional_sha256(paths.get("translated_subtitle"))
     term_sha = _optional_sha256(paths.get("terminology"))
+    revisions_sha = _optional_sha256(paths.get("revisions"))
+    revised_subtitle = paths.get("revised_subtitle", Path())
     desired = {
         "transcribe": {
             "video_sha256": video_sha,
@@ -490,6 +521,11 @@ def inspect_project(project_path: Path) -> ProjectInspection:
             "output_path": str(paths["translated_subtitle"]),
             "audit_path": str(paths["translation_audit"]),
             "settings": translation,
+        },
+        "revise": {
+            "translation_sha256": translation_sha,
+            "revisions_sha256": revisions_sha,
+            "output_path": str(revised_subtitle),
         },
         "mux": {
             "video_sha256": video_sha,
@@ -507,12 +543,9 @@ def inspect_project(project_path: Path) -> ProjectInspection:
             "settings": {"tts": tts, "speakers": speakers, "voice_clone": voice_clone},
         },
     }
-    workflow = config["workflow"]
-    enabled = {"translate", "mux"} if workflow == "run" else {"translate", "tts"}
-    if transcription.get("enabled", True):
-        enabled.add("transcribe")
     artifacts = {
         "transcribe": paths.get("source_subtitle", Path()).is_file(),
+        "revise": revised_subtitle.is_file(),
         "translate": (
             paths.get("translated_subtitle", Path()).is_file()
             and paths.get("translation_audit", Path()).is_file()
@@ -558,6 +591,7 @@ def build_project_state(
             inspection.paths.get("translated_subtitle"),
             inspection.paths.get("translation_audit"),
         ],
+        "revise": [inspection.paths.get("revised_subtitle")],
         "mux": [inspection.paths.get("video_output")],
         "tts": [inspection.paths.get("video_output")],
     }
@@ -600,6 +634,7 @@ def untracked_project_outputs(inspection: ProjectInspection) -> list[Path]:
     recorded_stages = recorded if isinstance(recorded, Mapping) else {}
     candidates = {
         "transcribe": (inspection.paths["source_subtitle"],),
+        "revise": (inspection.paths.get("revised_subtitle"),),
         "translate": (
             inspection.paths["translated_subtitle"],
             inspection.paths["translation_audit"],
@@ -612,7 +647,7 @@ def untracked_project_outputs(inspection: ProjectInspection) -> list[Path]:
         for name in inspection.enabled
         if inspection.statuses[name].stale and name not in recorded_stages
         for path in candidates[name]
-        if path.exists()
+        if path is not None and path.exists()
     ]
 
 
@@ -693,6 +728,8 @@ def project_legacy_argv(inspection: ProjectInspection, *, dry_run: bool) -> list
         arguments.append("--no-resume")
     if "terminology" in inspection.paths:
         arguments.extend(["--term-file", str(inspection.paths["terminology"])])
+    if "revisions" in inspection.paths:
+        arguments.extend(["--revisions", str(inspection.paths["revisions"])])
     translation_debug = inspection.paths.get("translation_debug")
     if translation_debug is not None:
         arguments.extend(["--translation-debug-dir", str(translation_debug)])
