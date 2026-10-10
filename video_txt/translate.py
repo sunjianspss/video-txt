@@ -395,13 +395,19 @@ def write_raw_response_debug(
 
 
 def loaded_local_model(base_url: str, *, timeout: float = 10.0) -> str:
-    """The chat model LM Studio currently has in memory.
+    """The chat model LM Studio will answer with.
 
     Local models are named after the file they were downloaded as, which nobody
     wants to retype, so ask the server instead. This uses LM Studio's own model
     listing rather than the OpenAI-compatible one: that one also lists models
     that are merely downloaded, and embedding models among them, so its first
     entry is often something that cannot translate a word.
+
+    A loaded chat model wins. With none loaded — LM Studio unloads idle models
+    when a JIT TTL is set — the one downloaded chat model is just as good: the
+    first request loads it (a few seconds), and the 500s that LM Studio hands the
+    requests racing that load are retried like any other 5xx. Several downloaded
+    and none loaded is a guess we do not make.
     """
     host = base_url.rstrip("/").removesuffix("/v1")
     url = host + "/api/v0/models"
@@ -411,16 +417,28 @@ def loaded_local_model(base_url: str, *, timeout: float = 10.0) -> str:
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise TranslationError(f"Could not ask {url} which model is loaded: {exc}") from exc
 
-    loaded = [
-        entry.get("id")
+    chat = [
+        entry
         for entry in payload.get("data") or []
-        if entry.get("id")
-        and entry.get("state") == "loaded"
-        and entry.get("type") in {"llm", "vlm"}
+        if entry.get("id") and entry.get("type") in {"llm", "vlm"}
     ]
-    if not loaded:
-        raise TranslationError(f"{host} has no chat model loaded.")
-    return loaded[0]
+    loaded = [entry["id"] for entry in chat if entry.get("state") == "loaded"]
+    if loaded:
+        return loaded[0]
+    downloaded = [entry["id"] for entry in chat]
+    if len(downloaded) == 1:
+        print(
+            f"No chat model loaded; {downloaded[0]} is the only one downloaded, "
+            "LM Studio will load it on the first request.",
+            file=sys.stderr,
+        )
+        return downloaded[0]
+    if downloaded:
+        raise TranslationError(
+            f"{host} has no chat model loaded and several downloaded "
+            f"({', '.join(downloaded)}); pass --model to pick one."
+        )
+    raise TranslationError(f"{host} has no chat model loaded or downloaded.")
 
 
 def post_chat_completion(

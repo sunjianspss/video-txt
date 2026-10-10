@@ -71,7 +71,9 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
    ```bash
    uv run python -c "from video_txt.translate import loaded_local_model; print(loaded_local_model('http://localhost:1234/v1'))"
    ```
-   报错就告诉用户去 LM Studio 加载模型、打开本地服务器，别硬跑。
+   打印出模型名就可以开跑——模型被 LM Studio 闲置卸载了也没关系：只下载了一个对话模型时会用它，第一个请求
+   让 LM Studio 自动载入（几秒），载入期间并发请求收到的 500 会自动重试。报错才停下：连不上就告诉用户打开
+   LM Studio 的本地服务器；报「several downloaded」就问用户用哪个，加 `--model`。别硬跑。
 2. **源语言要不要钉死**——片头是音乐/静音/夹英文时 Whisper 会认错语种，整片跑偏。电影一律显式 `--language ja|en|ko|fr...`，并加 `--whisper-arg=--condition_on_previous_text --whisper-arg=False` 防重复循环。看不出来就问用户源语言是什么。
 3. **源文件是 `.mkv` 电影吗**——是就**默认只出外挂 `.zh.srt`，既不烧硬字幕也不做软封装**，原片一个字节都不碰，画质无损。走上表"只要中文字幕文件"那一行，跑完告诉用户把 `.zh.srt` 拖进 IINA / VLC 即可。
    硬字幕要把整部片重编码（4K 一个多小时、画质有损），软封装虽是流拷贝无损，但要多占一份视频的空间——两者都只在**用户明确说要成片、要单文件、要发给别人**时才做，做之前把代价说清楚。

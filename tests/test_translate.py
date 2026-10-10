@@ -403,10 +403,39 @@ def test_loaded_local_model_skips_embeddings_and_unloaded_models(monkeypatch):
     assert seen == ["http://localhost:1234/api/v0/models"]
 
 
-def test_loaded_local_model_reports_an_idle_server(monkeypatch):
-    fake_model_listing(monkeypatch, [{"id": "qwen3-8b", "type": "llm", "state": "not-loaded"}])
+def test_loaded_local_model_falls_back_to_the_only_downloaded_chat_model(monkeypatch, capsys):
+    # LM Studio unloaded it after its idle TTL; the first request loads it again.
+    fake_model_listing(
+        monkeypatch,
+        [
+            {"id": "text-embedding-qwen3", "type": "embeddings", "state": "loaded"},
+            {"id": "qwen/qwen3.5-35b-a3b", "type": "vlm", "state": "not-loaded"},
+        ],
+    )
 
-    with pytest.raises(TranslationError, match="no chat model loaded"):
+    assert loaded_local_model("http://localhost:1234/v1") == "qwen/qwen3.5-35b-a3b"
+    assert "will load it on the first request" in capsys.readouterr().err
+
+
+def test_loaded_local_model_will_not_guess_between_downloaded_models(monkeypatch):
+    fake_model_listing(
+        monkeypatch,
+        [
+            {"id": "qwen3-8b", "type": "llm", "state": "not-loaded"},
+            {"id": "qwen3-30b", "type": "llm", "state": "not-loaded"},
+        ],
+    )
+
+    with pytest.raises(TranslationError, match="several downloaded.*qwen3-8b, qwen3-30b"):
+        loaded_local_model("http://localhost:1234/v1")
+
+
+def test_loaded_local_model_reports_a_server_without_chat_models(monkeypatch):
+    fake_model_listing(
+        monkeypatch, [{"id": "text-embedding-nomic", "type": "embeddings", "state": "loaded"}]
+    )
+
+    with pytest.raises(TranslationError, match="no chat model loaded or downloaded"):
         loaded_local_model("http://localhost:1234/v1")
 
 
