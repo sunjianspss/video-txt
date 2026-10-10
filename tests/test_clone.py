@@ -156,6 +156,62 @@ def test_references_are_cut_once_per_speaker_and_kept_beside_their_transcript(
     assert transcript.read_text(encoding="utf-8").strip() == "Thanks for having me."
 
 
+def test_a_reference_is_cut_from_the_separated_voice_when_there_is_one(tmp_path, monkeypatch):
+    """The same seconds of the mix carry the score, and the clone would copy that too."""
+    cut: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        cut.append(command)
+        Path(command[-1]).write_bytes(b"RIFF")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(clone_module.subprocess, "run", fake_run)
+    voice_track = tmp_path / "cache" / "bgm" / "vocals.flac"
+    voice_track.parent.mkdir(parents=True)
+    voice_track.write_bytes(b"flac")
+
+    references = build_references(
+        tmp_path / "clip.mp4",
+        cues=numbered(INTERVIEW),
+        speakers=SPEAKERS,
+        wanted=["SPEAKER_01"],
+        options=CloneOptions(engine="f5-tts"),
+        cache_dir=tmp_path / "cache",
+        ffmpeg_path="ffmpeg",
+        voice_track=voice_track,
+    )
+
+    assert cut[0][cut[0].index("-i") + 1] == str(voice_track)
+    # Named apart, so a clip cut from the mix is never served as a clean one.
+    assert references["SPEAKER_01"].audio.name == "SPEAKER_01-clean-8000.wav"
+
+
+def test_a_missing_voice_stem_falls_back_to_the_video(tmp_path, monkeypatch):
+    cut: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        cut.append(command)
+        Path(command[-1]).write_bytes(b"RIFF")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(clone_module.subprocess, "run", fake_run)
+    video = tmp_path / "clip.mp4"
+
+    references = build_references(
+        video,
+        cues=numbered(INTERVIEW),
+        speakers=SPEAKERS,
+        wanted=["SPEAKER_01"],
+        options=CloneOptions(engine="f5-tts"),
+        cache_dir=tmp_path / "cache",
+        ffmpeg_path="ffmpeg",
+        voice_track=tmp_path / "cache" / "bgm" / "vocals.flac",
+    )
+
+    assert cut[0][cut[0].index("-i") + 1] == str(video)
+    assert references["SPEAKER_01"].audio.name == "SPEAKER_01-8000.wav"
+
+
 def test_a_supplied_clip_is_used_as_is_along_with_the_text_beside_it(tmp_path, monkeypatch):
     monkeypatch.setattr(
         clone_module.subprocess,

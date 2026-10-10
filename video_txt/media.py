@@ -375,6 +375,29 @@ def probe_video_size(video_path: Path, *, ffmpeg_path: str | None = None) -> tup
     return int(match.group(1)), int(match.group(2))
 
 
+def probe_sample_rate(
+    media_path: Path, *, ffmpeg_path: str | None = None, ffprobe_path: str | None = None
+) -> int | None:
+    """The first audio stream's sample rate, or None when it cannot be read."""
+    resolved = ffprobe_path or find_ffprobe(ffmpeg_path)
+    try:
+        output = run_ffprobe(
+            resolved,
+            [
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=sample_rate",
+                "-of",
+                "default=nw=1:nk=1",
+                str(media_path),
+            ],
+        )
+        return int(output.splitlines()[0])
+    except (ProbeError, ValueError, IndexError):
+        return None
+
+
 def probe_duration(
     media_path: Path, *, ffmpeg_path: str | None = None, ffprobe_path: str | None = None
 ) -> float:

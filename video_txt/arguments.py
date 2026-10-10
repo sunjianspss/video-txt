@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from .bilingual import DEFAULT_ORDER, ORDERS
 from .constants import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_BATCH_CHARS,
@@ -19,9 +20,19 @@ from .diarize import (
 from .diarize import (
     DEFAULT_TOKEN_ENV,
 )
+from .draft import DEFAULT_MAX_TERMS, DEFAULT_MIN_COUNT
 from .dub import ENGINES
 from .env import DEFAULT_SECRETS_FILE
+from .music import (
+    DEFAULT_FORMAT,
+    FORMATS,
+    MIN_MUSICALITY,
+    MIN_PIECE_SECONDS,
+    MUSIC_FLOOR_LUFS,
+    VOICE_FLOOR_LUFS,
+)
 from .mux import HARD_LAYOUTS
+from .separate import STEM_MODELS
 from .timeline import VOICE_UNITS
 from .transcribe import BACKENDS, OUTPUT_FORMATS
 from .voices import DEFAULT_VOICE
@@ -170,6 +181,20 @@ def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: st
         type=Path,
         help="Directory for invalid API response debug files.",
     )
+    group.add_argument(
+        "--reuse",
+        type=Path,
+        metavar="PREVIOUS_SRT",
+        help=(
+            "Previous source .srt this one was repaired from. Lines that read the same keep "
+            "their translation and are not sent to the model again."
+        ),
+    )
+    group.add_argument(
+        "--reuse-translation",
+        type=Path,
+        help="Translation of --reuse. Defaults to '<previous>.<target language>.srt' beside it.",
+    )
     group.add_argument("--note", help="Extra translation note, for example 'keep a casual tone'.")
     group.add_argument(
         "--preserve-term",
@@ -183,6 +208,23 @@ def add_translation_arguments(parser: argparse.ArgumentParser, *, debug_flag: st
         help=(
             "Project terminology JSON containing approved source-to-target mappings. "
             "The same file is used for prompting, exact normalization and translation audit."
+        ),
+    )
+
+
+def add_revision_argument(parser: argparse.ArgumentParser) -> None:
+    """Hand-corrected lines, restored after every translation.
+
+    Not part of add_translation_arguments: `project init` builds its own record
+    of every stage, and a flag it accepted but did not write down would be lost
+    without a word.
+    """
+    parser.add_argument(
+        "--revisions",
+        type=Path,
+        help=(
+            "Revision JSON of hand-corrected lines. Reapplied after translating, so a "
+            "retranslation never loses them. Anchored on the source text, not cue numbers."
         ),
     )
 
@@ -607,9 +649,205 @@ def build_audit_command(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_bilingual_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--bilingual",
+        action="store_true",
+        help=(
+            "Keep the original under the translation. Burned in, the original is "
+            "smaller and dimmer than the line above it."
+        ),
+    )
+    parser.add_argument(
+        "--bilingual-order",
+        choices=ORDERS,
+        default=DEFAULT_ORDER,
+        help=f"Which language reads first. Defaults to {DEFAULT_ORDER}.",
+    )
+
+
+def build_music_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("media", type=Path, help="Video or audio file to take the music from.")
+    parser.add_argument(
+        "-o",
+        "--output-dir",
+        type=Path,
+        help="Where the music files go. Defaults to '<media>.music' beside the media.",
+    )
+    parser.add_argument(
+        "--subtitle",
+        type=Path,
+        help=(
+            "Source subtitle. Lines marked with a musical note name the songs, which the "
+            "audio alone cannot tell from dialogue. Optional."
+        ),
+    )
+    parser.add_argument("--from", dest="from_time", help="Extract one range instead of searching.")
+    parser.add_argument("--to", dest="to_time", help="End of that range, as HH:MM:SS.")
+    parser.add_argument(
+        "--source",
+        choices=("instrumental", "mix"),
+        default="instrumental",
+        help=(
+            "What a named range is cut from. instrumental has the dialogue removed; "
+            "mix is the soundtrack as it is, which is what a song needs."
+        ),
+    )
+    parser.add_argument(
+        "--min-musicality",
+        type=float,
+        default=MIN_MUSICALITY,
+        help=(
+            "How much of a piece must have two pitched instruments sounding together "
+            f"before it counts as music. Defaults to {MIN_MUSICALITY:g}. Without this a "
+            "film's footsteps, traffic and room tone all come back as music. 0 keeps "
+            "everything the loudness found and skips separating the stems."
+        ),
+    )
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help=(
+            "Keep only the stretches nobody talks over. Separation leaves its worst "
+            "artefacts where the dialogue was loudest."
+        ),
+    )
+    parser.add_argument(
+        "--min-duration",
+        type=float,
+        default=MIN_PIECE_SECONDS,
+        help=f"Shortest piece worth writing out. Defaults to {MIN_PIECE_SECONDS:g} seconds.",
+    )
+    parser.add_argument(
+        "--music-floor",
+        type=float,
+        default=MUSIC_FLOOR_LUFS,
+        help=f"Loudness above which music counts as playing. Defaults to {MUSIC_FLOOR_LUFS:g}.",
+    )
+    parser.add_argument(
+        "--voice-floor",
+        type=float,
+        default=VOICE_FLOOR_LUFS,
+        help=f"Loudness above which a voice counts as audible. Defaults to {VOICE_FLOOR_LUFS:g}.",
+    )
+    parser.add_argument(
+        "--stems",
+        action="store_true",
+        help="Also separate and keep every stem the model produces.",
+    )
+    parser.add_argument(
+        "--model",
+        choices=sorted(STEM_MODELS),
+        default="htdemucs_6s",
+        help=(
+            "Separation model. Defaults to htdemucs_6s, which is the one that pulls "
+            "guitar and piano out on their own -- the music test needs them."
+        ),
+    )
+    parser.add_argument(
+        "--format",
+        dest="audio_format",
+        choices=sorted(FORMATS),
+        default=DEFAULT_FORMAT,
+        help=(
+            f"Audio format for each piece. Defaults to {DEFAULT_FORMAT}, which keeps the "
+            "separated audio exactly as it came out; m4a and mp3 are far smaller and play "
+            "anywhere; alac is lossless in a container Apple Music will import."
+        ),
+    )
+    parser.add_argument(
+        "--raw-levels",
+        action="store_true",
+        help="Keep each piece at its original level instead of normalizing it for playback.",
+    )
+    parser.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="Where the separated audio is cached. Defaults to '<media>.dub-cache'.",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace music files already written."
+    )
+    add_dry_run(parser, "Report the pieces that were found without writing any audio.")
+
+
+def build_bilingual_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("source", type=Path, help="Path to the source-language .srt file.")
+    parser.add_argument("translation", type=Path, help="Path to the translated .srt file.")
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Bilingual .srt path. Defaults to '<translation>.bilingual.srt'.",
+    )
+    parser.add_argument(
+        "--order",
+        choices=ORDERS,
+        default=DEFAULT_ORDER,
+        help=f"Which language reads first. Defaults to {DEFAULT_ORDER}.",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing bilingual subtitle."
+    )
+
+
+def build_draft_terms_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "subtitles",
+        type=Path,
+        nargs="+",
+        help="Source-language .srt files to scan. Pass a whole season at once.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="Draft terminology JSON to write. Every 'target' comes back blank.",
+    )
+    parser.add_argument(
+        "--against",
+        type=Path,
+        metavar="TERMS_JSON",
+        help=(
+            "Glossary already in use. Names it covers are left out, and a new name that "
+            "shares a word with one of its entries is flagged as at risk of being pulled in."
+        ),
+    )
+    parser.add_argument(
+        "--min-count",
+        type=int,
+        default=DEFAULT_MIN_COUNT,
+        help=f"How often a name must appear to be proposed. Defaults to {DEFAULT_MIN_COUNT}.",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_MAX_TERMS,
+        help=f"Most candidates to propose. Defaults to {DEFAULT_MAX_TERMS}.",
+    )
+    parser.add_argument("--source-language", help="Written into the draft, for example en.")
+    parser.add_argument(
+        "--target-language",
+        default=DEFAULT_TARGET_LANGUAGE,
+        help=f"Written into the draft. Defaults to {DEFAULT_TARGET_LANGUAGE}.",
+    )
+    parser.add_argument(
+        "--overwrite", action="store_true", help="Replace an existing draft file."
+    )
+
+
 def build_translation_audit_command(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("source", type=Path, help="Path to the source-language .srt file.")
     parser.add_argument("translation", type=Path, help="Path to the translated .srt file.")
+    parser.add_argument(
+        "--revisions",
+        type=Path,
+        help=(
+            "Revision JSON naming the hand-finalized lines. Findings on those lines are "
+            "reported but no longer counted against the file."
+        ),
+    )
     parser.add_argument(
         "--term-file",
         type=Path,
@@ -649,6 +887,34 @@ def build_clean_command(parser: argparse.ArgumentParser) -> None:
     add_dry_run(parser, "Show the safe repairs without writing output files.")
 
 
+def build_revise_command(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("source", type=Path, help="Path to the source-language .srt file.")
+    parser.add_argument("translation", type=Path, help="Path to the translated .srt to correct.")
+    parser.add_argument(
+        "--revisions",
+        type=Path,
+        required=True,
+        help="Revision JSON holding hand-corrected lines and the source lines they belong to.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="Corrected .srt path. Defaults to '<translation>.revised.srt'.",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help="JSON report path. Defaults to '<output>.revision-report.json'.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite generated output and report files, never an input subtitle.",
+    )
+    add_dry_run(parser, "Show which cue each revision lands on without writing files.")
+
+
 def build_translate_command(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("input", type=Path, help="Path to the source .srt file.")
     parser.add_argument(
@@ -682,6 +948,8 @@ def build_mux_command(parser: argparse.ArgumentParser) -> None:
     )
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
     add_mux_arguments(parser)
+    add_revision_argument(parser)
+    add_bilingual_arguments(parser)
     add_dry_run(parser, "Print the translation plan and ffmpeg command without running them.")
 
 
@@ -692,6 +960,8 @@ def build_run_command(parser: argparse.ArgumentParser) -> None:
     add_transcribe_arguments(parser, standalone=False)
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
     add_mux_arguments(parser)
+    add_revision_argument(parser)
+    add_bilingual_arguments(parser)
     add_dry_run(
         parser, "Print every stage's plan without transcribing, calling the API or running ffmpeg."
     )
@@ -706,6 +976,7 @@ def build_dub_command(parser: argparse.ArgumentParser) -> None:
     add_clone_arguments(parser)
     add_transcribe_arguments(parser, standalone=False)
     add_translation_arguments(parser, debug_flag="--translation-debug-dir")
+    add_revision_argument(parser)
     add_dry_run(parser, "Print every stage's plan without synthesizing speech or running ffmpeg.")
 
 
@@ -730,6 +1001,7 @@ def build_project_command(parser: argparse.ArgumentParser) -> None:
     )
     add_transcribe_arguments(init, standalone=False)
     add_translation_arguments(init, debug_flag="--translation-debug-dir")
+    add_revision_argument(init)
     add_mux_arguments(init)
     add_voice_arguments(init, include_shared_arguments=False)
     add_speaker_arguments(init)

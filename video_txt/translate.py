@@ -21,6 +21,7 @@ from .constants import (
     DEFAULT_TIMEOUT,
 )
 from .parallel import map_in_parallel
+from .reuse import PreviousTranslation, plan_reuse
 from .subtitles import SubtitleCue, chunk_cues, parse_srt, serialize_srt, write_srt
 from .terminology import (
     Terminology,
@@ -394,13 +395,19 @@ def write_raw_response_debug(
 
 
 def loaded_local_model(base_url: str, *, timeout: float = 10.0) -> str:
-    """The chat model LM Studio currently has in memory.
+    """The chat model LM Studio will answer with.
 
     Local models are named after the file they were downloaded as, which nobody
     wants to retype, so ask the server instead. This uses LM Studio's own model
     listing rather than the OpenAI-compatible one: that one also lists models
     that are merely downloaded, and embedding models among them, so its first
     entry is often something that cannot translate a word.
+
+    A loaded chat model wins. With none loaded — LM Studio unloads idle models
+    when a JIT TTL is set — the one downloaded chat model is just as good: the
+    first request loads it (a few seconds), and the 500s that LM Studio hands the
+    requests racing that load are retried like any other 5xx. Several downloaded
+    and none loaded is a guess we do not make.
     """
     host = base_url.rstrip("/").removesuffix("/v1")
     url = host + "/api/v0/models"
@@ -410,16 +417,28 @@ def loaded_local_model(base_url: str, *, timeout: float = 10.0) -> str:
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
         raise TranslationError(f"Could not ask {url} which model is loaded: {exc}") from exc
 
-    loaded = [
-        entry.get("id")
+    chat = [
+        entry
         for entry in payload.get("data") or []
-        if entry.get("id")
-        and entry.get("state") == "loaded"
-        and entry.get("type") in {"llm", "vlm"}
+        if entry.get("id") and entry.get("type") in {"llm", "vlm"}
     ]
-    if not loaded:
-        raise TranslationError(f"{host} has no chat model loaded.")
-    return loaded[0]
+    loaded = [entry["id"] for entry in chat if entry.get("state") == "loaded"]
+    if loaded:
+        return loaded[0]
+    downloaded = [entry["id"] for entry in chat]
+    if len(downloaded) == 1:
+        print(
+            f"No chat model loaded; {downloaded[0]} is the only one downloaded, "
+            "LM Studio will load it on the first request.",
+            file=sys.stderr,
+        )
+        return downloaded[0]
+    if downloaded:
+        raise TranslationError(
+            f"{host} has no chat model loaded and several downloaded "
+            f"({', '.join(downloaded)}); pass --model to pick one."
+        )
+    raise TranslationError(f"{host} has no chat model loaded or downloaded.")
 
 
 def post_chat_completion(
@@ -621,17 +640,24 @@ def translate_cues(
     *,
     debug_dir: Path | None = None,
     partial_store: PartialStore | None = None,
+    reused: dict[str, str] | None = None,
 ) -> list[SubtitleCue]:
     pending = [
         (str(position), cue) for position, cue in enumerate(cues, start=1) if not cue.is_empty
     ]
     translations: dict[str, str] = {}
 
+    # Lines an earlier translation already covers. They also give the batches
+    # around them their context, the same way finished batches do.
+    if reused:
+        translations.update(reused)
+
     if partial_store is not None:
-        translations.update(partial_store.load())
-        reused = sum(1 for cue_id, _ in pending if cue_id in translations)
-        if reused:
-            print(f"Resuming: {reused}/{len(pending)} subtitle blocks already translated.")
+        stored = partial_store.load()
+        translations.update(stored)
+        resumed = sum(1 for cue_id, _ in pending if cue_id in stored)
+        if resumed:
+            print(f"Resuming: {resumed}/{len(pending)} subtitle blocks already translated.")
 
     todo = [(cue_id, cue) for cue_id, cue in pending if cue_id not in translations]
     if not todo:
@@ -697,16 +723,29 @@ def translate_subtitle_file(
     resume: bool = True,
     dry_run: bool = False,
     overwrite_audit: bool = False,
+    previous: PreviousTranslation | None = None,
 ) -> Path:
     cues = parse_srt(input_path)
     translatable = [cue for cue in cues if not cue.is_empty]
-    batches = chunk_cues(translatable, config.batch_chars)
+    plan = plan_reuse(cues, previous) if previous is not None else None
+    reused = plan.by_position if plan is not None else {}
+    outstanding = [
+        cue
+        for position, cue in enumerate(cues, start=1)
+        if not cue.is_empty and str(position) not in reused
+    ]
+    batches = chunk_cues(outstanding, config.batch_chars)
 
     print(f"Input: {input_path}")
     print(f"Output: {output_path}")
     print(f"Target language: {config.target_language}")
     print(f"Model: {config.model}")
     print(f"Subtitle blocks: {len(cues)} ({len(translatable)} with text)")
+    if plan is not None:
+        print(
+            f"Reusing: {plan.reused} unchanged block(s) from {plan.previous.translation}, "
+            f"{plan.fresh} left to translate"
+        )
     print(f"Batches: {len(batches)} (about {config.batch_chars} chars each)")
     print(f"Concurrency: {max(1, config.concurrency)}")
     if config.reasoning_effort and config.reasoning_effort != "auto":
@@ -734,6 +773,7 @@ def translate_subtitle_file(
         config,
         debug_dir=debug_dir or auto_debug_dir,
         partial_store=store,
+        reused=reused,
     )
     enforcement = (
         enforce_terminology(cues, translated, config.terminology)

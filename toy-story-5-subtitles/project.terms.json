@@ -1,0 +1,71 @@
+{
+  "schema": "video-txt.terminology",
+  "version": 1,
+  "source_language": "en",
+  "target_language": "zh-CN",
+  "terms": [
+    {
+      "source": "Buzz Lightyear",
+      "target": "巴斯光年",
+      "match": "phrase"
+    },
+    {
+      "source": "Jordan twins",
+      "target": "乔丹双胞胎",
+      "match": "phrase",
+      "aliases": ["乔丹家的双胞胎"]
+    },
+    {
+      "source": "Lily Pat",
+      "target": "莉莉板",
+      "match": "phrase",
+      "aliases": ["睡莲叶"]
+    },
+    {
+      "source": "Lilypan",
+      "target": "莉莉板",
+      "match": "word",
+      "aliases": ["睡莲叶"]
+    },
+    {
+      "source": "Bullseye",
+      "target": "红心",
+      "match": "word",
+      "aliases": ["靶眼"]
+    },
+    {
+      "source": "Woody",
+      "target": "胡迪",
+      "match": "word",
+      "aliases": ["伍迪", "乌迪"]
+    },
+    {
+      "source": "Jessie",
+      "target": "翠丝",
+      "match": "word",
+      "aliases": ["杰西"]
+    },
+    {
+      "source": "Blaze",
+      "target": "布蕾兹",
+      "match": "word",
+      "aliases": ["布莱兹", "布雷兹", "烈焰"]
+    },
+    {
+      "source": "Monty",
+      "target": "蒙蒂",
+      "match": "word"
+    },
+    {
+      "source": "Bonnie",
+      "target": "邦妮",
+      "match": "word"
+    },
+    {
+      "source": "Buzz",
+      "target": "巴斯",
+      "match": "word",
+      "aliases": ["巴兹"]
+    }
+  ]
+}

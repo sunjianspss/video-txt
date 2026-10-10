@@ -711,6 +711,62 @@ def test_translate_dry_run_reports_the_plan(project, capsys):
     assert not (subtitle.parent / "clip.zh.srt").exists()
 
 
+def test_translate_finds_the_previous_translation_beside_the_previous_source(project, capsys):
+    _, subtitle = project
+    repaired = subtitle.with_name("clip.repaired.srt")
+    repaired.write_text(SAMPLE.replace("Bye", "Goodbye now"), encoding="utf-8")
+    subtitle.with_name("clip.zh.srt").write_text(
+        SAMPLE.replace("Hello there", "你好").replace("Bye", "再见"), encoding="utf-8"
+    )
+
+    assert (
+        main(
+            [
+                "translate",
+                str(repaired),
+                "--reuse",
+                str(subtitle),
+                "--provider",
+                "deepseek",
+                "--dry-run",
+            ]
+        )
+        == 0
+    )
+
+    out = capsys.readouterr().out
+    assert "Reusing: 1 unchanged block(s)" in out
+    assert "1 left to translate" in out
+
+
+def test_translate_says_where_it_looked_for_the_previous_translation(project, capsys):
+    _, subtitle = project
+    repaired = subtitle.with_name("clip.repaired.srt")
+    repaired.write_text(SAMPLE, encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        main(["translate", str(repaired), "--reuse", str(subtitle), "--provider", "deepseek"])
+
+    assert "clip.zh.srt" in capsys.readouterr().err
+
+
+def test_a_previous_translation_without_a_previous_source_is_refused(project, capsys):
+    _, subtitle = project
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "translate",
+                str(subtitle),
+                "--reuse-translation",
+                str(subtitle),
+                "--provider",
+                "deepseek",
+            ]
+        )
+
+    assert "--reuse-translation needs --reuse" in capsys.readouterr().err
+
+
 def test_translate_refuses_to_clobber_an_existing_file(project):
     _, subtitle = project
     (subtitle.parent / "clip.zh.srt").write_text(SAMPLE, encoding="utf-8")

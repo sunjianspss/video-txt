@@ -59,6 +59,9 @@ class MuxOptions:
     crf: int = 20
     preset: str = "medium"
     video_size: tuple[int, int] | None = None
+    # The subtitle carries both languages, so its second line is the original
+    # and gets burned in smaller and quieter than the translation above it.
+    bilingual: bool = False
     ffmpeg_path: str | None = None
 
 
@@ -145,15 +148,22 @@ def prepare_styled_subtitle(
     print(
         f"Subtitle style: {options.font} {font_size}px, margin {margin_v}px, video {width}x{height}"
     )
+    styled = cues if cues is not None else parse_srt(options.subtitle_input)
+    # A bilingual cue is exactly [translation, original], so the trailing line is
+    # the quieter one wherever there are two.
+    secondary = (
+        [1 if len(cue.text_lines) == 2 else 0 for cue in styled] if options.bilingual else []
+    )
     return write_ass_subtitle(
         output_path or styled_subtitle_path(options.subtitle_input, options.hard_layout),
-        cues=cues if cues is not None else parse_srt(options.subtitle_input),
+        cues=styled,
         video_width=width,
         video_height=height,
         layout=options.hard_layout,
         font=options.font,
         font_size=font_size,
         margin_v=margin_v,
+        secondary_lines=secondary,
     )
 
 
