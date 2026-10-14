@@ -426,6 +426,9 @@ def repair_transcript(
                 last_kept_source_position = position
                 continue
             unresolved.append(mergeable[position])
+        # Numbered as the output is built, so nothing has to renumber it after:
+        # a kept cue's index is its place in the repaired list, whatever the
+        # source called it.
         repaired.append(
             SubtitleCue(
                 index=str(len(repaired) + 1),
@@ -434,8 +437,6 @@ def repair_transcript(
             )
         )
         last_kept_source_position = position
-    for index, cue in enumerate(repaired, start=1):
-        cue.index = str(index)
     renumbered = next(
         (finding for finding in report.findings if finding.repair == "renumber"), None
     )

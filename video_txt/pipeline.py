@@ -1,20 +1,34 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .bilingual import (
+    DEFAULT_ORDER,
+    bilingual_cues,
+    bilingual_subtitle_path,
+    merge_subtitles,
+)
+from .clone import CLONE_ENGINES
+from .diarize import DiarizeOptions, SpeakerTurn, ensure_speakers
+from .dub import DubOptions, run_dub
 from .mux import MuxOptions, run_mux
 from .quality import check_transcript
 from .refine import RefineError, load_word_document, word_document_matches_subtitle
-from .subtitles import parse_srt, translated_subtitle_path
+from .reuse import PreviousTranslation
+from .revise import apply_revisions, load_revisions, revised_subtitle_path
+from .subtitles import parse_srt, translated_subtitle_path, write_srt
 from .terminology import (
+    Terminology,
     audit_translation,
     translation_audit_path_for,
     write_translation_audit_report,
 )
 from .transcribe import TranscribeError, TranscribeOptions, run_transcribe
 from .translate import TranslationConfig, TranslationError, translate_subtitle_file
+from .voices import resolve_voice_name
 
 
 @dataclass
@@ -41,6 +55,8 @@ class TranslateStage:
     resume: bool = True
     retranslate: bool = False
     reuse_if_exists: bool = False
+    # An earlier source/translation pair whose unchanged lines are carried over.
+    previous: PreviousTranslation | None = None
 
     def require_config(self) -> TranslationConfig:
         """Load API settings only when this stage actually has work to do."""
@@ -226,29 +242,205 @@ def ensure_translated_subtitle(
         resume=stage.resume,
         dry_run=dry_run,
         overwrite_audit=stage.retranslate,
+        previous=stage.previous,
     )
 
 
-def run_pipeline(
+def ensure_revised_subtitle(
+    source_subtitle: Path,
+    translated_subtitle: Path,
     *,
-    video: Path,
-    subtitle: Path | None,
-    output_dir: Path,
-    transcribe_stage: TranscribeStage,
-    translate_stage: TranslateStage,
-    mux_options_for: Callable[[Path], MuxOptions],
+    revisions: Path | None,
+    terminology: Terminology | None = None,
     dry_run: bool = False,
+    label: str | None = None,
 ) -> Path:
-    source_subtitle = ensure_source_subtitle(
-        video,
-        subtitle=subtitle,
-        output_dir=output_dir,
-        stage=transcribe_stage,
-        dry_run=dry_run,
+    """Put the hand-corrected lines back on top of a freshly translated subtitle.
+
+    The translation is regenerated on every run; the corrections are not. They
+    are reapplied here rather than edited into the translation, so that the file
+    a person maintains stays the one they wrote, and a retranslation costs them
+    nothing.
+
+    The revised subtitle is the one that gets muxed or spoken, so it is the one
+    worth auditing. `translate` already wrote a report about its own output; this
+    one describes what actually ships, with the hand-finalized lines marked as
+    signed off rather than counted against it.
+    """
+    if revisions is None:
+        return translated_subtitle
+
+    prefix = stage_prefix(label)
+    revision_set = load_revisions(revisions)
+    if not (source_subtitle.is_file() and translated_subtitle.is_file()):
+        # A dry run reaches here with nothing on disk yet: the anchors cannot be
+        # checked, but the file itself has already been read and validated.
+        print(
+            f"{prefix}Revise: would apply {len(revision_set.revisions)} "
+            f"hand-corrected line(s) from {revisions}"
+        )
+        return translated_subtitle
+
+    source_cues = parse_srt(source_subtitle)
+    result = apply_revisions(source_cues, parse_srt(translated_subtitle), revision_set)
+    for item in result.drifted:
+        print(
+            f"{prefix}Anchor moved: cue {item.cue_index} is now {item.drift:.1f}s from "
+            f"where {item.revision.source!r} used to be.",
+            file=sys.stderr,
+        )
+    output = revised_subtitle_path(translated_subtitle)
+    if dry_run:
+        print(
+            f"{prefix}Revise: would restore {result.changed_count} hand-corrected "
+            f"line(s) -> {output}"
+        )
+        return translated_subtitle
+
+    write_srt(output, result.cues)
+    already = len(result.already_current)
+    print(
+        f"{prefix}Revise: restored {result.changed_count} hand-corrected line(s)"
+        + (f", {already} already current" if already else "")
+        + f" -> {output}"
     )
-    translated_subtitle = ensure_translated_subtitle(
-        source_subtitle, stage=translate_stage, dry_run=dry_run
+
+    audit = audit_translation(
+        source_cues,
+        result.cues,
+        terminology,
+        revised={item.position for item in result.applied},
     )
-    options = mux_options_for(translated_subtitle)
-    print(f"[3/3] Mux: {options.mux_mode} subtitles -> {options.video_output}")
-    return run_mux(options, dry_run=dry_run)
+    report_path = write_translation_audit_report(
+        source_path=source_subtitle,
+        translation_path=output,
+        terminology=terminology,
+        audit=audit,
+        overwrite=True,
+    )
+    accepted = audit.summary["accepted"]
+    print(
+        f"{prefix}Translation audit: {audit.summary['error']} errors, "
+        f"{audit.summary['warning']} warnings"
+        + (f", {accepted} accepted on revised lines" if accepted else "")
+        + f" -> {report_path}"
+    )
+    if audit.has_errors:
+        raise TranslationError(
+            f"The revised translation failed audit with {audit.summary['error']} error(s). "
+            f"Correct the line in {revisions}, fix the terminology, or review: {report_path}"
+        )
+    return output
+
+
+def ensure_bilingual_subtitle(
+    source_subtitle: Path,
+    translated_subtitle: Path,
+    *,
+    bilingual: bool,
+    order: str,
+    dry_run: bool = False,
+    label: str | None = None,
+) -> Path:
+    """Put the original back under the translation, on one timeline.
+
+    Last of the subtitle stages, because it merges whatever the translation has
+    become -- fitted, revised -- with the source it was made from.
+    """
+    if not bilingual:
+        return translated_subtitle
+
+    prefix = stage_prefix(label)
+    output = bilingual_subtitle_path(translated_subtitle)
+    if dry_run or not (source_subtitle.is_file() and translated_subtitle.is_file()):
+        print(f"{prefix}Bilingual: would write {output} ({order})")
+        return output if not dry_run else translated_subtitle
+
+    merged = merge_subtitles(
+        parse_srt(source_subtitle), parse_srt(translated_subtitle), order=order
+    )
+    write_srt(output, bilingual_cues(merged))
+    print(f"{prefix}Bilingual: {len(merged)} cue(s) in both languages -> {output}")
+    return output
+
+
+@dataclass
+class Workflow:
+    video: Path
+    subtitle: Path | None
+    output_dir: Path
+    transcribe_stage: TranscribeStage
+    translate_stage: TranslateStage
+    mux_options_for: Callable[[Path], MuxOptions] | None = None
+    dub_options_for: Callable[[Path, Path, list[SpeakerTurn]], DubOptions] | None = None
+    diarize_options: DiarizeOptions | None = None
+    revisions: Path | None = None
+    bilingual: bool = False
+    bilingual_order: str = DEFAULT_ORDER
+    dry_run: bool = False
+    on_stage_complete: Callable[[str], None] = lambda _name: None
+
+
+def run_workflow(workflow: Workflow) -> Path:
+    """Execute shared subtitle stages, then the selected media output stage."""
+    w = workflow
+    if (w.mux_options_for is None) == (w.dub_options_for is None):
+        raise ValueError("A workflow must select exactly one output: mux or dub.")
+
+    def complete(name: str) -> None:
+        if not w.dry_run:
+            w.on_stage_complete(name)
+
+    stages = 4 if w.diarize_options is not None else 3
+    turns = []
+    if w.diarize_options is not None:
+        turns = ensure_speakers(
+            w.video, options=w.diarize_options, dry_run=w.dry_run, label="[1/4]"
+        )
+    source = ensure_source_subtitle(
+        w.video,
+        subtitle=w.subtitle,
+        output_dir=w.output_dir,
+        stage=w.transcribe_stage,
+        dry_run=w.dry_run,
+        label=f"[{stages - 2}/{stages}]",
+    )
+    complete("transcribe")
+    translated = ensure_translated_subtitle(
+        source, stage=w.translate_stage, dry_run=w.dry_run, label=f"[{stages - 1}/{stages}]"
+    )
+    complete("translate")
+    translated = ensure_revised_subtitle(
+        source,
+        translated,
+        revisions=w.revisions,
+        terminology=w.translate_stage.config.terminology,
+        dry_run=w.dry_run,
+    )
+    complete("revise")
+    if w.dub_options_for is not None:
+        options = w.dub_options_for(source, translated, turns)
+        voicing = (
+            "cloning the original voice"
+            if options.engine in CLONE_ENGINES
+            else "one voice per speaker"
+            if w.diarize_options is not None
+            else f"voice {resolve_voice_name(options.engine, options.voice)}"
+        )
+        print(f"[{stages}/{stages}] Dub: {options.engine} {voicing}")
+        output = run_dub(options, dry_run=w.dry_run)
+        complete("tts")
+        return output
+    translated = ensure_bilingual_subtitle(
+        source,
+        translated,
+        bilingual=w.bilingual,
+        order=w.bilingual_order,
+        dry_run=w.dry_run,
+    )
+    assert w.mux_options_for is not None
+    mux = w.mux_options_for(translated)
+    print(f"[3/3] Mux: {mux.mux_mode} subtitles -> {mux.video_output}")
+    output = run_mux(mux, dry_run=w.dry_run)
+    complete("mux")
+    return output

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -156,6 +157,62 @@ def test_references_are_cut_once_per_speaker_and_kept_beside_their_transcript(
     assert transcript.read_text(encoding="utf-8").strip() == "Thanks for having me."
 
 
+def test_a_reference_is_cut_from_the_separated_voice_when_there_is_one(tmp_path, monkeypatch):
+    """The same seconds of the mix carry the score, and the clone would copy that too."""
+    cut: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        cut.append(command)
+        Path(command[-1]).write_bytes(b"RIFF")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(clone_module.subprocess, "run", fake_run)
+    voice_track = tmp_path / "cache" / "bgm" / "vocals.flac"
+    voice_track.parent.mkdir(parents=True)
+    voice_track.write_bytes(b"flac")
+
+    references = build_references(
+        tmp_path / "clip.mp4",
+        cues=numbered(INTERVIEW),
+        speakers=SPEAKERS,
+        wanted=["SPEAKER_01"],
+        options=CloneOptions(engine="f5-tts"),
+        cache_dir=tmp_path / "cache",
+        ffmpeg_path="ffmpeg",
+        voice_track=voice_track,
+    )
+
+    assert cut[0][cut[0].index("-i") + 1] == str(voice_track)
+    # Named apart, so a clip cut from the mix is never served as a clean one.
+    assert references["SPEAKER_01"].audio.name == "SPEAKER_01-clean-8000.wav"
+
+
+def test_a_missing_voice_stem_falls_back_to_the_video(tmp_path, monkeypatch):
+    cut: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        cut.append(command)
+        Path(command[-1]).write_bytes(b"RIFF")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(clone_module.subprocess, "run", fake_run)
+    video = tmp_path / "clip.mp4"
+
+    references = build_references(
+        video,
+        cues=numbered(INTERVIEW),
+        speakers=SPEAKERS,
+        wanted=["SPEAKER_01"],
+        options=CloneOptions(engine="f5-tts"),
+        cache_dir=tmp_path / "cache",
+        ffmpeg_path="ffmpeg",
+        voice_track=tmp_path / "cache" / "bgm" / "vocals.flac",
+    )
+
+    assert cut[0][cut[0].index("-i") + 1] == str(video)
+    assert references["SPEAKER_01"].audio.name == "SPEAKER_01-8000.wav"
+
+
 def test_a_supplied_clip_is_used_as_is_along_with_the_text_beside_it(tmp_path, monkeypatch):
     monkeypatch.setattr(
         clone_module.subprocess,
@@ -285,6 +342,8 @@ def test_the_manifest_carries_every_job_with_the_clip_it_clones(tmp_path):
             "output": str(tmp_path / "a.wav"),
             "reference_audio": str(tmp_path / "ref.wav"),
             "reference_text": "hello",
+            "emotion_audio": None,
+            "emotion_alpha": 0.8,
             "speed": None,
         }
     ]
@@ -436,3 +495,25 @@ def test_the_worker_turns_a_failure_into_an_exit_code_not_a_traceback(tmp_path, 
     assert clone_worker.main([str(manifest)]) == 1
     assert "Reference audio not found" in capsys.readouterr().err
     assert clone_worker.main([]) == 2
+
+
+def test_indextts_passes_the_delivery_clip_only_when_the_job_has_one(tmp_path):
+    engine = object.__new__(clone_worker.IndexTTSEngine)
+    calls: list[dict] = []
+
+    class Model:
+        def infer(self, spk_audio_prompt, text, output_path, emo_audio_prompt=None, emo_alpha=1.0):
+            calls.append({"emo": emo_audio_prompt, "alpha": emo_alpha})
+
+    engine.model = Model()
+    engine.infer_parameters = inspect.signature(Model.infer).parameters
+    engine.lang = "ZH"
+    engine.speed = 1.0
+    base = {"reference_audio": "/ref.wav", "text": "你好"}
+
+    engine.synthesize(base, tmp_path / "a.wav")
+    engine.synthesize(
+        {**base, "emotion_audio": "/drawl.wav", "emotion_alpha": 0.8}, tmp_path / "b.wav"
+    )
+
+    assert calls == [{"emo": None, "alpha": 1.0}, {"emo": "/drawl.wav", "alpha": 0.8}]

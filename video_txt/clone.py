@@ -42,11 +42,26 @@ REFERENCE_MAX_SECONDS = 12.0
 # Lines further apart than this are two separate stretches of talking.
 REFERENCE_JOIN_GAP = 0.6
 REFERENCE_SAMPLE_RATE = 24000
+# IndexTTS-2 can take its delivery (pace, pitch movement, drawl) from a second
+# clip while the voice still comes from the reference. How much of it to apply.
+EMOTION_ALPHA = 0.8
 RATE_PATTERN = re.compile(r"^([+-]\d+(?:\.\d+)?)%$")
 
 
 class CloneError(RuntimeError):
     pass
+
+
+def update_with_file(digest: "hashlib._Hash", path: Path) -> None:
+    resolved = path.expanduser().resolve()
+    try:
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError:
+        # Dry runs and unit-level plans can name a future reference clip. Its
+        # absolute path still prevents unrelated same-named clips from colliding.
+        digest.update(str(resolved).encode("utf-8"))
 
 
 @dataclass(frozen=True)
@@ -56,6 +71,9 @@ class Reference:
     speaker: str
     audio: Path
     text: str = ""
+    # A clip beside the reference whose delivery IndexTTS borrows; the other
+    # engines have no such input and ignore it.
+    emotion_audio: Path | None = None
 
     @property
     def label(self) -> str:
@@ -65,17 +83,14 @@ class Reference:
     def fingerprint(self) -> str:
         """Audio and transcript identity used to isolate synthesized-clip caches."""
         digest = hashlib.sha1()
-        resolved = self.audio.expanduser().resolve()
-        try:
-            with resolved.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError:
-            # Dry runs and unit-level plans can name a future reference clip. Its
-            # absolute path still prevents unrelated same-named clips from colliding.
-            digest.update(str(resolved).encode("utf-8"))
+        update_with_file(digest, self.audio)
         digest.update(b"\0")
         digest.update(self.text.encode("utf-8"))
+        if self.emotion_audio is not None:
+            # Absent for every plain reference, so their cached clips stay valid.
+            digest.update(b"\0emotion\0")
+            update_with_file(digest, self.emotion_audio)
+            digest.update(f"{EMOTION_ALPHA}".encode())
         return digest.hexdigest()
 
 
@@ -214,6 +229,10 @@ def build_manifest(jobs: list[CloneJob], options: CloneOptions) -> dict[str, obj
                 "output": str(job.output),
                 "reference_audio": str(job.reference.audio),
                 "reference_text": job.reference.text,
+                "emotion_audio": (
+                    str(job.reference.emotion_audio) if job.reference.emotion_audio else None
+                ),
+                "emotion_alpha": EMOTION_ALPHA,
                 "speed": job.speed,
             }
             for job in jobs
@@ -359,14 +378,25 @@ def reference_text_path(audio: Path) -> Path:
     return audio.with_suffix(".txt")
 
 
+def emotion_reference_path(audio: Path) -> Path:
+    """voice.wav borrows its delivery from voice.emo.wav, when that exists."""
+    return audio.with_suffix(".emo.wav")
+
+
 def supplied_reference(speaker: str, audio: Path) -> Reference:
-    """A clip the caller pointed at, plus the transcript they may have left beside it."""
+    """A clip the caller pointed at, plus the transcript and delivery clip left beside it."""
     resolved = audio.expanduser().resolve()
     if not resolved.is_file():
         raise CloneError(f"Reference audio not found: {resolved}")
     sidecar = reference_text_path(resolved)
     text = sidecar.read_text(encoding="utf-8").strip() if sidecar.is_file() else ""
-    return Reference(speaker=speaker, audio=resolved, text=text)
+    emotion = emotion_reference_path(resolved)
+    return Reference(
+        speaker=speaker,
+        audio=resolved,
+        text=text,
+        emotion_audio=emotion if emotion.is_file() else None,
+    )
 
 
 def build_references(
@@ -378,8 +408,16 @@ def build_references(
     options: CloneOptions,
     cache_dir: Path,
     ffmpeg_path: str,
+    voice_track: Path | None = None,
 ) -> dict[str, Reference]:
-    """One reference clip per speaker, cut from the video unless one was supplied."""
+    """One reference clip per speaker, cut from the video unless one was supplied.
+
+    voice_track is the separated vocal stem when --separate-bgm has made one. A
+    clip cut from it carries the speaker alone; the same seconds of the original
+    mix carry whatever the score was doing under them, and the clone copies that
+    too.
+    """
+    clean = voice_track if voice_track is not None and voice_track.is_file() else None
     references: dict[str, Reference] = {}
     for speaker in wanted:
         supplied = options.references.get(speaker)
@@ -402,10 +440,15 @@ def build_references(
 
         start, end, text = window
         label = speaker or "main"
-        audio = cache_dir / REFERENCE_DIR_NAME / f"{label}-{round(start * 1000)}.wav"
-        extract_reference(video, start=start, end=end, output=audio, ffmpeg_path=ffmpeg_path)
+        # Two names, so a cache made from the mix is not mistaken for a clean one.
+        stem = f"{label}-clean" if clean is not None else label
+        audio = cache_dir / REFERENCE_DIR_NAME / f"{stem}-{round(start * 1000)}.wav"
+        extract_reference(
+            clean or video, start=start, end=end, output=audio, ffmpeg_path=ffmpeg_path
+        )
         reference_text_path(audio).write_text(text + "\n", encoding="utf-8")
-        print(f"  {label}: {end - start:.1f}s from {start:.1f}s -> {audio.name}")
+        cut_from = "separated voice" if clean is not None else "original mix"
+        print(f"  {label}: {end - start:.1f}s from {start:.1f}s of the {cut_from}")
         references[speaker] = Reference(speaker=speaker, audio=audio, text=text)
 
     return references

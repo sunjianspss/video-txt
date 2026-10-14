@@ -5,11 +5,29 @@ import os
 import re
 import tempfile
 import unicodedata
-from dataclasses import dataclass
+from collections.abc import Collection
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 from .subtitles import SubtitleCue
+
+# Findings a person's judgement is allowed to overrule on a line they finalized
+# by hand. Deliberately keeping an English phrase, deliberately not using the
+# approved term for a character who mispronounces a name, a line that had to
+# grow -- all of these read as defects to a heuristic and are correct on screen.
+# The structural codes are deliberately absent: a revision replaces one cue's
+# text, so it cannot make cue counts, indexes or timings disagree, and an empty
+# revision is refused when the revision file is read.
+ACCEPTABLE_WHEN_REVISED = frozenset(
+    {
+        "glossary_alias",
+        "glossary_target_missing",
+        "source_text_unchanged",
+        "source_text_residue",
+        "translation_unusually_long",
+    }
+)
 
 
 class TerminologyError(ValueError):
@@ -70,12 +88,16 @@ class TranslationFinding:
     translation_position: int | None = None
     term_source: str | None = None
     expected_target: str | None = None
+    # A person revised this line by hand, and this finding is one their judgement
+    # is allowed to overrule. Still reported, no longer counted against the file.
+    accepted: bool = False
 
     def to_dict(self) -> dict[str, object]:
         values: dict[str, Any] = {
             "code": self.code,
             "severity": self.severity,
             "message": self.message,
+            "accepted": True if self.accepted else None,
             "source_position": self.source_position,
             "translation_position": self.translation_position,
             "term_source": self.term_source,
@@ -91,12 +113,17 @@ class TranslationAudit:
     findings: tuple[TranslationFinding, ...]
 
     @property
+    def outstanding(self) -> tuple[TranslationFinding, ...]:
+        """Findings nobody has signed off on, which is what the counts are about."""
+        return tuple(finding for finding in self.findings if not finding.accepted)
+
+    @property
     def is_clean(self) -> bool:
-        return not self.findings
+        return not self.outstanding
 
     @property
     def has_errors(self) -> bool:
-        return any(finding.severity == "error" for finding in self.findings)
+        return any(finding.severity == "error" for finding in self.outstanding)
 
     @property
     def summary(self) -> dict[str, object]:
@@ -104,8 +131,9 @@ class TranslationAudit:
         for finding in self.findings:
             by_code[finding.code] = by_code.get(finding.code, 0) + 1
         return {
-            "error": sum(finding.severity == "error" for finding in self.findings),
-            "warning": sum(finding.severity == "warning" for finding in self.findings),
+            "error": sum(finding.severity == "error" for finding in self.outstanding),
+            "warning": sum(finding.severity == "warning" for finding in self.outstanding),
+            "accepted": len(self.findings) - len(self.outstanding),
             "by_code": by_code,
         }
 
@@ -230,8 +258,16 @@ def audit_translation(
     source_cues: list[SubtitleCue],
     translated_cues: list[SubtitleCue],
     terminology: Terminology | None = None,
+    *,
+    revised: Collection[int] = (),
 ) -> TranslationAudit:
-    """Compare a source/translation pair without changing either subtitle."""
+    """Compare a source/translation pair without changing either subtitle.
+
+    `revised` holds the cue positions a person finalized by hand. Their lines are
+    still inspected and still reported -- a structural defect is a defect whoever
+    wrote it -- but the findings a reader's judgement outranks stop counting
+    against the file, so a deliberate choice does not keep failing the audit.
+    """
     findings: list[TranslationFinding] = []
     if len(source_cues) != len(translated_cues):
         findings.append(
@@ -372,10 +408,17 @@ def audit_translation(
                 )
             )
 
+    signed_off = set(revised)
     return TranslationAudit(
         source_cue_count=len(source_cues),
         translation_cue_count=len(translated_cues),
-        findings=tuple(findings),
+        findings=tuple(
+            replace(finding, accepted=True)
+            if finding.translation_position in signed_off
+            and finding.code in ACCEPTABLE_WHEN_REVISED
+            else finding
+            for finding in findings
+        ),
     )
 
 
