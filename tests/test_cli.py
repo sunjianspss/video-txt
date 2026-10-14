@@ -34,6 +34,12 @@ def project(tmp_path, monkeypatch):
     monkeypatch.setenv("FFMPEG_PATH", "/bin/echo")
     monkeypatch.delenv("OPENAI_MODEL", raising=False)
     monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    # Default Mambo dry runs must not depend on a developer's installed model.
+    test_home = tmp_path / "home"
+    checkpoints = test_home / "tools" / "index-tts" / "checkpoints"
+    checkpoints.mkdir(parents=True)
+    (checkpoints / "config.yaml").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(Path, "home", lambda: test_home)
     video = tmp_path / "clip.mp4"
     video.write_bytes(b"not really a video")
     subtitle = tmp_path / "clip.srt"
@@ -1098,7 +1104,10 @@ def test_a_reference_clip_named_for_a_speaker_needs_diarization(project, capsys)
 def test_cloning_flags_are_refused_by_the_online_engines(project, capsys):
     video, _ = project
     with pytest.raises(SystemExit):
-        main(["dub", str(video), "--clone-model", "F5TTS_v1_Base", "--dry-run"])
+        main([
+            "dub", str(video), "--tts-engine", "edge-tts",
+            "--clone-model", "F5TTS_v1_Base", "--dry-run",
+        ])
 
     assert "only applies to a cloning engine" in capsys.readouterr().err
 

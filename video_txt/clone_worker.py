@@ -189,6 +189,9 @@ class IndexTTSEngine:
         }
         if "verbose" in self.infer_parameters:
             arguments["verbose"] = False
+        if job.get("emotion_audio") and "emo_audio_prompt" in self.infer_parameters:
+            arguments["emo_audio_prompt"] = job["emotion_audio"]
+            arguments["emo_alpha"] = float(job.get("emotion_alpha") or 1.0)
         # IndexTTS-2.5 requires the language; the IndexTTS-2 loader has no
         # such parameter and reads everything as Chinese or English.
         if "lang" in self.infer_parameters:
@@ -229,6 +232,9 @@ def check_references(jobs: list[dict], *, engine: str) -> None:
     for job in jobs:
         if not Path(job["reference_audio"]).is_file():
             raise WorkerError(f"Reference audio not found: {job['reference_audio']}")
+        emotion = job.get("emotion_audio")
+        if emotion and not Path(emotion).is_file():
+            raise WorkerError(f"Emotion reference audio not found: {emotion}")
     if engine == "cosyvoice" and any(not job["reference_text"].strip() for job in jobs):
         print(
             "Warning: a reference clip has no transcript, which CosyVoice clones badly from. "

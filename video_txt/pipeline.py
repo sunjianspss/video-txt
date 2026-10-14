@@ -11,6 +11,9 @@ from .bilingual import (
     bilingual_subtitle_path,
     merge_subtitles,
 )
+from .clone import CLONE_ENGINES
+from .diarize import DiarizeOptions, SpeakerTurn, ensure_speakers
+from .dub import DubOptions, run_dub
 from .mux import MuxOptions, run_mux
 from .quality import check_transcript
 from .refine import RefineError, load_word_document, word_document_matches_subtitle
@@ -25,6 +28,7 @@ from .terminology import (
 )
 from .transcribe import TranscribeError, TranscribeOptions, run_transcribe
 from .translate import TranslationConfig, TranslationError, translate_subtitle_file
+from .voices import resolve_voice_name
 
 
 @dataclass
@@ -360,43 +364,83 @@ def ensure_bilingual_subtitle(
     return output
 
 
-def run_pipeline(
-    *,
-    video: Path,
-    subtitle: Path | None,
-    output_dir: Path,
-    transcribe_stage: TranscribeStage,
-    translate_stage: TranslateStage,
-    mux_options_for: Callable[[Path], MuxOptions],
-    revisions: Path | None = None,
-    bilingual: bool = False,
-    bilingual_order: str = DEFAULT_ORDER,
-    dry_run: bool = False,
-) -> Path:
-    source_subtitle = ensure_source_subtitle(
-        video,
-        subtitle=subtitle,
-        output_dir=output_dir,
-        stage=transcribe_stage,
-        dry_run=dry_run,
+@dataclass
+class Workflow:
+    video: Path
+    subtitle: Path | None
+    output_dir: Path
+    transcribe_stage: TranscribeStage
+    translate_stage: TranslateStage
+    mux_options_for: Callable[[Path], MuxOptions] | None = None
+    dub_options_for: Callable[[Path, Path, list[SpeakerTurn]], DubOptions] | None = None
+    diarize_options: DiarizeOptions | None = None
+    revisions: Path | None = None
+    bilingual: bool = False
+    bilingual_order: str = DEFAULT_ORDER
+    dry_run: bool = False
+    on_stage_complete: Callable[[str], None] = lambda _name: None
+
+
+def run_workflow(workflow: Workflow) -> Path:
+    """Execute shared subtitle stages, then the selected media output stage."""
+    w = workflow
+    if (w.mux_options_for is None) == (w.dub_options_for is None):
+        raise ValueError("A workflow must select exactly one output: mux or dub.")
+
+    def complete(name: str) -> None:
+        if not w.dry_run:
+            w.on_stage_complete(name)
+
+    stages = 4 if w.diarize_options is not None else 3
+    turns = []
+    if w.diarize_options is not None:
+        turns = ensure_speakers(
+            w.video, options=w.diarize_options, dry_run=w.dry_run, label="[1/4]"
+        )
+    source = ensure_source_subtitle(
+        w.video,
+        subtitle=w.subtitle,
+        output_dir=w.output_dir,
+        stage=w.transcribe_stage,
+        dry_run=w.dry_run,
+        label=f"[{stages - 2}/{stages}]",
     )
-    translated_subtitle = ensure_translated_subtitle(
-        source_subtitle, stage=translate_stage, dry_run=dry_run
+    complete("transcribe")
+    translated = ensure_translated_subtitle(
+        source, stage=w.translate_stage, dry_run=w.dry_run, label=f"[{stages - 1}/{stages}]"
     )
-    translated_subtitle = ensure_revised_subtitle(
-        source_subtitle,
-        translated_subtitle,
-        revisions=revisions,
-        terminology=translate_stage.config.terminology,
-        dry_run=dry_run,
+    complete("translate")
+    translated = ensure_revised_subtitle(
+        source,
+        translated,
+        revisions=w.revisions,
+        terminology=w.translate_stage.config.terminology,
+        dry_run=w.dry_run,
     )
-    translated_subtitle = ensure_bilingual_subtitle(
-        source_subtitle,
-        translated_subtitle,
-        bilingual=bilingual,
-        order=bilingual_order,
-        dry_run=dry_run,
+    complete("revise")
+    if w.dub_options_for is not None:
+        options = w.dub_options_for(source, translated, turns)
+        voicing = (
+            "cloning the original voice"
+            if options.engine in CLONE_ENGINES
+            else "one voice per speaker"
+            if w.diarize_options is not None
+            else f"voice {resolve_voice_name(options.engine, options.voice)}"
+        )
+        print(f"[{stages}/{stages}] Dub: {options.engine} {voicing}")
+        output = run_dub(options, dry_run=w.dry_run)
+        complete("tts")
+        return output
+    translated = ensure_bilingual_subtitle(
+        source,
+        translated,
+        bilingual=w.bilingual,
+        order=w.bilingual_order,
+        dry_run=w.dry_run,
     )
-    options = mux_options_for(translated_subtitle)
-    print(f"[3/3] Mux: {options.mux_mode} subtitles -> {options.video_output}")
-    return run_mux(options, dry_run=dry_run)
+    assert w.mux_options_for is not None
+    mux = w.mux_options_for(translated)
+    print(f"[3/3] Mux: {mux.mux_mode} subtitles -> {mux.video_output}")
+    output = run_mux(mux, dry_run=w.dry_run)
+    complete("mux")
+    return output

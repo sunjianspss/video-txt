@@ -35,7 +35,6 @@ from .mux import HARD_LAYOUTS
 from .separate import STEM_MODELS
 from .timeline import VOICE_UNITS
 from .transcribe import BACKENDS, OUTPUT_FORMATS
-from .voices import DEFAULT_VOICE
 
 # A parser or one of its argument groups: whatever an option can be hung on.
 type ArgumentTarget = argparse.ArgumentParser | argparse._ArgumentGroup
@@ -417,17 +416,22 @@ def add_voice_arguments(
     group.add_argument(
         "--tts-engine",
         choices=ENGINES,
-        default="edge-tts",
         help=(
-            "Speech engine. edge-tts sounds natural and is free; say works offline "
+            "Defaults to the mambo narrator with index-tts. Choosing an engine "
+            "without --voice uses that engine's default voice. "
+            "edge-tts sounds natural and is free; say works offline "
             "on macOS; index-tts, cosyvoice and f5-tts clone the original speaker "
             "locally, index-tts being the most expressive of the three."
         ),
     )
     group.add_argument(
         "--voice",
-        default=DEFAULT_VOICE,
-        help=f"Voice name for edge-tts or say. Defaults to {DEFAULT_VOICE}.",
+        help=(
+            "Defaults to mambo (曼波) for single-narrator dubbing. "
+            "Also accepts voice names for edge-tts or say. "
+            "mambo selects the bundled narrator reference with index-tts; "
+            "--clone-repo defaults to ~/tools/index-tts for this preset."
+        ),
     )
     group.add_argument(
         "--voice-unit",
@@ -1002,6 +1006,7 @@ def build_project_command(parser: argparse.ArgumentParser) -> None:
     add_transcribe_arguments(init, standalone=False)
     add_translation_arguments(init, debug_flag="--translation-debug-dir")
     add_revision_argument(init)
+    add_bilingual_arguments(init)
     add_mux_arguments(init)
     add_voice_arguments(init, include_shared_arguments=False)
     add_speaker_arguments(init)

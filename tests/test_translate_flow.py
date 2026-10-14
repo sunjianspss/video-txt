@@ -5,12 +5,13 @@ import threading
 
 import pytest
 
+from video_txt import model_client
 from video_txt import translate as translate_module
+from video_txt.model_client import ApiHttpError
 from video_txt.reuse import PreviousTranslation
 from video_txt.subtitles import parse_srt, parse_srt_text, write_srt
 from video_txt.terminology import Term, Terminology
 from video_txt.translate import (
-    ApiHttpError,
     PartialStore,
     TranslationConfig,
     build_partial_meta,
@@ -63,7 +64,7 @@ class FakeApi:
 @pytest.fixture
 def fake_api(monkeypatch):
     api = FakeApi()
-    monkeypatch.setattr(translate_module, "post_chat_completion", api)
+    monkeypatch.setattr(model_client, "post_chat_completion", api)
     return api
 
 
@@ -194,7 +195,7 @@ def test_a_batch_the_model_answers_short_is_split_instead_of_asked_again(
             return {"choices": [{"message": {"content": content}}]}
 
     api = DropsLastId()
-    monkeypatch.setattr(translate_module, "post_chat_completion", api)
+    monkeypatch.setattr(model_client, "post_chat_completion", api)
     output = tmp_path / "clip.zh.srt"
 
     translate_subtitle_file(
@@ -210,7 +211,7 @@ def test_a_batch_the_model_answers_short_is_split_instead_of_asked_again(
 
 def test_a_failed_batch_leaves_the_finished_ones_on_disk(srt, monkeypatch, tmp_path):
     api = FakeApi(fail_ids={"4"})
-    monkeypatch.setattr(translate_module, "post_chat_completion", api)
+    monkeypatch.setattr(model_client, "post_chat_completion", api)
     output = tmp_path / "clip.zh.srt"
 
     with pytest.raises(ApiHttpError):
@@ -237,7 +238,7 @@ def test_success_cleans_up_snapshots_from_batches_that_recovered(srt, monkeypatc
             return {"choices": [{"message": {"content": "not json"}}]}
         return inner(config=config, messages=messages, json_mode=json_mode)
 
-    monkeypatch.setattr(translate_module, "post_chat_completion", flaky)
+    monkeypatch.setattr(model_client, "post_chat_completion", flaky)
     output = tmp_path / "clip.zh.srt"
 
     translate_subtitle_file(
@@ -267,7 +268,7 @@ def test_a_run_that_ultimately_fails_keeps_the_snapshots(srt, monkeypatch, tmp_p
     def always_garbage(*, config, messages, json_mode):
         return {"choices": [{"message": {"content": "not json"}}]}
 
-    monkeypatch.setattr(translate_module, "post_chat_completion", always_garbage)
+    monkeypatch.setattr(model_client, "post_chat_completion", always_garbage)
     output = tmp_path / "clip.zh.srt"
 
     with pytest.raises(translate_module.TranslationError):
@@ -292,7 +293,7 @@ def test_an_explicit_debug_dir_is_not_cleaned_up(srt, monkeypatch, tmp_path):
             return {"choices": [{"message": {"content": "not json"}}]}
         return inner(config=config, messages=messages, json_mode=json_mode)
 
-    monkeypatch.setattr(translate_module, "post_chat_completion", flaky)
+    monkeypatch.setattr(model_client, "post_chat_completion", flaky)
     debug_dir = tmp_path / "kept-debug"
 
     translate_subtitle_file(
@@ -359,7 +360,7 @@ def test_translation_normalizes_terms_and_writes_a_clean_audit_report(tmp_path, 
         content = json.dumps({"items": [{"id": "1", "text": "伍迪来了。"}]})
         return {"choices": [{"message": {"content": content}}]}
 
-    monkeypatch.setattr(translate_module, "post_chat_completion", translated_alias)
+    monkeypatch.setattr(model_client, "post_chat_completion", translated_alias)
     terminology = Terminology(
         source_language="en",
         target_language="Simplified Chinese",
@@ -394,7 +395,7 @@ def test_unresolved_terminology_stops_after_preserving_the_translation_and_repor
         content = json.dumps({"items": [{"id": "1", "text": "他来了。"}]})
         return {"choices": [{"message": {"content": content}}]}
 
-    monkeypatch.setattr(translate_module, "post_chat_completion", missing_term)
+    monkeypatch.setattr(model_client, "post_chat_completion", missing_term)
     terminology = Terminology(
         source_language="en",
         target_language="Simplified Chinese",

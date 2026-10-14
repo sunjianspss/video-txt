@@ -1,17 +1,14 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
-import subprocess
 import sys
-import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import __version__
+from . import __version__, notes, notes_sync
 from .arguments import (
     build_audit_command,
     build_bilingual_command,
@@ -28,13 +25,21 @@ from .arguments import (
     build_translate_command,
     build_translation_audit_command,
 )
+from .artifacts import write_json
 from .bilingual import (
     BilingualError,
     bilingual_cues,
     bilingual_subtitle_path,
     merge_subtitles,
 )
-from .clone import CLONE_ENGINES, CloneError, CloneOptions, is_rate, speed_from_rate
+from .clone import (
+    CLONE_ENGINES,
+    CloneError,
+    CloneOptions,
+    emotion_reference_path,
+    is_rate,
+    speed_from_rate,
+)
 from .constants import (
     DEFAULT_API_KEY_ENV,
     DEFAULT_BASE_URL,
@@ -47,47 +52,40 @@ from .diarize import (
     DiarizeError,
     DiarizeOptions,
     SpeakerTurn,
-    ensure_speakers,
 )
 from .draft import draft_terminology, draft_to_dict
-from .dub import DubError, DubOptions, default_dubbed_output, run_dub
+from .dub import DubError, DubOptions, default_dubbed_output
 from .env import CredentialError, resolve_api_key, resolve_optional_key
 from .fit import FitOptions
 from .media import (
     MediaError,
-    find_ffmpeg,
     parse_video_size,
     probe_audio_streams,
-    probe_sample_rate,
     select_audio_stream,
 )
+from .model_client import loaded_local_model
 from .music import (
-    PITCHED_STEMS,
     MusicError,
-    MusicPiece,
-    extract_command,
-    find_music,
-    loudness_envelope,
-    piece_filename,
-    sung_spans,
 )
+from .music_workflow import MusicOptions, run_music
 from .mux import MuxError, MuxOptions, default_video_output, run_mux
 from .pipeline import (
     TranscribeStage,
     TranslateStage,
+    Workflow,
     ensure_bilingual_subtitle,
     ensure_revised_subtitle,
-    ensure_source_subtitle,
     ensure_translated_subtitle,
-    run_pipeline,
+    run_workflow,
 )
 from .project import (
     ProjectError,
+    begin_project_run,
     build_project_state,
+    checkpoint_project_stage,
     create_project_config,
     inspect_project,
-    project_legacy_argv,
-    untracked_project_outputs,
+    project_workflow_config,
 )
 from .project import write_json as write_project_json
 from .quality import audit_transcript, check_transcript, probe_media_duration, repair_transcript
@@ -108,11 +106,6 @@ from .revise import (
 )
 from .separate import (
     SeparateError,
-    ensure_instrumental,
-    ensure_stems,
-    mix_instrumental,
-    separated_bgm_path,
-    separated_voice_path,
 )
 from .subtitles import (
     SubtitleFormatError,
@@ -136,10 +129,17 @@ from .transcribe import resolve_model as resolve_whisper_model
 from .translate import (
     TranslationConfig,
     TranslationError,
-    loaded_local_model,
     translate_subtitle_file,
 )
-from .voices import DEFAULT_SAY_VOICE, DEFAULT_VOICE, resolve_voice_name
+from .voices import (
+    DEFAULT_NARRATOR,
+    DEFAULT_SAY_VOICE,
+    DEFAULT_VOICE,
+    MAMBO_REFERENCE,
+    MAMBO_VOICE_NAMES,
+    resolve_voice_name,
+)
+from .workflow_config import WorkflowConfig, WorkflowConfigError
 
 SPEAKER_PATTERN = re.compile(r"^\w+$")
 
@@ -274,14 +274,14 @@ def resolve_reasoning_effort(args: argparse.Namespace) -> str:
     return args.reasoning_effort or provider.get("reasoning_effort") or "auto"
 
 
-def resolve_thinking(args: argparse.Namespace) -> str:
+def resolve_thinking(args: argparse.Namespace | WorkflowConfig) -> str:
     provider = PROVIDERS[args.provider] if args.provider else {}
     if args.provider == "deepseek" and args.reasoning_effort:
         if args.reasoning_effort == "none":
             return "disabled"
         if args.reasoning_effort != "auto":
             return "enabled"
-    return provider.get("thinking") or "auto"
+    return getattr(args, "thinking", None) or provider.get("thinking") or "auto"
 
 
 def resolve_batch_chars(args: argparse.Namespace) -> int:
@@ -413,14 +413,6 @@ def build_mux_options(
         ffmpeg_path=args.ffmpeg_path,
     )
 
-
-def dub_voicing(args: argparse.Namespace) -> str:
-    """How the dub will be spoken, in the few words the stage banner has room for."""
-    if args.tts_engine in CLONE_ENGINES:
-        return "cloning the original voice"
-    if args.diarize:
-        return "one voice per speaker"
-    return f"voice {resolve_voice_name(args.tts_engine, args.voice)}"
 
 
 def build_dub_options(
@@ -612,7 +604,51 @@ def validate_engine_options(parser: argparse.ArgumentParser, args: argparse.Name
         )
 
 
+def apply_voice_preset(
+    parser: argparse.ArgumentParser, args: argparse.Namespace | WorkflowConfig
+) -> None:
+    """Expand the named narrator into existing clone settings before validation.
+
+    Project init persists these explicit settings, so replay uses the same
+    reference and checkout without introducing a second project schema.
+    """
+    if args.voice is None:
+        # Explicit engines keep their defaults, as do multi-speaker workflows.
+        # Only an unconfigured single narrator takes the new default preset.
+        args.voice = (
+            DEFAULT_VOICE
+            if args.tts_engine is not None or args.diarize or args.speaker_voices
+            else DEFAULT_NARRATOR
+        )
+    args.tts_engine = args.tts_engine or "edge-tts"
+    if args.voice not in MAMBO_VOICE_NAMES:
+        return
+    if args.tts_engine not in ("edge-tts", "index-tts"):
+        parser.error("--voice mambo uses index-tts; remove the conflicting --tts-engine.")
+    for flag, value in (
+        ("--clone-reference", args.clone_references),
+        ("--speaker-voice", args.speaker_voices),
+        ("--diarize", args.diarize),
+    ):
+        if value:
+            parser.error(
+                f"--voice mambo is a single narrator preset; it cannot be used with {flag}."
+            )
+    if not MAMBO_REFERENCE.is_file() or not MAMBO_REFERENCE.with_suffix(".txt").is_file():
+        parser.error(f"Mambo reference audio or transcript is missing: {MAMBO_REFERENCE}")
+    if not emotion_reference_path(MAMBO_REFERENCE).is_file():
+        parser.error(
+            f"Mambo delivery reference is missing: {emotion_reference_path(MAMBO_REFERENCE)}"
+        )
+    args.tts_engine = "index-tts"
+    args.voice = DEFAULT_VOICE  # Clone engines take the voice from the reference.
+    args.clone_references = [str(MAMBO_REFERENCE.resolve())]
+    args.clone_repo = args.clone_repo or Path.home() / "tools" / "index-tts"
+    print(f"Voice preset: 曼波 (mambo), reference: {MAMBO_REFERENCE}")
+
+
 def validate_voice_options(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    apply_voice_preset(parser, args)
     validate_dub_numbers(parser, args)
     validate_engine_options(parser, args)
     if args.speaker_voices and not args.diarize:
@@ -761,27 +797,6 @@ def command_retranscribe_range(
     return 0
 
 
-def write_json(path: Path, payload: dict[str, object]) -> Path:
-    """Atomically write a generated JSON artifact."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        dir=path.parent,
-        prefix=f".{path.name}.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    return path
-
 
 def command_audit(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
     subtitle = existing_file(parser, args.input, "Subtitle file")
@@ -862,170 +877,20 @@ def command_translation_audit(args: argparse.Namespace, parser: argparse.Argumen
     return 0 if report.is_clean else 1
 
 
-def default_music_dir(media: Path) -> Path:
-    return media.with_name(f"{media.stem}.music")
-
-
 def command_music(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    media = existing_file(parser, args.media, "Media file")
-    output_dir = resolved(args.output_dir) or default_music_dir(media)
-    cache_dir = resolved(args.cache_dir) or media.with_name(f"{media.stem}.dub-cache")
-    if args.min_duration <= 0:
-        parser.error("--min-duration must be greater than 0")
-    named = args.from_time is not None or args.to_time is not None
-    if named and (args.from_time is None or args.to_time is None):
-        parser.error("--from and --to must be passed together.")
-    ffmpeg_path = find_ffmpeg(explicit=None)
-
-    print(f"Media: {media}")
-    print(f"Separated audio cache: {cache_dir}")
-    print(f"Music: {output_dir}")
-    if args.dry_run and not cache_dir.is_dir():
-        print("Would separate the soundtrack, then search it for music (dry run).")
-        return 0
-
-    gated = args.min_musicality > 0
-    if gated and args.model != "htdemucs_6s":
-        parser.error(
-            "--min-musicality needs --model htdemucs_6s: the test asks whether two pitched "
-            "instruments sound together, and only that model separates guitar and piano. "
-            "Pass --min-musicality 0 to keep everything the loudness found instead."
-        )
-
-    stems: dict[str, Path] = {}
-    if gated or args.stems:
-        stems = ensure_stems(
-            media, model=args.model, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path
-        )
-
-    # The dub's own cache first: a film already separated for --separate-bgm costs
-    # nothing here. Failing that the instrumental is mixed back from the stems,
-    # which saves separating the same soundtrack a second time.
-    instrumental = separated_bgm_path(cache_dir)
-    voice = separated_voice_path(cache_dir)
-    if instrumental.is_file() and voice.is_file():
-        print(f"Reusing the separated background track: {instrumental.name}")
-    elif stems:
-        instrumental = mix_instrumental(
-            stems, target=instrumental, ffmpeg_path=ffmpeg_path
-        )
-        voice = stems["vocals"]
-    else:
-        instrumental = ensure_instrumental(media, cache_dir=cache_dir, ffmpeg_path=ffmpeg_path)
-        voice = separated_voice_path(cache_dir)
-    if not voice.is_file():
-        raise MusicError(
-            f"The separated voice track is missing: {voice}. It is what says which "
-            f"stretches nobody talks over. Delete {separated_bgm_path(cache_dir).parent} "
-            "and run again to rebuild both."
-        )
-
-    # Each piece travels with the file it gets cut out of.
-    found: list[tuple[MusicPiece, Path]] = []
-    if named:
-        piece = MusicPiece(
-            start=parse_timecode(args.from_time),
-            end=parse_timecode(args.to_time),
-            voice_share=0.0,
-            peak_lufs=0.0,
-            labelled="named",
-        )
-        found.append((piece, media if args.source == "mix" else instrumental))
-    else:
-        songs: list[MusicPiece] = []
-        if args.subtitle:
-            songs = sung_spans(parse_srt(existing_file(parser, args.subtitle, "Subtitle file")))
-            print(f"Songs marked in the subtitle: {len(songs)}")
-
-        print("Measuring the soundtrack...")
-        pitched = [
-            loudness_envelope(stems[name], ffmpeg_path=ffmpeg_path)
-            for name in PITCHED_STEMS
-            if name in stems
-        ]
-        # The songs are found first and masked out of the search, so a song does
-        # not come back a second time inside the longer stretch around it.
-        pieces = find_music(
-            loudness_envelope(instrumental, ffmpeg_path=ffmpeg_path),
-            loudness_envelope(voice, ffmpeg_path=ffmpeg_path),
-            music_floor=args.music_floor,
-            voice_floor=args.voice_floor,
-            min_duration=args.min_duration,
-            clean_only=args.clean,
-            exclude=[(song.start, song.end) for song in songs],
-            pitched=pitched,
-            min_musicality=args.min_musicality,
-        )
-        found = [(piece, instrumental) for piece in pieces]
-        # A song is cut from the soundtrack itself: without its singing it is not
-        # the song, and the singing is the half separation takes out. A person
-        # marked these, so they skip the music test -- but a one-second scrap of
-        # one is still not worth writing out.
-        found += [
-            (song, media) for song in songs if song.duration >= args.min_duration
-        ]
-        found.sort(key=lambda pair: pair[0].start)
-
-    print(f"Pieces found: {len(found)}")
-    for number, (piece, _source) in enumerate(found, start=1):
-        print(
-            f"  {number:02d}  {piece.kind:15s} {piece.clock_range} "
-            f"({piece.duration:6.1f}s, voice {piece.voice_share:.0%})"
-        )
-    if args.dry_run:
-        print(f"Would write {len(found)} file(s) to: {output_dir}")
-        return 0
-    if not found:
-        print("Nothing long enough to write out. Lower --min-duration to widen the search.")
-        return 1
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    written: list[dict[str, object]] = []
-    rates: dict[Path, int | None] = {}
-    for number, (piece, source) in enumerate(found, start=1):
-        target = output_dir / piece_filename(media, number, piece, audio_format=args.audio_format)
-        if target.exists() and not args.overwrite:
-            parser.error(f"Music file already exists: {target}. Pass --overwrite to replace it.")
-        if source not in rates:
-            rates[source] = probe_sample_rate(source, ffmpeg_path=ffmpeg_path)
-        completed = subprocess.run(
-            extract_command(
-                source,
-                piece,
-                output=target,
-                ffmpeg_path=ffmpeg_path,
-                normalize=not args.raw_levels,
-                sample_rate=rates[source],
-                audio_format=args.audio_format,
-            ),
-            capture_output=True,
-            text=True,
-        )
-        if completed.returncode != 0 or not target.is_file():
-            raise MusicError(f"Could not cut {target.name}: {(completed.stderr or '').strip()}")
-        written.append({**piece.to_dict(), "file": target.name})
-
-    report = output_dir / f"{media.stem}.music.json"
-    write_json(
-        report,
-        {
-            "schema": "video-txt.music",
-            "version": 1,
-            "media": str(media),
-            "instrumental": str(instrumental),
-            "stems": {name: str(path) for name, path in stems.items()},
-            "format": args.audio_format,
-            "normalized": not args.raw_levels,
-            "piece_count": len(written),
-            "pieces": written,
-        },
+    options = MusicOptions(
+        media=existing_file(parser, args.media, "Media file"),
+        subtitle=existing_file(parser, args.subtitle, "Subtitle file") if args.subtitle else None,
+        output_dir=resolved(args.output_dir), cache_dir=resolved(args.cache_dir),
+        from_time=parse_timecode(args.from_time) if args.from_time is not None else None,
+        to_time=parse_timecode(args.to_time) if args.to_time is not None else None,
+        min_duration=args.min_duration, min_musicality=args.min_musicality,
+        model=args.model, stems=args.stems, source=args.source,
+        music_floor=args.music_floor, voice_floor=args.voice_floor, clean=args.clean,
+        audio_format=args.audio_format, raw_levels=args.raw_levels,
+        overwrite=args.overwrite, dry_run=args.dry_run,
     )
-    print(f"Wrote {len(written)} music file(s) to: {output_dir}")
-    print(f"Whole-film instrumental: {instrumental}")
-    if stems:
-        print(f"Stems: {', '.join(sorted(stems))} in {next(iter(stems.values())).parent}")
-    print(f"Report: {report}")
-    return 0
+    return run_music(options)
 
 
 def command_bilingual(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
@@ -1316,106 +1181,56 @@ def command_mux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
     return 0
 
 
-def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    validate_hard_subtitle_options(parser, args)
+def build_workflow(args: WorkflowConfig, parser: argparse.ArgumentParser) -> Workflow:
+    if args.workflow == "dub":
+        validate_fit_options(parser, args)
+        validate_voice_options(parser, args)
+    else:
+        validate_hard_subtitle_options(parser, args)
     video = existing_file(parser, args.video, "Video file")
     subtitle = existing_file(parser, args.subtitle, "Subtitle file") if args.subtitle else None
     output_dir = resolved(args.output_dir) or video.parent
-    video_output = resolved(args.video_output) or default_video_output(
-        video, mux_mode=args.mux_mode, target_language=args.target_language
+    video_output = resolved(args.video_output) or (
+        default_dubbed_output(video, target_language=args.target_language)
+        if args.workflow == "dub" else default_video_output(
+            video, mux_mode=args.mux_mode, target_language=args.target_language
+        )
     )
+    stage = build_translate_stage(
+        args, parser, require_key=not args.dry_run,
+        output_path=resolved(args.subtitle_output), output_dir=output_dir,
+        spoken=args.workflow == "dub",
+    )
+    workflow = Workflow(
+        video=video, subtitle=subtitle, output_dir=output_dir,
+        transcribe_stage=build_transcribe_stage(args), translate_stage=stage,
+        revisions=resolved(args.revisions), bilingual=args.bilingual,
+        bilingual_order=args.bilingual_order, dry_run=args.dry_run,
+    )
+    if args.workflow == "dub":
+        workflow.diarize_options = build_diarize_options(args) if args.diarize else None
+        workflow.dub_options_for = lambda source, translated, turns: build_dub_options(
+            args, parser, video=video, subtitle=translated, source_subtitle=source,
+            video_output=video_output, translation=stage.require_config, turns=turns,
+        )
+    else:
+        workflow.mux_options_for = lambda translated: build_mux_options(
+            args, video=video, subtitle=translated, video_output=video_output,
+        )
+    return workflow
 
-    output = run_pipeline(
-        video=video,
-        subtitle=subtitle,
-        output_dir=output_dir,
-        transcribe_stage=build_transcribe_stage(args),
-        translate_stage=build_translate_stage(
-            args,
-            parser,
-            require_key=not args.dry_run,
-            output_path=resolved(args.subtitle_output),
-            output_dir=output_dir,
-        ),
-        mux_options_for=lambda translated: build_mux_options(
-            args, video=video, subtitle=translated, video_output=video_output
-        ),
-        revisions=resolved(args.revisions),
-        bilingual=args.bilingual,
-        bilingual_order=args.bilingual_order,
-        dry_run=args.dry_run,
-    )
+
+def command_run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    workflow = build_workflow(WorkflowConfig.from_namespace(args, workflow="run"), parser)
+    output = run_workflow(workflow)
     if not args.dry_run:
         print(f"Done: {output}")
     return 0
 
 
 def command_dub(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
-    validate_fit_options(parser, args)
-    validate_voice_options(parser, args)
-    video = existing_file(parser, args.video, "Video file")
-    subtitle = existing_file(parser, args.subtitle, "Subtitle file") if args.subtitle else None
-    output_dir = resolved(args.output_dir) or video.parent
-    video_output = resolved(args.video_output) or default_dubbed_output(
-        video, target_language=args.target_language
-    )
-
-    # Diarization comes first because it is the stage most likely to be turned
-    # away for a missing token, and nothing before it is worth paying for twice.
-    stages = 4 if args.diarize else 3
-    turns = []
-    if args.diarize:
-        turns = ensure_speakers(
-            video,
-            options=build_diarize_options(args),
-            dry_run=args.dry_run,
-            label=f"[1/{stages}]",
-        )
-
-    source_subtitle = ensure_source_subtitle(
-        video,
-        subtitle=subtitle,
-        output_dir=output_dir,
-        stage=build_transcribe_stage(args),
-        dry_run=args.dry_run,
-        label=f"[{stages - 2}/{stages}]",
-    )
-    translate_stage = build_translate_stage(
-        args,
-        parser,
-        require_key=not args.dry_run,
-        output_path=resolved(args.subtitle_output),
-        output_dir=output_dir,
-        # The lines are going to be spoken, so they should read like speech.
-        # An already-translated subtitle is reused as is: --retranslate redoes it.
-        spoken=True,
-    )
-    translated = ensure_translated_subtitle(
-        source_subtitle,
-        stage=translate_stage,
-        dry_run=args.dry_run,
-        label=f"[{stages - 1}/{stages}]",
-    )
-    translated = ensure_revised_subtitle(
-        source_subtitle,
-        translated,
-        revisions=resolved(args.revisions),
-        terminology=translate_stage.config.terminology,
-        dry_run=args.dry_run,
-    )
-
-    print(f"[{stages}/{stages}] Dub: {args.tts_engine} {dub_voicing(args)}")
-    options = build_dub_options(
-        args,
-        parser,
-        video=video,
-        subtitle=translated,
-        source_subtitle=source_subtitle,
-        video_output=video_output,
-        translation=translate_stage.require_config,
-        turns=turns,
-    )
-    output = run_dub(options, dry_run=args.dry_run)
+    workflow = build_workflow(WorkflowConfig.from_namespace(args, workflow="dub"), parser)
+    output = run_workflow(workflow)
     if not args.dry_run:
         print(f"Done: {output}")
     return 0
@@ -1464,21 +1279,15 @@ def command_project(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         if not inspection.stale:
             print("All enabled stages are current; nothing to run.")
             return 0
+        workflow = build_workflow(project_workflow_config(inspection, dry_run=args.dry_run), parser)
         if not args.dry_run:
-            untracked = untracked_project_outputs(inspection)
-            if untracked:
-                listed = "\n".join(f"  {path}" for path in untracked)
-                raise ProjectError(
-                    "Refusing to replace output files that are not recorded in project state:\n"
-                    f"{listed}\nMove them aside, choose new output paths, "
-                    "or use --dry-run to inspect."
-                )
-        legacy_argv = project_legacy_argv(inspection, dry_run=args.dry_run)
-        legacy_args = build_parser().parse_args(legacy_argv)
-        legacy_args.project_reuse_translation = not inspection.statuses["translate"].stale
-        code = legacy_args.handler(legacy_args, parser)
-        if code != 0 or args.dry_run:
-            return code
+            begin_project_run(inspection)
+            workflow.on_stage_complete = lambda name: checkpoint_project_stage(
+                inspection.project_path, name
+            )
+        run_workflow(workflow)
+        if args.dry_run:
+            return 0
         requested_stream = transcription.get("audio_stream")
         if isinstance(requested_stream, int):
             audio_selection: dict[str, object] = {
@@ -1538,9 +1347,8 @@ def command_project(args: argparse.Namespace, parser: argparse.ArgumentParser) -
         return 0
     if args.project_action != "init":
         parser.error(f"Unknown project action: {args.project_action}")
-    # The same checks the workflow's own command runs, run now: `project run`
-    # replays this configuration as that command, so a combination it would
-    # reject has to be caught while it is being typed, not a stage later.
+    # Project creation and direct commands accept the same workflow settings.
+    # Reject incompatible options before saving a project that cannot run.
     if args.workflow == "dub":
         validate_fit_options(parser, args)
         validate_voice_options(parser, args)
@@ -1573,7 +1381,7 @@ def command_project(args: argparse.Namespace, parser: argparse.ArgumentParser) -
     payload = create_project_config(
         project_path=project_path,
         video=video,
-        args=args,
+        args=WorkflowConfig.from_namespace(args, workflow=args.workflow),
         term_file=term_file,
         revisions_file=revisions_file,
         subtitle=subtitle,
@@ -1592,6 +1400,18 @@ class Command:
 
 
 COMMANDS = (
+    Command(
+        "sync-notes",
+        "Discover subtitle pairs and run one queued Obsidian import with a cited summary.",
+        notes_sync.add_arguments,
+        notes_sync.command,
+    ),
+    Command(
+        "export-notes",
+        "Export existing subtitles as immutable, timestamped Obsidian source notes.",
+        notes.add_arguments,
+        notes.command,
+    ),
     Command(
         "project",
         "Create, inspect and run reproducible video projects.",
@@ -1699,6 +1519,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.handler(args, parser)
     except (
+        notes.NotesError,
         CloneError,
         CredentialError,
         DiarizeError,
@@ -1716,6 +1537,7 @@ def main(argv: list[str] | None = None) -> int:
         TerminologyError,
         TranscribeError,
         TranslationError,
+        WorkflowConfigError,
     ) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

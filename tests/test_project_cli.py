@@ -10,15 +10,14 @@ from video_txt.cli import main
 from video_txt.project import (
     build_project_state,
     inspect_project,
-    project_legacy_argv,
+    project_workflow_config,
     write_json,
 )
 from video_txt.terminology import translation_audit_path_for
 
 
 def test_project_init_refuses_what_the_dub_workflow_would_refuse(tmp_path):
-    """`project run` replays a dub project as the dub command. A combination that
-    command rejects has to fail here, not one stage and one config file later."""
+    """Project creation rejects the same incompatible options as a direct dub."""
     video = tmp_path / "movie.mkv"
     video.write_bytes(b"movie-content")
     project_file = tmp_path / "project.video-txt.json"
@@ -308,7 +307,7 @@ def test_a_project_without_revisions_keeps_the_revise_stage_out_of_the_way(tmp_p
     assert "revise: disabled for this workflow" in capsys.readouterr().out
 
 
-def test_project_run_replays_the_revision_file(tmp_path):
+def test_project_run_resolves_the_revision_file(tmp_path):
     video = tmp_path / "movie.mkv"
     video.write_bytes(b"movie")
     revisions = tmp_path / "revisions.json"
@@ -330,10 +329,9 @@ def test_project_run_replays_the_revision_file(tmp_path):
         ]
     )
 
-    argv = project_legacy_argv(inspect_project(project_file), dry_run=True)
+    config = project_workflow_config(inspect_project(project_file), dry_run=True)
 
-    assert "--revisions" in argv
-    assert argv[argv.index("--revisions") + 1] == str(revisions.resolve())
+    assert config.revisions == revisions.resolve()
 
 
 def test_project_init_reads_the_revision_file_before_writing_the_project(tmp_path):
@@ -525,7 +523,8 @@ def test_successful_project_run_records_artifacts_and_actual_stream(tmp_path, mo
         == 0
     )
 
-    def fake_pipeline(**kwargs):
+    def fake_pipeline(workflow):
+        kwargs = vars(workflow)
         source = kwargs["output_dir"] / "movie.srt"
         source.write_text("source", encoding="utf-8")
         translated = kwargs["translate_stage"].output_path
@@ -536,7 +535,7 @@ def test_successful_project_run_records_artifacts_and_actual_stream(tmp_path, mo
         output.write_bytes(b"muxed")
         return output
 
-    monkeypatch.setattr(cli_module, "run_pipeline", fake_pipeline)
+    monkeypatch.setattr(cli_module, "run_workflow", fake_pipeline)
 
     assert main(["project", "run", str(project_file)]) == 0
 
@@ -558,9 +557,9 @@ def test_successful_project_run_records_artifacts_and_actual_stream(tmp_path, mo
 
     monkeypatch.setattr(
         cli_module,
-        "run_pipeline",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("a current project must not enter the legacy pipeline")
+        "run_workflow",
+        lambda _workflow: (_ for _ in ()).throw(
+            AssertionError("a current project must not execute the workflow")
         ),
     )
     assert main(["project", "run", str(project_file)]) == 0
@@ -635,3 +634,237 @@ def test_project_init_records_dub_voice_speaker_and_cache_settings(
     assert "Dub: f5-tts cloning the original voice" in output
     assert str(tmp_path / "cache" / "voices") in output
     assert str(tmp_path / "outputs" / "movie.dub.wav") in output
+
+
+@pytest.mark.parametrize("partial_output", [False, True])
+def test_project_retry_keeps_completed_transcription_after_translation_failure(
+    tmp_path, monkeypatch, partial_output
+):
+    from video_txt import pipeline
+    from video_txt.translate import TranslationError
+
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    project = tmp_path / "project.json"
+    assert (
+        main(
+            [
+                "project",
+                "init",
+                str(video),
+                "-o",
+                str(project),
+                "--provider",
+                "deepseek",
+                "--skip-transcript-check",
+            ]
+        )
+        == 0
+    )
+    calls = []
+
+    def transcribe(options, **kwargs):
+        calls.append("transcribe")
+        path = options.output_dir / "movie.srt"
+        path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n")
+        return path
+
+    def translate(source, *, stage, **kwargs):
+        calls.append("translate")
+        if calls.count("translate") == 1:
+            if partial_output:
+                stage.output_path.write_text("incomplete")
+                translation_audit_path_for(stage.output_path).write_text("{}")
+            raise TranslationError("simulated outage")
+        assert stage.retranslate
+        stage.output_path.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n")
+        translation_audit_path_for(stage.output_path).write_text("{}")
+        return stage.output_path
+
+    def mux(options, **kwargs):
+        options.video_output.write_bytes(b"muxed")
+        return options.video_output
+
+    monkeypatch.setattr(pipeline, "run_transcribe", transcribe)
+    monkeypatch.setattr(pipeline, "ensure_translated_subtitle", translate)
+    monkeypatch.setattr(pipeline, "run_mux", mux)
+    assert main(["project", "run", str(project)]) == 1
+    assert not inspect_project(project).statuses["transcribe"].stale
+    assert main(["project", "run", str(project)]) == 0
+    assert calls == ["transcribe", "translate", "translate"]
+    assert not inspect_project(project).stale
+
+
+@pytest.mark.parametrize("workflow", ["run", "dub"])
+def test_project_and_cli_build_equivalent_workflow_settings(tmp_path, workflow):
+    from dataclasses import fields
+
+    from video_txt.workflow_config import WorkflowConfig
+
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    project = tmp_path / "project.json"
+    shared = [
+        "--provider",
+        "deepseek",
+        "--reasoning-effort",
+        "none",
+        "--language",
+        "en",
+        "--batch-chars",
+        "1200",
+        "--concurrency",
+        "2",
+        "--note",
+        "Keep punctuation",
+        "--preserve-term",
+        "Example",
+    ]
+    selected = (
+        ["--bilingual", "--bilingual-order", "source-first", "--crf", "24"]
+        if workflow == "run"
+        else ["--tts-engine", "say", "--bgm-volume", "0.3", "--voice-unit", "line", "--keep-bgm"]
+    )
+    assert (
+        main(
+            [
+                "project",
+                "init",
+                str(video),
+                "-o",
+                str(project),
+                "--workflow",
+                workflow,
+                *shared,
+                *selected,
+            ]
+        )
+        == 0
+    )
+    parser = cli_module.build_parser()
+    direct = WorkflowConfig.from_namespace(
+        parser.parse_args([workflow, str(video), *shared, *selected, "--dry-run"]),
+        workflow=workflow,
+    )
+    saved = project_workflow_config(inspect_project(project), dry_run=True)
+    # Both adapters must produce the same effective translation and output settings.
+    left = cli_module.build_translation_config(direct, parser, require_key=False)
+    right = cli_module.build_translation_config(saved, parser, require_key=False)
+    assert left == right
+    direct_workflow = cli_module.build_workflow(direct, parser)
+    saved_workflow = cli_module.build_workflow(saved, parser)
+    if workflow == "run":
+        assert direct_workflow.bilingual == saved_workflow.bilingual is True
+        assert direct_workflow.bilingual_order == saved_workflow.bilingual_order == "source-first"
+        subtitle = tmp_path / "movie.zh.srt"
+        assert direct_workflow.mux_options_for(subtitle) == saved_workflow.mux_options_for(subtitle)
+    else:
+        subtitle = tmp_path / "movie.zh.srt"
+        source = tmp_path / "movie.srt"
+        first = direct_workflow.dub_options_for(source, subtitle, [])
+        second = saved_workflow.dub_options_for(source, subtitle, [])
+        for item in fields(first):
+            if item.name not in {"audio_output", "cache_dir"}:
+                assert getattr(first, item.name) == getattr(second, item.name), item.name
+
+
+def test_project_rejects_new_external_output_path_even_with_old_stage_record(tmp_path, capsys):
+    from video_txt.project import begin_project_run
+
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    project = tmp_path / "project.json"
+    main(["project", "init", str(video), "-o", str(project)])
+    inspection = inspect_project(project)
+    begin_project_run(inspection)
+    external = tmp_path / "external.srt"
+    external.write_text("user-owned")
+    config = json.loads(project.read_text())
+    config["paths"]["source_subtitle"] = external.name
+    write_json(project, config)
+    assert main(["project", "run", str(project)]) == 1
+    assert "not recorded in project state" in capsys.readouterr().err
+    assert external.read_text() == "user-owned"
+
+
+@pytest.mark.parametrize(
+    "key,value",
+    [
+        ("concurrency", "two"),
+        ("resume", "false"),
+        ("provider", "unknown"),
+        ("preserve_terms", "abc"),
+    ],
+)
+def test_project_invalid_settings_report_error_without_creating_state(tmp_path, key, value):
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    project = tmp_path / "project.json"
+    main(["project", "init", str(video), "-o", str(project)])
+    payload = json.loads(project.read_text())
+    payload["translation"][key] = value
+    write_json(project, payload)
+    assert main(["project", "run", str(project)]) == 1
+    assert not inspect_project(project).state_path.exists()
+
+
+def test_dub_checkpoints_keep_audio_owned_across_reruns(tmp_path, monkeypatch):
+    from video_txt import pipeline
+    from video_txt.project import untracked_project_outputs
+
+    video = tmp_path / "movie.mkv"
+    video.write_bytes(b"movie")
+    source = tmp_path / "movie.srt"
+    source.write_text("1\n00:00:00,000 --> 00:00:02,000\nHello\n")
+    project = tmp_path / "project.json"
+    assert (
+        main(
+            [
+                "project",
+                "init",
+                str(video),
+                "-o",
+                str(project),
+                "--workflow",
+                "dub",
+                "--subtitle",
+                str(source),
+                "--skip-transcript-check",
+                "--tts-engine",
+                "say",
+            ]
+        )
+        == 0
+    )
+
+    def translate(source, *, stage, **kwargs):
+        stage.output_path.write_text("1\n00:00:00,000 --> 00:00:02,000\n你好\n")
+        translation_audit_path_for(stage.output_path).write_text("{}")
+        return stage.output_path
+
+    def dub(options, **kwargs):
+        options.video_output.write_bytes(b"movie")
+        options.audio_output.write_bytes(b"voice")
+        return options.video_output
+
+    monkeypatch.setattr(pipeline, "ensure_translated_subtitle", translate)
+    monkeypatch.setattr(pipeline, "run_dub", dub)
+    assert main(["project", "run", str(project)]) == 0
+    payload = json.loads(project.read_text())
+    payload["tts"]["rate"] = "+10%"
+    write_json(project, payload)
+    assert not untracked_project_outputs(inspect_project(project))
+    assert main(["project", "run", str(project)]) == 0
+
+
+def test_workflow_defaults_agree_with_cli_for_old_project_missing_fields():
+    from pathlib import Path
+
+    from video_txt.workflow_config import WorkflowConfig
+
+    parser = cli_module.build_parser()
+    for command in ("run", "dub"):
+        args = vars(parser.parse_args([command, "movie.mp4"]))
+        defaults = vars(WorkflowConfig(video=Path("movie.mp4"), workflow=command))
+        for name in args.keys() & defaults.keys():
+            assert args[name] == defaults[name], (command, name)

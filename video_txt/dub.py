@@ -47,6 +47,7 @@ from .media import (
     run_ffprobe,
     temporary_output_path,
 )
+from .model_client import cleanup_debug_dir, default_debug_dir
 from .mux import container_arguments, subtitle_track_arguments
 from .parallel import map_in_parallel
 from .separate import (
@@ -68,7 +69,6 @@ from .timeline import (
     split_into_sentences,
     spoken_duration,
 )
-from .translate import cleanup_debug_dir, default_debug_dir
 from .voices import (
     DEFAULT_VOICE,
     VoiceChoice,

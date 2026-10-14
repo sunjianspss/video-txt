@@ -68,12 +68,13 @@ uv run --python 3.12 video-txt project run project.video-txt.json
 ```
 
 - `project.video-txt.json` 只保存稳定声明；相对路径始终以该文件所在目录为基准。
-- `.video-txt/state.json` 保存上次成功运行的内容/配置指纹、实际 Whisper 后端与模型、实际音轨及选择依据、阶段状态和产物。
+- `.video-txt/state.json` 在执行前登记产物路径，每阶段成功后保存内容/配置指纹。中途失败可直接重跑，已完成阶段继续复用；整条流程成功后补充实际 Whisper 后端、模型和音轨信息。
 - 视频、原文字幕、术语表和译文按内容 SHA-256 判断，单纯 touch 文件不会失效。
 - 音轨或转写设置变化会使转写及下游过期；原文、术语表或翻译设置只从翻译向下失效；字幕样式只重跑 mux；音色只重跑配音并复用未变化的语音片段缓存。
 - 项目 JSON 和 state 只记录凭据环境变量名，不保存 API key、token 或其他秘密；真正执行云端阶段时仍从环境变量或凭据文件读取。
 - 没有 state 时，已有目标译文或成片视为外部文件，真实运行会拒绝覆盖；先 dry-run，或把文件移开/改输出路径。
-- `project run --dry-run` 不写字幕、成片或 state。原有 `run`、`dub`、`translate` 等命令行为不变。
+- `project init --bilingual --bilingual-order source-first` 可保存双语字幕设置；顺序默认为译文在前。
+- `project run --dry-run` 不写字幕、成片或 state；`music --dry-run` 只展示处理计划，缓存目录已存在时也不会启动分离或导出。
 
 ## 指定时间段局部重新识别（v0.7）
 
@@ -596,8 +597,7 @@ uv run video-txt run "$V" --provider lmstudio --mux-mode soft --subtitle "${V%.m
 ## 中文配音
 
 ```bash
-uv sync --extra dub                            # 只做一次,装的是 edge-tts,合成时要联网
-uv run video-txt dub "$V" --provider lmstudio
+uv run --python 3.12 video-txt dub "$V" --provider lmstudio  # 默认曼波
 ```
 
 和字幕流程一样先转写、再翻译,然后合成中文语音、按字幕时间轴对齐、混进视频,
@@ -606,7 +606,9 @@ uv run video-txt dub "$V" --provider lmstudio
 加 `--retranslate` 重翻一次。
 
 两个默认值先记住:**默认整轨替换原声**(保留背景声的两种方式见下面「常用调整」),
-默认音色是 `zh-CN-XiaoxiaoNeural` 女声。
+默认单人配音是 **曼波**，使用本地 IndexTTS；安装要求见下方“曼波配音”。
+想用晓晓时加 `--voice zh-CN-XiaoxiaoNeural`（需要 `uv sync --extra dub`，合成时联网）。
+显式选择 `--tts-engine` 时遵循该引擎的默认音色，多说话人模式仍使用 Edge TTS 音色池。
 
 跑完的报告看这四行:
 
@@ -639,7 +641,7 @@ uv run video-txt dub "$V" --provider lmstudio
 
 | `--voice` 取值 | 性别 | 特点 |
 | --- | --- | --- |
-| `zh-CN-XiaoxiaoNeural` | 女 | 默认,温暖,口播和新闻都合适 |
+| `zh-CN-XiaoxiaoNeural` | 女 | 温暖,口播和新闻都合适 |
 | `zh-CN-XiaoyiNeural` | 女 | 活泼 |
 | `zh-CN-YunyangNeural` | 男 | 专业稳重,新闻腔 |
 | `zh-CN-YunxiNeural` | 男 | 明朗年轻 |
@@ -689,6 +691,29 @@ uv run video-txt dub "$V" --provider lmstudio --diarize
   pyannote,把手改覆盖掉;重跑时命令行上的 `--speakers` 等参数也要和 `cache_key` 里记的一致。
 - **字幕块数变了要重建。** 做过 `retranscribe-range` 之后块边界全变了,旧 turn 的时间对不上新块,
   角色会整段错位——按新的字幕时间轴重写一遍。
+
+### 曼波配音
+
+```bash
+uv run --python 3.12 video-txt dub '/绝对路径/视频.mp4' --provider lmstudio
+# 默认就是曼波，也可以显式写 --voice mambo 或 --voice 曼波。
+```
+
+`mambo` 是单人旁白预设：自动使用 IndexTTS 和项目自带的曼波参考音频，不需要每次填写
+`--clone-reference`。默认从 `~/tools/index-tts` 读取已安装的引擎和模型；装在别处时加
+`--clone-repo '/你的/index-tts目录'`。尚未安装时按下一节安装，不会自动下载大模型。
+
+参考声音来自 [MamboTTS](https://github.com/Tsukimisaka/MamboTTS)，文件来源见
+[voice_samples/README.md](video_txt/voice_samples/README.md)。这里通过 IndexTTS 克隆该参考，
+没有使用 MamboTTS 的专用 GPT-SoVITS 权重；新台词的相似度和语气需试听确认。
+音色取自这段参考，说话方式（语调、节奏）另借一段曼波语音 `mambo.emo.wav`，强度 0.8；
+自己的参考音频旁放同名的 `.emo.wav`（如 `voice.wav` 配 `voice.emo.wav`），index-tts 也会这样借用。
+本地合成比晓晓慢，建议先试短片。不能与 `--diarize`、`--speaker-voice` 或
+`--clone-reference` 同用，避免部分角色意外用回原声。
+
+`project init --workflow dub` 同样默认曼波。保存时展开成已有的引擎、模型目录和
+参考音频设置，`project run` 直接复用，不要求新的项目格式。已保存的项目继续使用各自
+明确记录的音色设置。
 
 ### 原声克隆:保留原讲者的声音
 
@@ -873,7 +898,86 @@ uv run --python 3.12 python translate_and_mux_video.py '/绝对路径/视频.mp4
   --mux-mode hard
 ```
 
-## 开发
+## 字幕导出到 Obsidian
+
+已有字幕可以直接生成带时间戳、段落引用和来源指纹的 Markdown，不重新转写、不调用模型：
+
+```bash
+uv run --python 3.12 video-txt export-notes '/绝对路径/访谈.mp4' \
+  --source '/绝对路径/访谈.srt' \
+  --translation '/绝对路径/访谈.zh.revised.srt' \
+  --vault '/绝对路径/Obsidian库' --folder 'ClaudeAI/raw/videos' \
+  --source-id 'interview-2026-10-13' --title '访谈标题' \
+  --author '讲者或频道' --source-url 'https://原始来源地址' --dry-run
+```
+
+先预览，去掉 `--dry-run` 正式导出。`--translation` 必须明确选择完整译文，有校订稿时优先
+选择适用的校订稿；不接受配音压缩版 `.fitted.srt` 或双语版 `.bilingual.srt`。两份输入仍须
+通过时间轴、非空、媒体覆盖范围等检查。`--published YYYY-MM-DD` 只填确认的来源发布日期，
+不知道就省略，不拿入库日期替代。
+
+- 默认严格检查原文与译文逐条配对。如果来自不同字幕流程，先确认是同一段视频，再显式使用
+  `--alignment independent`：各自分段、各自保留时间，不宣称逐句对齐。
+- YouTube 滚动英文字幕可显式加 `--source-rollup --alignment independent`。只消除相邻
+  重复显示的完整行，保留行内重复词和有时间间隔的重复句；空显示块会记录后略过。原 SRT
+  不变，每次处理记录与原文件指纹保存在导出清单中。这是显示整理，不是听写纠错。
+- 输出为 `<folder>/<source-id>/<内容版本>/原文.md`、`中文译文.md` 和 `manifest.json`；
+  `latest.json` 指向最新完整版本。原文和译文成对发布，旧版本留存，已引用的内容不被替换。
+- 同一输入重复导出不重复建页。`source-id` 是由你分配的稳定来源身份，之后改标题或移动
+  输入文件仍沿用它及原 `folder`；不依赖文件名猜身份，也不跨 ID 自动判断是不是同一视频。
+- 检测到来源稿被人工修改时拒绝继续，保留修改。批注、摘要和文章放在独立笔记里。
+- 摘要或文章的 YAML 添加 `video_source_id`、`video_revision`（值从导出结果复制）后，
+  再导出或 `--dry-run` 会在 `needs_review` 中列出版本过期的笔记。工具只报告，不改写人工正文。
+- 这是显式导出命令，不会常驻扫描、自动生成文章或自动运行 sun-history；写入知识库前，
+  按该库的约定先拍版本快照。摘要和文章由 Agent 或作者另外整理。
+
+首个真实用例为 Boris Cherny CHM 访谈：英文是独立的滚动字幕，中文采用已有校订版，
+分别导出并用时间定位核对。实现与恢复规则见 [NOTES.md](NOTES.md) 的“Obsidian 来源稿导出”一节。
+
+## Obsidian 自动入库与来源摘要
+
+本机 Obsidian 的「视频资料同步」（`sun-video-sync`）插件负责监听，`sync-notes` 负责
+队列与写入。保持 Obsidian 打开，把下列同名前缀的文件放在
+`~/Documents/docx/video/` 顶层即可：
+
+```text
+访谈.mp4
+访谈.en.srt       # 或 访谈.srt，二选一
+访谈.zh.srt      # 若存在 访谈.zh.revised.srt，优先采用校订版
+```
+
+插件每 2 分钟检查一次，文件连续稳定 120 秒后，每次处理一个项目：
+检查字幕 → 原文/中文 Markdown → Claude 来源摘要 → 已有相关页面、索引和日志的引用。
+第一次扫描只登记已有视频；打开左侧电影图标「视频资料」，在「历史项目」选择分类并
+点击「加入队列」。原有视频后来收到第一对字幕，也会视为新任务。
+
+- 原文/译文在 `<分类>/raw/videos/`，摘要在 `<分类>/wiki/sources/视频：…（版本）.md`。
+- 摘要使用现有 Claude CLI 登录和 Sonnet 模型，消耗相应额度；插件设置可改模型、目录、
+  扫描间隔或暂停。摘要标为待复核，文章仍按选题另行生成。
+- 摘要每条观点必须链接到真实来源段落，不能把口述数字或产品信息当成已核实事实。
+- 缺字幕会等待；多组候选或不对齐的字幕会停止。不同名、独立时间轴或滚动字幕先用
+  `export-notes` 显式登记，后续扫描沿用登记参数，Boris 用例已登记。
+- 错误在面板保存，可手动重试；相同输入不会自动反复调用模型。来源稿和有效摘要缓存保留，
+  已经人工改过的笔记不会被覆盖。字幕变化会保留新版本，并列出仍引用旧版的笔记。
+- 这里自动化的是已有字幕的入库，不会自行开始全片转写、翻译、配音或发布文章。
+
+无需 Obsidian 调度时，也可手动执行一轮（需要本机 Claude CLI 已登录）：
+
+```bash
+uv run --no-sync --python 3.12 video-txt sync-notes \
+  --vault '/完整路径/Obsidian知识库' --source-dir '/完整路径/视频目录'
+```
+
+`--action scan` 只扫描；`--action enqueue --job-id ID --category ClaudeAI` 选择历史项目；
+`--action retry --job-id ID` 恢复失败项，之后再运行默认动作；`--action ignore --job-id ID`
+暂停该项。输出 JSON 含 `processed`、`failed`、`counts` 和 `state_path`，单项失败的原因
+保存在状态文件相应 job 的 `error` 中。状态与缓存位于库外
+`~/Library/Application Support/sun-video-sync/<路径摘要>/`；未知状态版本拒绝读取。
+
+自动入库在写笔记前调用库内 sun-history 快照；裸 `export-notes` 仍由操作者先拍快照。
+目前只支持单台电脑处理一个来源；不要在多个 iCloud 客户端同时启动此同步。
+
+## 开发与检查
 
 ```bash
 uv sync --group dev

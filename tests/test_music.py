@@ -341,3 +341,22 @@ def test_every_stem_the_model_makes_has_a_place_in_the_cache():
 
     assert set(paths) == set(STEM_MODELS["htdemucs_6s"])
     assert paths["piano"] == Path("/cache/stems/htdemucs_6s/piano.flac")
+
+
+@pytest.mark.parametrize("cache_exists", [False, True])
+def test_music_dry_run_never_separates_or_writes(tmp_path, monkeypatch, cache_exists):
+    from video_txt import cli, music_workflow
+
+    media = tmp_path / "movie.mkv"
+    media.write_bytes(b"fixture")
+    cache = tmp_path / "cache"
+    if cache_exists:
+        cache.mkdir()
+    before = sorted(tmp_path.rglob("*"))
+    monkeypatch.setattr(music_workflow, "find_ffmpeg", lambda **kwargs: "/bin/echo")
+    def forbidden(*args, **kwargs):
+        pytest.fail("dry-run must not execute audio separation")
+    monkeypatch.setattr(music_workflow, "ensure_stems", forbidden)
+    monkeypatch.setattr(music_workflow, "ensure_instrumental", forbidden)
+    assert cli.main(["music", str(media), "--cache-dir", str(cache), "--dry-run"]) == 0
+    assert sorted(tmp_path.rglob("*")) == before

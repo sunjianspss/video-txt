@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from pathlib import Path
@@ -341,6 +342,8 @@ def test_the_manifest_carries_every_job_with_the_clip_it_clones(tmp_path):
             "output": str(tmp_path / "a.wav"),
             "reference_audio": str(tmp_path / "ref.wav"),
             "reference_text": "hello",
+            "emotion_audio": None,
+            "emotion_alpha": 0.8,
             "speed": None,
         }
     ]
@@ -492,3 +495,25 @@ def test_the_worker_turns_a_failure_into_an_exit_code_not_a_traceback(tmp_path, 
     assert clone_worker.main([str(manifest)]) == 1
     assert "Reference audio not found" in capsys.readouterr().err
     assert clone_worker.main([]) == 2
+
+
+def test_indextts_passes_the_delivery_clip_only_when_the_job_has_one(tmp_path):
+    engine = object.__new__(clone_worker.IndexTTSEngine)
+    calls: list[dict] = []
+
+    class Model:
+        def infer(self, spk_audio_prompt, text, output_path, emo_audio_prompt=None, emo_alpha=1.0):
+            calls.append({"emo": emo_audio_prompt, "alpha": emo_alpha})
+
+    engine.model = Model()
+    engine.infer_parameters = inspect.signature(Model.infer).parameters
+    engine.lang = "ZH"
+    engine.speed = 1.0
+    base = {"reference_audio": "/ref.wav", "text": "你好"}
+
+    engine.synthesize(base, tmp_path / "a.wav")
+    engine.synthesize(
+        {**base, "emotion_audio": "/drawl.wav", "emotion_alpha": 0.8}, tmp_path / "b.wav"
+    )
+
+    assert calls == [{"emo": None, "alpha": 1.0}, {"emo": "/drawl.wav", "alpha": 0.8}]

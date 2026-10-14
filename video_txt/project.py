@@ -3,13 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
+from .artifacts import write_json
 from .constants import (
     DEFAULT_BATCH_CHARS,
     DEFAULT_CONCURRENCY,
@@ -24,6 +23,7 @@ from .mux import default_video_output
 from .revise import revised_subtitle_path
 from .subtitles import translated_subtitle_path
 from .terminology import load_terminology, translation_audit_path_for
+from .workflow_config import WorkflowConfig
 
 PROJECT_SCHEMA = "video-txt.project"
 PROJECT_VERSION = 1
@@ -145,6 +145,9 @@ def evaluate_stages(
         if not isinstance(previous, Mapping):
             statuses[name] = StageStatus(name, True, "no recorded successful run")
             continue
+        if previous.get("status", "complete") != "complete":
+            statuses[name] = StageStatus(name, True, "previous run incomplete")
+            continue
         inputs = desired[name]
         if previous.get("fingerprint") != fingerprint_payload(inputs):
             statuses[name] = StageStatus(name, True, _changed_input_reason(inputs, previous))
@@ -191,7 +194,7 @@ def create_project_config(
     *,
     project_path: Path,
     video: Path,
-    args: Any,
+    args: WorkflowConfig,
     term_file: Path | None,
     revisions_file: Path | None,
     subtitle: Path | None,
@@ -269,18 +272,11 @@ def create_project_config(
             ),
         },
         "transcription": {
+            **_project_settings(args, "transcription"),
             "enabled": subtitle is None,
-            "audio_stream": args.audio_stream,
-            "backend": args.whisper_backend,
-            "model": args.whisper_model,
-            "language": args.language,
-            "device": args.device,
-            "initial_prompt": args.initial_prompt,
-            "whisper_args": args.whisper_args,
-            "refine_subtitles": args.refine_subtitles,
-            "skip_transcript_check": args.skip_transcript_check,
         },
         "translation": {
+            **_project_settings(args, "translation"),
             "provider": provider_name,
             "model": translation_model,
             "base_url": args.base_url or provider.get("base_url"),
@@ -293,92 +289,31 @@ def create_project_config(
                 loaded_terminology.source_language if loaded_terminology is not None else None
             ),
             "batch_chars": args.batch_chars or provider.get("batch_chars") or DEFAULT_BATCH_CHARS,
-            "retries": args.retries,
             "concurrency": args.concurrency or DEFAULT_CONCURRENCY,
-            "context_cues": args.context_cues,
             "reasoning_effort": (
                 args.reasoning_effort or provider.get("reasoning_effort") or "auto"
             ),
             "thinking": provider.get("thinking") or "auto",
             "timeout": args.timeout or DEFAULT_TIMEOUT,
-            "resume": args.resume,
-            "note": args.note,
             "preserve_terms": list(dict.fromkeys([*DEFAULT_TERMS, *args.preserve_term])),
             "terminology": terminology,
             "revisions": revisions,
         },
         "mux": {
-            "mode": args.mux_mode,
-            "language_code": args.language_code,
-            "default_subtitle": args.default_subtitle,
-            "subtitle_codec": args.subtitle_codec,
-            "hard_subtitle_layout": args.hard_subtitle_layout,
-            "hard_subtitle_font": args.hard_subtitle_font,
-            "hard_subtitle_font_size": args.hard_subtitle_font_size,
-            "hard_subtitle_margin_v": args.hard_subtitle_margin_v,
-            "hard_subtitle_box_height": args.hard_subtitle_box_height,
-            "hard_subtitle_box_opacity": args.hard_subtitle_box_opacity,
-            "video_codec": args.video_codec,
-            "crf": args.crf,
-            "preset": args.preset,
-            "video_size": args.video_size,
+            **_project_settings(args, "mux"),
             "ffmpeg": _portable_executable(args.ffmpeg_path, base=base),
         },
-        "tts": {
-            "engine": args.tts_engine,
-            "voice": args.voice,
-            "voice_unit": args.voice_unit,
-            "rate": args.rate,
-            "max_atempo": args.max_atempo,
-            "fit_duration": args.fit_duration,
-            "fit_tempo": args.fit_tempo,
-            "fit_rounds": args.fit_rounds,
-            "keep_bgm": args.keep_bgm,
-            "separate_bgm": args.separate_bgm,
-            "bgm_volume": args.bgm_volume,
-            "keep_dub_audio": args.keep_dub_audio,
-            "soft_subtitle": args.soft_subtitle,
-            "concurrency": args.tts_concurrency,
-            "prune_cache": args.prune_cache,
-        },
-        "speakers": {
-            "enabled": args.diarize,
-            "count": args.speaker_count,
-            "min": args.min_speakers,
-            "max": args.max_speakers,
-            "voices": args.speaker_voices,
-            "model": args.diarize_model,
-            "credential_env": args.hf_token_env,
-        },
+        "tts": _project_settings(args, "tts"),
+        "speakers": _project_settings(args, "speakers"),
         "voice_clone": {
-            "model": args.clone_model,
+            **_project_settings(args, "voice_clone"),
             "references": _clone_reference_records(args.clone_references, base=base),
             "repo": (
                 relative_path(args.clone_repo, base=base) if args.clone_repo is not None else None
             ),
             "python": _portable_executable(args.clone_python, base=base),
-            "device": args.clone_device,
         },
     }
-
-
-def write_json(path: Path, payload: dict[str, object]) -> Path:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
-    )
-    temporary = Path(temporary_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        temporary.replace(path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    return path
 
 
 def _read_json_object(path: Path, *, label: str) -> dict[str, object]:
@@ -585,16 +520,7 @@ def build_project_state(
             "Cannot record a successful project state; missing artifacts for: "
             + ", ".join(sorted(missing))
         )
-    artifact_paths = {
-        "transcribe": [inspection.paths.get("source_subtitle")],
-        "translate": [
-            inspection.paths.get("translated_subtitle"),
-            inspection.paths.get("translation_audit"),
-        ],
-        "revise": [inspection.paths.get("revised_subtitle")],
-        "mux": [inspection.paths.get("video_output")],
-        "tts": [inspection.paths.get("video_output")],
-    }
+    artifact_paths = project_artifacts(inspection)
     stages: dict[str, object] = {}
     for name in inspection.enabled:
         record = stage_record(inspection.desired[name])
@@ -629,232 +555,223 @@ def build_project_state(
     }
 
 
-def untracked_project_outputs(inspection: ProjectInspection) -> list[Path]:
-    recorded = inspection.state.get("stages")
-    recorded_stages = recorded if isinstance(recorded, Mapping) else {}
-    candidates = {
-        "transcribe": (inspection.paths["source_subtitle"],),
-        "revise": (inspection.paths.get("revised_subtitle"),),
-        "translate": (
-            inspection.paths["translated_subtitle"],
-            inspection.paths["translation_audit"],
-        ),
-        "mux": (inspection.paths["video_output"],),
-        "tts": (inspection.paths["video_output"], inspection.paths["dub_audio"]),
+def project_artifacts(inspection: ProjectInspection) -> dict[str, tuple[Path, ...]]:
+    paths = inspection.paths
+    return {
+        "transcribe": (paths["source_subtitle"],),
+        "revise": (paths["revised_subtitle"],) if "revised_subtitle" in paths else (),
+        "translate": (paths["translated_subtitle"], paths["translation_audit"]),
+        "mux": (paths["video_output"],),
+        "tts": (paths["video_output"], paths["dub_audio"]),
     }
+
+
+def untracked_project_outputs(inspection: ProjectInspection) -> list[Path]:
+    recorded = inspection.state.get("stages", {})
+    if not isinstance(recorded, Mapping):
+        raise ProjectError("Project state stages must be an object.")
+    owned = {
+        (inspection.project_path.parent / value).resolve()
+        for record in recorded.values()
+        if isinstance(record, Mapping)
+        for value in record.get("artifacts", [])
+        if isinstance(value, str)
+    }
+    content = inspection.state.get("content", {})
+    audio = inspection.paths["dub_audio"]
+    tts = recorded.get("tts", {})
+    if (
+        isinstance(content, Mapping)
+        and isinstance(tts, Mapping)
+        and tts.get("status") == "complete"
+        and audio.is_file()
+        and content.get("dub_audio_sha256") == sha256_file(audio)
+    ):
+        owned.add(audio.resolve())
     return [
         path
-        for name in inspection.enabled
-        if inspection.statuses[name].stale and name not in recorded_stages
-        for path in candidates[name]
-        if path is not None and path.exists()
+        for name, paths in project_artifacts(inspection).items()
+        if name in inspection.enabled and inspection.statuses[name].stale
+        for path in paths
+        if path.exists() and path.resolve() not in owned
     ]
 
 
-def _append_option(arguments: list[str], flag: str, value: object) -> None:
-    if value is not None:
-        arguments.extend([flag, str(value)])
+def begin_project_run(inspection: ProjectInspection) -> None:
+    """Claim checked output paths before work, retaining completed checkpoints."""
+    untracked = untracked_project_outputs(inspection)
+    if untracked:
+        raise ProjectError(
+            "Refusing to replace output files that are not recorded in project state:\n"
+            + "\n".join(f"  {path}" for path in untracked)
+            + "\nMove them aside, choose new output paths, or use --dry-run to inspect."
+        )
+    state = dict(inspection.state)
+    stages = dict(state.get("stages", {}))
+    for name, paths in project_artifacts(inspection).items():
+        if name in inspection.enabled and inspection.statuses[name].stale:
+            stages[name] = {
+                "status": "pending",
+                "artifacts": [relative_path(p, base=inspection.project_path.parent) for p in paths],
+            }
+    state.update(schema=STATE_SCHEMA, version=STATE_VERSION, stages=stages)
+    write_json(inspection.state_path, state)
 
 
-def _resolved_executable(project_path: Path, value: object) -> object:
-    if not isinstance(value, str) or ("/" not in value and not value.startswith((".", "~"))):
-        return value
-    return _project_relative_path(project_path.parent, value, field="executable path")
+def checkpoint_project_stage(project_path: Path, name: str) -> None:
+    inspection = inspect_project(project_path)
+    if name not in inspection.enabled:
+        return
+    if not inspection.artifacts[name]:
+        raise ProjectError(f"Cannot complete {name}: expected artifacts are missing.")
+    state = dict(inspection.state)
+    stages = dict(state.get("stages", {}))
+    stages[name] = {
+        **stage_record(inspection.desired[name]),
+        "status": "complete",
+        "artifacts": [
+            relative_path(p, base=inspection.project_path.parent)
+            for p in project_artifacts(inspection)[name]
+        ],
+    }
+    state.update(stages=stages, updated_at=datetime.now(UTC).isoformat())
+    write_json(inspection.state_path, state)
 
 
-def project_legacy_argv(inspection: ProjectInspection, *, dry_run: bool) -> list[str]:
-    config = inspection.config
-    transcription = _required_mapping(config, "transcription")
-    translation = _required_mapping(config, "translation")
-    mux = _required_mapping(config, "mux")
-    workflow = str(config["workflow"])
-    arguments = [workflow, str(inspection.paths["video"])]
-    if not transcription.get("enabled", True):
-        arguments.extend(["--subtitle", str(inspection.paths["source_subtitle"])])
-    arguments.extend(
-        [
-            "--subtitle-output",
-            str(inspection.paths["translated_subtitle"]),
-            "--output-dir",
-            str(inspection.paths["output_dir"]),
-            "--video-output",
-            str(inspection.paths["video_output"]),
-        ]
+# One correspondence for writing and reading settings; paths are resolved separately.
+PROJECT_OPTION_FIELDS = {
+    "whisper_backend": ("transcription", "backend"),
+    "whisper_model": ("transcription", "model"),
+    "language": ("transcription", "language"),
+    "device": ("transcription", "device"),
+    "initial_prompt": ("transcription", "initial_prompt"),
+    "audio_stream": ("transcription", "audio_stream"),
+    "provider": ("translation", "provider"),
+    "model": ("translation", "model"),
+    "base_url": ("translation", "base_url"),
+    "api_key_env": ("translation", "credential_env"),
+    "target_language": ("translation", "target_language"),
+    "source_language": ("translation", "source_language"),
+    "batch_chars": ("translation", "batch_chars"),
+    "retries": ("translation", "retries"),
+    "concurrency": ("translation", "concurrency"),
+    "context_cues": ("translation", "context_cues"),
+    "reasoning_effort": ("translation", "reasoning_effort"),
+    "timeout": ("translation", "timeout"),
+    "note": ("translation", "note"),
+    "mux_mode": ("mux", "mode"),
+    "language_code": ("mux", "language_code"),
+    "subtitle_codec": ("mux", "subtitle_codec"),
+    "hard_subtitle_layout": ("mux", "hard_subtitle_layout"),
+    "hard_subtitle_font": ("mux", "hard_subtitle_font"),
+    "hard_subtitle_font_size": ("mux", "hard_subtitle_font_size"),
+    "hard_subtitle_margin_v": ("mux", "hard_subtitle_margin_v"),
+    "hard_subtitle_box_height": ("mux", "hard_subtitle_box_height"),
+    "hard_subtitle_box_opacity": ("mux", "hard_subtitle_box_opacity"),
+    "video_codec": ("mux", "video_codec"),
+    "crf": ("mux", "crf"),
+    "preset": ("mux", "preset"),
+    "video_size": ("mux", "video_size"),
+    "tts_engine": ("tts", "engine"),
+    "voice": ("tts", "voice"),
+    "voice_unit": ("tts", "voice_unit"),
+    "rate": ("tts", "rate"),
+    "max_atempo": ("tts", "max_atempo"),
+    "fit_tempo": ("tts", "fit_tempo"),
+    "fit_rounds": ("tts", "fit_rounds"),
+    "bgm_volume": ("tts", "bgm_volume"),
+    "tts_concurrency": ("tts", "concurrency"),
+    "speaker_count": ("speakers", "count"),
+    "min_speakers": ("speakers", "min"),
+    "max_speakers": ("speakers", "max"),
+    "diarize_model": ("speakers", "model"),
+    "hf_token_env": ("speakers", "credential_env"),
+    "clone_model": ("voice_clone", "model"),
+    "clone_device": ("voice_clone", "device"),
+    "refine_subtitles": ("transcription", "refine_subtitles"),
+    "skip_transcript_check": ("transcription", "skip_transcript_check"),
+    "whisper_args": ("transcription", "whisper_args"),
+    "preserve_term": ("translation", "preserve_terms"),
+    "resume": ("translation", "resume"),
+    "thinking": ("translation", "thinking"),
+    "default_subtitle": ("mux", "default_subtitle"),
+    "bilingual": ("mux", "bilingual"),
+    "bilingual_order": ("mux", "bilingual_order"),
+    "diarize": ("speakers", "enabled"),
+    "speaker_voices": ("speakers", "voices"),
+    "fit_duration": ("tts", "fit_duration"),
+    "keep_bgm": ("tts", "keep_bgm"),
+    "separate_bgm": ("tts", "separate_bgm"),
+    "keep_dub_audio": ("tts", "keep_dub_audio"),
+    "soft_subtitle": ("tts", "soft_subtitle"),
+    "prune_cache": ("tts", "prune_cache"),
+}
+
+
+def project_workflow_config(inspection: ProjectInspection, *, dry_run: bool) -> WorkflowConfig:
+    values: dict[str, object] = {"workflow": inspection.config["workflow"], "dry_run": dry_run}
+    for option, (section, key) in PROJECT_OPTION_FIELDS.items():
+        settings = _required_mapping(inspection.config, section)
+        if key in settings and settings[key] is not None:
+            values[option] = settings[key]
+    paths = inspection.paths
+    values.update(
+        video=paths["video"],
+        output_dir=paths["output_dir"],
+        subtitle_output=paths["translated_subtitle"],
+        video_output=paths["video_output"],
+        term_file=paths.get("terminology"),
+        revisions=paths.get("revisions"),
+        debug_dir=paths.get("translation_debug"),
+        cache_dir=paths["cache_dir"],
+        audio_output=paths["dub_audio"],
+        project_reuse_translation=not inspection.statuses["translate"].stale,
+        retranscribe=inspection.statuses["transcribe"].stale,
+        retranslate=inspection.statuses["translate"].stale,
     )
-
-    _append_option(arguments, "--backend", transcription.get("backend"))
-    _append_option(arguments, "--whisper-model", transcription.get("model"))
-    _append_option(arguments, "--language", transcription.get("language"))
-    _append_option(arguments, "--device", transcription.get("device"))
-    _append_option(arguments, "--initial-prompt", transcription.get("initial_prompt"))
-    _append_option(arguments, "--audio-stream", transcription.get("audio_stream"))
-    for value in transcription.get("whisper_args", []):
-        _append_option(arguments, "--whisper-arg", value)
-    if transcription.get("refine_subtitles"):
-        arguments.append("--refine-subtitles")
-    if transcription.get("skip_transcript_check"):
-        arguments.append("--skip-transcript-check")
-
-    _append_option(arguments, "--provider", translation.get("provider"))
-    _append_option(arguments, "--model", translation.get("model"))
-    _append_option(arguments, "--base-url", translation.get("base_url"))
-    _append_option(arguments, "--api-key-env", translation.get("credential_env"))
-    credentials_file = translation.get("credentials_file")
-    if credentials_file is not None:
-        arguments.extend(
-            [
-                "--secrets-file",
-                str(
-                    _project_relative_path(
-                        inspection.project_path.parent,
-                        credentials_file,
-                        field="translation.credentials_file",
-                    )
-                ),
-            ]
-        )
-    _append_option(arguments, "--target-language", translation.get("target_language"))
-    _append_option(arguments, "--source-language", translation.get("source_language"))
-    _append_option(arguments, "--batch-chars", translation.get("batch_chars"))
-    _append_option(arguments, "--retries", translation.get("retries"))
-    _append_option(arguments, "--concurrency", translation.get("concurrency"))
-    _append_option(arguments, "--context-cues", translation.get("context_cues"))
-    _append_option(arguments, "--reasoning-effort", translation.get("reasoning_effort"))
-    _append_option(arguments, "--timeout", translation.get("timeout"))
-    _append_option(arguments, "--note", translation.get("note"))
-    for value in translation.get("preserve_terms", []):
-        _append_option(arguments, "--preserve-term", value)
-    if not translation.get("resume", True):
-        arguments.append("--no-resume")
-    if "terminology" in inspection.paths:
-        arguments.extend(["--term-file", str(inspection.paths["terminology"])])
-    if "revisions" in inspection.paths:
-        arguments.extend(["--revisions", str(inspection.paths["revisions"])])
-    translation_debug = inspection.paths.get("translation_debug")
-    if translation_debug is not None:
-        arguments.extend(["--translation-debug-dir", str(translation_debug)])
-
-    if workflow == "run":
-        _append_option(arguments, "--mux-mode", mux.get("mode"))
-        _append_option(arguments, "--language-code", mux.get("language_code"))
-        _append_option(arguments, "--subtitle-codec", mux.get("subtitle_codec"))
-        _append_option(
-            arguments, "--hard-subtitle-layout", mux.get("hard_subtitle_layout")
-        )
-        _append_option(arguments, "--hard-subtitle-font", mux.get("hard_subtitle_font"))
-        _append_option(
-            arguments, "--hard-subtitle-font-size", mux.get("hard_subtitle_font_size")
-        )
-        _append_option(
-            arguments, "--hard-subtitle-margin-v", mux.get("hard_subtitle_margin_v")
-        )
-        _append_option(
-            arguments, "--hard-subtitle-box-height", mux.get("hard_subtitle_box_height")
-        )
-        _append_option(
-            arguments, "--hard-subtitle-box-opacity", mux.get("hard_subtitle_box_opacity")
-        )
-        _append_option(arguments, "--video-codec", mux.get("video_codec"))
-        _append_option(arguments, "--crf", mux.get("crf"))
-        _append_option(arguments, "--preset", mux.get("preset"))
-        _append_option(arguments, "--video-size", mux.get("video_size"))
-        _append_option(
-            arguments,
-            "--ffmpeg",
-            _resolved_executable(inspection.project_path, mux.get("ffmpeg")),
-        )
-        if mux.get("default_subtitle"):
-            arguments.append("--default-subtitle")
-    else:
-        tts = _required_mapping(config, "tts")
-        speakers = _required_mapping(config, "speakers")
-        voice_clone = _required_mapping(config, "voice_clone")
-        _append_option(arguments, "--tts-engine", tts.get("engine"))
-        _append_option(arguments, "--voice", tts.get("voice"))
-        _append_option(arguments, "--voice-unit", tts.get("voice_unit"))
-        _append_option(arguments, "--rate", tts.get("rate"))
-        _append_option(arguments, "--max-atempo", tts.get("max_atempo"))
-        _append_option(arguments, "--fit-tempo", tts.get("fit_tempo"))
-        _append_option(arguments, "--fit-rounds", tts.get("fit_rounds"))
-        _append_option(arguments, "--bgm-volume", tts.get("bgm_volume"))
-        _append_option(arguments, "--tts-concurrency", tts.get("concurrency"))
-        arguments.extend(["--cache-dir", str(inspection.paths["cache_dir"])])
-        arguments.extend(["--audio-output", str(inspection.paths["dub_audio"])])
-        _append_option(arguments, "--language-code", mux.get("language_code"))
-        _append_option(
-            arguments,
-            "--ffmpeg",
-            _resolved_executable(inspection.project_path, mux.get("ffmpeg")),
-        )
-        for key, flag in (
-            ("fit_duration", "--fit-duration"),
-            ("keep_bgm", "--keep-bgm"),
-            ("separate_bgm", "--separate-bgm"),
-            ("keep_dub_audio", "--keep-dub-audio"),
-            ("soft_subtitle", "--soft-subtitle"),
-            ("prune_cache", "--prune-cache"),
-        ):
-            if tts.get(key):
-                arguments.append(flag)
-        if speakers.get("enabled"):
-            arguments.append("--diarize")
-        _append_option(arguments, "--speakers", speakers.get("count"))
-        _append_option(arguments, "--min-speakers", speakers.get("min"))
-        _append_option(arguments, "--max-speakers", speakers.get("max"))
-        _append_option(arguments, "--diarize-model", speakers.get("model"))
-        _append_option(arguments, "--hf-token-env", speakers.get("credential_env"))
-        for value in speakers.get("voices", []):
-            _append_option(arguments, "--speaker-voice", value)
-
-        _append_option(arguments, "--clone-model", voice_clone.get("model"))
-        repo = voice_clone.get("repo")
-        if repo is not None:
-            arguments.extend(
-                [
-                    "--clone-repo",
-                    str(
-                        _project_relative_path(
-                            inspection.project_path.parent,
-                            repo,
-                            field="voice_clone.repo",
-                        )
-                    ),
-                ]
-            )
-        _append_option(
-            arguments,
-            "--clone-python",
-            _resolved_executable(inspection.project_path, voice_clone.get("python")),
-        )
-        _append_option(arguments, "--clone-device", voice_clone.get("device"))
-        references = voice_clone.get("references", [])
-        if not isinstance(references, list):
-            raise ProjectError("Project field 'voice_clone.references' must be a list.")
-        for index, reference in enumerate(references):
-            if not isinstance(reference, Mapping):
-                raise ProjectError(f"Voice clone reference #{index + 1} must be an object.")
-            reference_path = _project_relative_path(
-                inspection.project_path.parent,
-                reference.get("path"),
-                field=f"voice_clone.references[{index}].path",
-            )
-            speaker = reference.get("speaker")
-            value = f"{speaker}={reference_path}" if speaker else str(reference_path)
-            arguments.extend(["--clone-reference", value])
-
-    if inspection.statuses["transcribe"].stale and "transcribe" in inspection.enabled:
-        arguments.append("--retranscribe")
-    if inspection.statuses["translate"].stale:
-        arguments.append("--retranslate")
-    final_stage = "mux" if workflow == "run" else "tts"
-    recorded_stages = inspection.state.get("stages")
-    if (
-        inspection.statuses[final_stage].stale
-        and inspection.paths["video_output"].exists()
-        and isinstance(recorded_stages, Mapping)
-        and final_stage in recorded_stages
+    if not _required_mapping(inspection.config, "transcription").get("enabled", True):
+        values["subtitle"] = paths["source_subtitle"]
+    for section, key, option in (
+        ("translation", "credentials_file", "secrets_file"),
+        ("voice_clone", "repo", "clone_repo"),
     ):
-        arguments.append("--overwrite-video")
-    if dry_run:
-        arguments.append("--dry-run")
-    return arguments
+        value = _required_mapping(inspection.config, section).get(key)
+        if value is not None:
+            values[option] = _project_relative_path(
+                inspection.project_path.parent, value, field=f"{section}.{key}"
+            )
+    for section, key, option in (
+        ("mux", "ffmpeg", "ffmpeg_path"),
+        ("voice_clone", "python", "clone_python"),
+    ):
+        value = _required_mapping(inspection.config, section).get(key)
+        if isinstance(value, str) and ("/" in value or value.startswith((".", "~"))):
+            value = str(_project_relative_path(inspection.project_path.parent, value, field=key))
+        values[option] = value
+    references = _required_mapping(inspection.config, "voice_clone").get("references", [])
+    if not isinstance(references, list):
+        raise ProjectError("Project field 'voice_clone.references' must be a list.")
+    values["clone_references"] = []
+    for reference in references:
+        if not isinstance(reference, Mapping):
+            raise ProjectError("Each clone reference must be an object.")
+        path = _project_relative_path(
+            inspection.project_path.parent, reference.get("path"), field="clone reference"
+        )
+        speaker = reference.get("speaker")
+        values["clone_references"].append(f"{speaker}={path}" if speaker else str(path))
+    final_stage = "mux" if values["workflow"] == "run" else "tts"
+    values["overwrite_video"] = (
+        inspection.statuses[final_stage].stale
+        and paths["video_output"].exists()
+        and paths["video_output"] not in untracked_project_outputs(inspection)
+    )
+    return WorkflowConfig(**values)
+
+
+def _project_settings(args: WorkflowConfig, section: str) -> dict[str, object]:
+    return {
+        key: getattr(args, option)
+        for option, (owner, key) in PROJECT_OPTION_FIELDS.items()
+        if owner == section
+    }
