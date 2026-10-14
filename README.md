@@ -508,6 +508,10 @@ uv run video-txt dub "$V" --provider lmstudio --tts-engine index-tts \
 基本是转写时文件还没下载完(种子按块乱序落盘,文件看着是全尺寸,其实只有开头能解码)。
 `run` 和 `dub` 一旦发现就停在这里,不往下浪费时间和钱;单独跑 `transcribe` 字幕照样写出来,
 但退出码是 1——用 `&&` 串起来的下一条命令不会跑,想看看问题再决定就分两次跑。
+  英文或自动检测语种、输出 `srt`/`txt`(或 `--refine-subtitles`)时,不传这个参数也会默认带上
+  一句 `Claude Code` / `Anthropic` 的提示。不带提示 Whisper 会把 Claude 听成 Quad、Cloud,
+  而且一旦写成 Quad 就一路错下去。静音、音乐段它偶尔会把提示词原样吐出来,这类字幕会自动删掉。
+  传自己的 `--initial-prompt` 就替换默认值;传 `--initial-prompt ""` 则完全关掉。
 复用已有 `.srt` 时同样会查。确认没问题,加 `--skip-transcript-check` 跳过。
 
 ### 硬字幕外观
@@ -526,6 +530,14 @@ uv run video-txt run "$V" --provider lmstudio --mux-mode hard \
 - 黑罩布局 `bottom-box` 的实测经验也在 NOTES 里,一般优先用 `top`。
 
 ### 翻译
+新转写的 SRT 会在翻译前自动将完整短语 `Claud Code` 校正为 `Claude Code`,无需额外参数;
+支持换行、大小写异写、逐词高亮等行内标签,以及不重叠且间隔不超过 0.8 秒的相邻字幕块;
+纠正时保留标签、字幕编号与时间轴。普通转写、`--refine-subtitles` 和局部重识别共用该规则,
+精排模式的 `.words.json` 也同步校正,字幕时间轴不变。`Cloud Code`、`Quad Code`、单独的 `Claud`
+不自动替换,避免误改其他名称。这是确定的拼写纠正,不能保证翻译模型绝不会另起译名,
+译名仍可用 `--term-file` 约束。已有字幕的复用不会触发纠正;需 `--retranscribe` 或局部重识别。
+此规则只用于生成的 SRT(含 `--format all` 中的 SRT)和精排词级文件,其他原始转写格式不变。
+
 
 | 参数 | 说明 |
 | --- | --- |
