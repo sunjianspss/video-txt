@@ -12,12 +12,27 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from .chunking import (
+    MIN_CHUNKED_DURATION,
+    SILENCE_FILTER,
+    clamp_cues,
+    clamp_payload,
+    collapse_repeats,
+    merge_whisper_payloads,
+    parse_silences,
+    plan_chunks,
+    renumber,
+    repeated_runs,
+    sentences,
+    shift_cues,
+)
 from .media import (
     AudioStreamSelection,
     MediaError,
     find_ffmpeg,
     format_command,
     probe_audio_streams,
+    probe_duration,
     select_audio_stream,
 )
 from .refine import (
@@ -182,8 +197,15 @@ def _drop_prompt_echo_lines(lines: list[str], prompt: str) -> list[str]:
     return [line for line in lines if not _is_prompt_echo(_tokens(line), vocabulary, grams)]
 
 
+def _read_cues(path: Path) -> list[SubtitleCue]:
+    """Cues of a Whisper SRT; a piece with nothing audible leaves an empty file."""
+    if not path.read_text(encoding="utf-8-sig").strip():
+        return []
+    return parse_srt(path)
+
+
 def _drop_prompt_echo_subtitles(path: Path, prompt: str) -> None:
-    cues = parse_srt(path)
+    cues = _read_cues(path)
     vocabulary, grams = _echo_model(prompt)
     kept = [c for c in cues if not _is_prompt_echo(_tokens(c.text), vocabulary, grams)]
     if len(kept) == len(cues):
@@ -533,6 +555,161 @@ def run_transcribe(options: TranscribeOptions, *, dry_run: bool = False) -> Path
         )
 
 
+def _detect_silences(input_path: Path, ffmpeg_path: str) -> list[tuple[float, float]]:
+    completed = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-nostats", "-i", str(input_path), "-vn",
+         "-af", SILENCE_FILTER, "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Without silences the chunks are simply cut at fixed intervals.
+    return parse_silences(completed.stderr) if completed.returncode == 0 else []
+
+
+def _extract_chunk(input_path: Path, output_path: Path, chunk, ffmpeg_path: str) -> Path:
+    completed = subprocess.run(
+        [ffmpeg_path, "-hide_banner", "-loglevel", "error", "-y",
+         "-ss", f"{chunk.start:.3f}", "-t", f"{chunk.duration:.3f}", "-i", str(input_path),
+         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(output_path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0 or not output_path.is_file():
+        detail = completed.stderr.strip() or f"exit code {completed.returncode}"
+        raise TranscribeError(f"Could not cut audio {chunk.start:.0f}s-{chunk.end:.0f}s: {detail}")
+    return output_path
+
+
+def _whisper_piece(
+    options: TranscribeOptions,
+    piece: Path,
+    directory: Path,
+    *,
+    output_format: str,
+    backend: str,
+    model: str,
+) -> Path:
+    piece_options = replace(options, input_path=piece, output_dir=directory, output_format=output_format)
+    completed = subprocess.run(build_command(piece_options, backend=backend, model=model))
+    if completed.returncode != 0:
+        raise TranscribeError(f"Transcription failed with exit code {completed.returncode}.")
+    return expected_output_path(piece_options)
+
+
+def _clock(seconds: float) -> str:
+    whole = int(seconds)
+    return f"{whole // 3600}:{whole // 60 % 60:02d}:{whole % 60:02d}"
+
+
+def _piece_texts(kind: str, parsed: object) -> list[str]:
+    if kind == "json":
+        return [str(segment.get("text", "")) for segment in parsed["segments"]]  # type: ignore[index]
+    if kind == "srt":
+        return [cue.text for cue in parsed]  # type: ignore[attr-defined]
+    return list(parsed)  # type: ignore[call-overload]
+
+
+def _collapse(kind: str, parsed: object) -> object:
+    texts = _piece_texts(kind, parsed)
+    if kind == "json":
+        return {**parsed, "segments": collapse_repeats(parsed["segments"], texts)}  # type: ignore[index]
+    return collapse_repeats(parsed, texts)  # type: ignore[arg-type]
+
+
+def _sets_condition(options: TranscribeOptions) -> bool:
+    return any(arg.replace("_", "-").startswith("--condition-on-previous-text") for arg in options.extra_args)
+
+
+def _without_context(options: TranscribeOptions, backend: str) -> TranscribeOptions:
+    flag = "--condition-on-previous-text" if backend == "mlx-whisper" else "--condition_on_previous_text"
+    return replace(options, extra_args=[*options.extra_args, flag, "False"])
+
+
+def _run_chunked(
+    options: TranscribeOptions,
+    *,
+    kind: str | None,
+    backend: str,
+    model: str,
+) -> tuple[TranscribeOptions, object | None]:
+    """Transcribe a long file in pieces, each started with the prompt.
+
+    ``kind`` is what to build: "json" (merged Whisper JSON), "srt" (cues) or
+    "txt" (lines); anything else is not chunked. Returns the options, with the
+    language pinned when it was detected here, and the result, or None when the
+    file should simply be transcribed in one go.
+    """
+    if kind is None or effective_initial_prompt(options) is None:
+        return options, None
+    ffmpeg_path = str(find_ffmpeg())
+    try:
+        duration = probe_duration(options.input_path, ffmpeg_path=ffmpeg_path)
+    except MediaError:
+        return options, None
+    if duration < MIN_CHUNKED_DURATION:
+        return options, None
+    chunks = plan_chunks(duration, _detect_silences(options.input_path, ffmpeg_path))
+    if len(chunks) < 2:
+        return options, None
+
+    with tempfile.TemporaryDirectory(dir=options.output_dir, prefix=".video-txt-chunks-") as name:
+        directory = Path(name)
+        piece = directory / "piece.wav"
+        if options.language is None:
+            # Detect the language once, so that no single piece, say one of
+            # music, decides it differently from the rest.
+            _extract_chunk(options.input_path, piece, chunks[0], ffmpeg_path)
+            probe_options = replace(options, refine_subtitles=False)
+            probe = _whisper_piece(
+                probe_options, piece, directory, output_format="json", backend=backend, model=model
+            )
+            language = json.loads(probe.read_text(encoding="utf-8")).get("language")
+            if language:
+                options = replace(options, language=str(language))
+            # A language that does not take the default prompt is run normally.
+            if effective_initial_prompt(options) is None:
+                return options, None
+
+        print(f"Transcribing in {len(chunks)} pieces so the prompt applies throughout.")
+        parts: list[tuple[float, object]] = []
+        for number, chunk in enumerate(chunks, start=1):
+            print(f"Piece {number}/{len(chunks)}: {_clock(chunk.start)}-{_clock(chunk.end)}")
+            _extract_chunk(options.input_path, piece, chunk, ffmpeg_path)
+
+            def decode(piece_options: TranscribeOptions) -> object:
+                result = _whisper_piece(
+                    piece_options, piece, directory,
+                    output_format=kind, backend=backend, model=model,
+                )
+                if kind == "json":
+                    return clamp_payload(json.loads(result.read_text(encoding="utf-8")), chunk.duration)
+                if kind == "srt":
+                    return clamp_cues(_read_cues(result), chunk.duration)
+                return result.read_text(encoding="utf-8").splitlines()
+
+            parsed = decode(options)
+            if repeated_runs(sentences(_piece_texts(kind, parsed))) and not _sets_condition(options):
+                # Whisper looped. Without the previous text to lean on it cannot.
+                print("  Whisper repeated itself here; running the piece again without context.")
+                parsed = decode(_without_context(options, backend))
+            if repeated_runs(sentences(_piece_texts(kind, parsed))):
+                print(
+                    f"  Warning: still repeating after {_clock(chunk.start)}; "
+                    "that stretch is unreliable."
+                )
+                parsed = _collapse(kind, parsed)
+            if kind == "srt":
+                parsed = shift_cues(parsed, chunk.start)
+            parts.append((chunk.start, parsed))
+    if kind == "json":
+        return options, merge_whisper_payloads(parts)
+    if kind == "srt":
+        return options, renumber([cue for _, cues in parts for cue in cues])
+    return options, [line for _, lines in parts for line in lines]
+
+
 def _run_whisper(
     options: TranscribeOptions,
     *,
@@ -548,10 +725,17 @@ def _run_whisper(
             output_path=output_path,
         )
 
-    command = build_command(options, backend=backend, model=model)
-    completed = subprocess.run(command)
-    if completed.returncode != 0:
-        raise TranscribeError(f"Transcription failed with exit code {completed.returncode}.")
+    kind = options.output_format if options.output_format in {"srt", "txt"} else None
+    options, chunked = _run_chunked(options, kind=kind, backend=backend, model=model)
+    if chunked is None:
+        command = build_command(options, backend=backend, model=model)
+        completed = subprocess.run(command)
+        if completed.returncode != 0:
+            raise TranscribeError(f"Transcription failed with exit code {completed.returncode}.")
+    elif kind == "srt":
+        write_srt(output_path, chunked)
+    else:
+        output_path.write_text("\n".join(chunked) + "\n", encoding="utf-8")
     prompt = effective_initial_prompt(options)
     for suffix in (".srt", ".txt"):
         if options.output_format not in {suffix[1:], "all"}:
@@ -590,16 +774,23 @@ def _run_refined_transcription(
             output_dir=Path(temporary_dir),
             output_format="json",
         )
-        command = build_command(raw_options, backend=backend, model=model)
-        completed = subprocess.run(command)
-        if completed.returncode != 0:
-            raise TranscribeError(
-                f"Transcription failed with exit code {completed.returncode}."
-            )
+        raw_options, merged = _run_chunked(raw_options, kind="json", backend=backend, model=model)
+        options = replace(options, language=raw_options.language)
+        if merged is None:
+            command = build_command(raw_options, backend=backend, model=model)
+            completed = subprocess.run(command)
+            if completed.returncode != 0:
+                raise TranscribeError(
+                    f"Transcription failed with exit code {completed.returncode}."
+                )
 
         raw_path = expected_output_path(raw_options)
         try:
-            payload = json.loads(raw_path.read_text(encoding="utf-8"))
+            payload = (
+                merged
+                if merged is not None
+                else json.loads(raw_path.read_text(encoding="utf-8"))
+            )
             if not isinstance(payload, Mapping):
                 raise RefineError("Whisper JSON root must be an object.")
             document = document_from_whisper_result(payload)
