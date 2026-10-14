@@ -42,7 +42,8 @@ from .refine import (
     refine_transcript,
     write_word_document,
 )
-from .subtitles import SubtitleCue, parse_srt, write_srt
+from .spelling import correct_texts
+from .subtitles import SubtitleCue, SubtitleFormatError, parse_srt, write_srt
 
 BACKENDS = ("auto", "openai-whisper", "mlx-whisper")
 OUTPUT_FORMATS = ("txt", "vtt", "srt", "tsv", "json", "all")
@@ -53,86 +54,46 @@ REFINEMENT_RESERVED_FLAGS = {
     "--word-timestamps",
 }
 
-# Only confirmed, unambiguous phrase spellings belong here. In particular,
-# Cloud Code / Quad Code and the standalone name Claud are not safe aliases.
-_CLAUD_CODE = re.compile(r"(?<!\w)Claud(\s+)Code(?!\w)", re.IGNORECASE)
-_INLINE_TAG = re.compile(r"</?(?:u|b|i|font)(?:\s+[^<>]*?)?\s*>", re.IGNORECASE)
 _SPELLING_JOIN_GAP = 0.8
+_SPELLING_SUSPECT = re.compile(r"Claud|Quad|Cloud", re.IGNORECASE)
 
 
-def _correct_spelling(text: str) -> str:
-    return _CLAUD_CODE.sub(lambda match: f"Claude{match[1]}Code", text)
+def _spelling_joins(spans: list[tuple[float, float]]) -> list[str]:
+    """Where a phrase may run from one cue or word into the next: only if they follow
+    each other closely and do not overlap."""
+    return [
+        "\n" if 0 <= round(later[0] - earlier[1], 3) <= _SPELLING_JOIN_GAP else "\0"
+        for earlier, later in zip(spans, spans[1:])
+    ]
 
 
 def _correct_subtitle_spelling(path: Path) -> None:
-    plain = _INLINE_TAG.sub("", path.read_text(encoding="utf-8"))
-    if not re.search(r"(?<!\w)Claud(?!\w)", plain, re.IGNORECASE) or not re.search(
-        r"(?<!\w)Code(?!\w)", plain, re.IGNORECASE
-    ):
+    if not _SPELLING_SUSPECT.search(path.read_text(encoding="utf-8")):
         return
-    cues = parse_srt(path)
-
-    # Match visible text, retaining a map back to each original character. This
-    # lets a phrase span adjacent cues or inline tags without moving either.
-    visible: list[str] = []
-    locations: list[tuple[int, int] | None] = []
-    for index, cue in enumerate(cues):
-        if index:
-            gap = round(cue.start_seconds - cues[index - 1].end_seconds, 3)
-            visible.append("\n" if 0 <= gap <= _SPELLING_JOIN_GAP else "\0")
-            locations.append(None)
-        text = cue.text
-        cursor = 0
-        for tag in _INLINE_TAG.finditer(text):
-            visible.extend(text[cursor:tag.start()])
-            locations.extend((index, offset) for offset in range(cursor, tag.start()))
-            cursor = tag.end()
-        visible.extend(text[cursor:])
-        locations.extend((index, offset) for offset in range(cursor, len(text)))
-
-    edits: dict[int, dict[int, str]] = {}
-    for match in _CLAUD_CODE.finditer("".join(visible)):
-        # Replace individual letters rather than a raw substring, so even tags
-        # inside a word survive. The extra e inherits the d's formatting.
-        replacements = [
-            (match.start(), ("C", "l", "a", "u", "de")),
-            (match.end() - 4, tuple("Code")),
-        ]
-        for start, letters in replacements:
-            for position, letter in enumerate(letters, start=start):
-                location = locations[position]
-                assert location is not None  # Matches only letters, never a cue separator.
-                cue_index, offset = location
-                edits.setdefault(cue_index, {})[offset] = letter
-    corrected = list(cues)
-    for index, replacements in edits.items():
-        corrected[index] = cues[index].with_text(
-            "".join(replacements.get(offset, char) for offset, char in enumerate(cues[index].text))
-        )
+    try:
+        cues = parse_srt(path)
+    except SubtitleFormatError:
+        return  # Not something to guess at; leave the file as Whisper wrote it.
+    texts = correct_texts(
+        [cue.text for cue in cues],
+        _spelling_joins([(cue.start_seconds, cue.end_seconds) for cue in cues]),
+    )
+    corrected = [cue.with_text(text) if text != cue.text else cue for cue, text in zip(cues, texts)]
     count = sum(old.text != new.text for old, new in zip(cues, corrected, strict=True))
     if count:
         write_srt(path, corrected)
-        print(f"Corrected Claud Code spelling in {count} subtitle cue(s).")
+        print(f"Corrected the spelling of Claude in {count} subtitle cue(s).")
 
 
 def _correct_word_spelling(document: TranscriptDocument) -> TranscriptDocument:
-    words = [replace(word, text=_correct_spelling(word.text)) for word in document.words]
-    for index in range(len(words) - 1):
-        left, right = words[index : index + 2]
-        # Do not join unrelated words separated by a long pause.
-        if right.start - left.end > _SPELLING_JOIN_GAP:
-            continue
-        combined = f"{left.text}\n{right.text}"
-        corrected = _correct_spelling(combined)
-        if corrected != combined:
-            # Each word was already corrected individually, so this match must
-            # span the join: Claud gains one letter, Code keeps its length.
-            boundary = len(left.text) + 1
-            words[index] = replace(left, text=corrected[:boundary])
-            words[index + 1] = replace(right, text=corrected[boundary + 1:])
+    texts = correct_texts(
+        [word.text for word in document.words],
+        _spelling_joins([(word.start, word.end) for word in document.words]),
+    )
+    words = [replace(word, text=text) for word, text in zip(document.words, texts)]
     count = sum(old.text != new.text for old, new in zip(document.words, words, strict=True))
     if count:
-        print(f"Corrected Claud Code spelling in {count} timestamped word(s).")
+        print(f"Corrected the spelling of Claude in {count} timestamped word(s).")
     return replace(document, words=words)
 
 

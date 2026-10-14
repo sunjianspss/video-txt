@@ -536,12 +536,18 @@ uv run video-txt run "$V" --provider lmstudio --mux-mode hard \
 - 黑罩布局 `bottom-box` 的实测经验也在 NOTES 里,一般优先用 `top`。
 
 ### 翻译
-新转写的 SRT 会在翻译前自动将完整短语 `Claud Code` 校正为 `Claude Code`,无需额外参数;
-支持换行、大小写异写、逐词高亮等行内标签,以及不重叠且间隔不超过 0.8 秒的相邻字幕块;
-纠正时保留标签、字幕编号与时间轴。普通转写、`--refine-subtitles` 和局部重识别共用该规则,
-精排模式的 `.words.json` 也同步校正,字幕时间轴不变。`Cloud Code`、`Quad Code`、单独的 `Claud`
-不自动替换,避免误改其他名称。这是确定的拼写纠正,不能保证翻译模型绝不会另起译名,
-译名仍可用 `--term-file` 约束。已有字幕的复用不会触发纠正;需 `--retranscribe` 或局部重识别。
+新转写的 SRT 会在翻译前自动纠正 Claude 的拼写,无需额外参数;支持换行、大小写异写、
+逐词高亮等行内标签,以及不重叠且间隔不超过 0.8 秒的相邻字幕块;纠正时保留标签、字幕编号与时间轴。
+普通转写、`--refine-subtitles` 和局部重识别共用该规则,精排模式的 `.words.json` 也同步校正,
+字幕时间轴不变。
+
+- `Claud Code` 一律改成 `Claude Code`(Claud 不是词)。
+- `Quad Code`、`Cloud Code`、`Cloud Opus/Sonnet/Haiku` 和单独的 `Quad` 是真实的词
+  (`quad-core`、Google 的 Cloud Code 插件),**只有文稿本身显示在谈 Claude** 时才改:
+  `Claude Code`/`Claude Opus`…或 `Anthropic` 至少出现 3 次。`Google Cloud Code`、`quad core/bike/GPU`
+  不改;单独的 `Cloud` 太常见,不改。谈 Claude Shannon 的文稿只有人名,不算证据。
+- 这是确定的拼写纠正,不能保证翻译模型绝不会另起译名,译名仍可用 `--term-file` 约束。
+  已有字幕的复用不会触发纠正;需 `--retranscribe` 或局部重识别。
 此规则只用于生成的 SRT(含 `--format all` 中的 SRT)和精排词级文件,其他原始转写格式不变。
 
 
