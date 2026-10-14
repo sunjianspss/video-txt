@@ -3,7 +3,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import platform
-import re
 import shutil
 import subprocess
 import sys
@@ -22,12 +21,11 @@ from .media import (
 )
 from .refine import (
     RefineError,
-    TranscriptDocument,
     document_from_whisper_result,
     refine_transcript,
     write_word_document,
 )
-from .subtitles import SubtitleCue, parse_srt, write_srt
+from .subtitles import write_srt
 
 BACKENDS = ("auto", "openai-whisper", "mlx-whisper")
 OUTPUT_FORMATS = ("txt", "vtt", "srt", "tsv", "json", "all")
@@ -37,198 +35,6 @@ REFINEMENT_RESERVED_FLAGS = {
     "--output-name",
     "--word-timestamps",
 }
-
-# Only confirmed, unambiguous phrase spellings belong here. In particular,
-# Cloud Code / Quad Code and the standalone name Claud are not safe aliases.
-_CLAUD_CODE = re.compile(r"(?<!\w)Claud(\s+)Code(?!\w)", re.IGNORECASE)
-_INLINE_TAG = re.compile(r"</?(?:u|b|i|font)(?:\s+[^<>]*?)?\s*>", re.IGNORECASE)
-_SPELLING_JOIN_GAP = 0.8
-
-
-def _correct_spelling(text: str) -> str:
-    return _CLAUD_CODE.sub(lambda match: f"Claude{match[1]}Code", text)
-
-
-def _correct_subtitle_spelling(path: Path) -> None:
-    plain = _INLINE_TAG.sub("", path.read_text(encoding="utf-8"))
-    if not re.search(r"(?<!\w)Claud(?!\w)", plain, re.IGNORECASE) or not re.search(
-        r"(?<!\w)Code(?!\w)", plain, re.IGNORECASE
-    ):
-        return
-    cues = parse_srt(path)
-
-    # Match visible text, retaining a map back to each original character. This
-    # lets a phrase span adjacent cues or inline tags without moving either.
-    visible: list[str] = []
-    locations: list[tuple[int, int] | None] = []
-    for index, cue in enumerate(cues):
-        if index:
-            gap = round(cue.start_seconds - cues[index - 1].end_seconds, 3)
-            visible.append("\n" if 0 <= gap <= _SPELLING_JOIN_GAP else "\0")
-            locations.append(None)
-        text = cue.text
-        cursor = 0
-        for tag in _INLINE_TAG.finditer(text):
-            visible.extend(text[cursor:tag.start()])
-            locations.extend((index, offset) for offset in range(cursor, tag.start()))
-            cursor = tag.end()
-        visible.extend(text[cursor:])
-        locations.extend((index, offset) for offset in range(cursor, len(text)))
-
-    edits: dict[int, dict[int, str]] = {}
-    for match in _CLAUD_CODE.finditer("".join(visible)):
-        # Replace individual letters rather than a raw substring, so even tags
-        # inside a word survive. The extra e inherits the d's formatting.
-        replacements = [
-            (match.start(), ("C", "l", "a", "u", "de")),
-            (match.end() - 4, tuple("Code")),
-        ]
-        for start, letters in replacements:
-            for position, letter in enumerate(letters, start=start):
-                location = locations[position]
-                assert location is not None  # Matches only letters, never a cue separator.
-                cue_index, offset = location
-                edits.setdefault(cue_index, {})[offset] = letter
-    corrected = list(cues)
-    for index, replacements in edits.items():
-        corrected[index] = cues[index].with_text(
-            "".join(replacements.get(offset, char) for offset, char in enumerate(cues[index].text))
-        )
-    count = sum(old.text != new.text for old, new in zip(cues, corrected, strict=True))
-    if count:
-        write_srt(path, corrected)
-        print(f"Corrected Claud Code spelling in {count} subtitle cue(s).")
-
-
-def _correct_word_spelling(document: TranscriptDocument) -> TranscriptDocument:
-    words = [replace(word, text=_correct_spelling(word.text)) for word in document.words]
-    for index in range(len(words) - 1):
-        left, right = words[index : index + 2]
-        # Do not join unrelated words separated by a long pause.
-        if right.start - left.end > _SPELLING_JOIN_GAP:
-            continue
-        combined = f"{left.text}\n{right.text}"
-        corrected = _correct_spelling(combined)
-        if corrected != combined:
-            # Each word was already corrected individually, so this match must
-            # span the join: Claud gains one letter, Code keeps its length.
-            boundary = len(left.text) + 1
-            words[index] = replace(left, text=corrected[:boundary])
-            words[index + 1] = replace(right, text=corrected[boundary + 1:])
-    count = sum(old.text != new.text for old, new in zip(document.words, words, strict=True))
-    if count:
-        print(f"Corrected Claud Code spelling in {count} timestamped word(s).")
-    return replace(document, words=words)
-
-
-# Whisper spells a rare proper noun as whatever common word it sounds like
-# (Claude -> Quad / Cloud), and once it has, it keeps doing so for the rest of
-# the file. Priming it with the right spelling fixes the root cause; replacing
-# the wrong words afterwards cannot, because "quad" and "cloud" are real words.
-DEFAULT_INITIAL_PROMPT = "A talk about Claude Code, Anthropic's coding agent, and the Claude models."
-_PROMPT_ECHO_NGRAM = 4
-_PROMPT_ECHO_MIN_TOKENS = 4
-_ENGLISH = {"en", "english"}
-_PROMPT_TOKEN = re.compile(r"[\w']+")
-
-
-def effective_initial_prompt(options: TranscribeOptions) -> str | None:
-    """The prompt to send to Whisper.
-
-    An explicit --initial-prompt always wins, and an empty one turns the default
-    off. The default only applies where it is safe: English or auto-detected
-    speech (a Chinese prompt-free run was unchanged in testing), and output
-    formats whose prompt echo ``_drop_prompt_echo`` can remove again.
-    """
-    if options.initial_prompt is not None:
-        return options.initial_prompt or None
-    if options.language and options.language.lower() not in _ENGLISH:
-        return None
-    if not options.refine_subtitles and options.output_format not in {"srt", "txt"}:
-        return None
-    return DEFAULT_INITIAL_PROMPT
-
-
-def _tokens(text: str) -> list[str]:
-    return [token.lower() for token in _PROMPT_TOKEN.findall(text)]
-
-
-def _echo_model(prompt: str) -> tuple[set[str], set[tuple[str, ...]]]:
-    tokens = _tokens(prompt)
-    grams = {
-        tuple(tokens[i : i + _PROMPT_ECHO_NGRAM])
-        for i in range(len(tokens) - _PROMPT_ECHO_NGRAM + 1)
-    }
-    return set(tokens), grams
-
-
-def _is_prompt_echo(tokens: list[str], vocabulary: set[str], grams: set[tuple[str, ...]]) -> bool:
-    """True for text made only of prompt words that repeats a stretch of the prompt.
-
-    On silence or music Whisper tends to write the prompt itself, sometimes in a
-    loop. Real speech does not consist solely of prompt words around a verbatim
-    four-word run of it.
-    """
-    if len(tokens) < _PROMPT_ECHO_MIN_TOKENS or not all(t in vocabulary for t in tokens):
-        return False
-    return any(
-        tuple(tokens[i : i + _PROMPT_ECHO_NGRAM]) in grams
-        for i in range(len(tokens) - _PROMPT_ECHO_NGRAM + 1)
-    )
-
-
-def _drop_prompt_echo_lines(lines: list[str], prompt: str) -> list[str]:
-    vocabulary, grams = _echo_model(prompt)
-    return [line for line in lines if not _is_prompt_echo(_tokens(line), vocabulary, grams)]
-
-
-def _drop_prompt_echo_subtitles(path: Path, prompt: str) -> None:
-    cues = parse_srt(path)
-    vocabulary, grams = _echo_model(prompt)
-    kept = [c for c in cues if not _is_prompt_echo(_tokens(c.text), vocabulary, grams)]
-    if len(kept) == len(cues):
-        return
-    write_srt(
-        path,
-        [SubtitleCue(index=str(n), timing=c.timing, text_lines=c.text_lines) for n, c in enumerate(kept, 1)],
-    )
-    print(f"Dropped {len(cues) - len(kept)} subtitle cue(s) that only repeated the prompt.")
-
-
-def _drop_prompt_echo_text(path: Path, prompt: str) -> None:
-    lines = path.read_text(encoding="utf-8").splitlines()
-    kept = _drop_prompt_echo_lines(lines, prompt)
-    if len(kept) != len(lines):
-        path.write_text("\n".join(kept) + "\n", encoding="utf-8")
-        print(f"Dropped {len(lines) - len(kept)} line(s) that only repeated the prompt.")
-
-
-def _drop_prompt_echo_words(document: TranscriptDocument, prompt: str) -> TranscriptDocument:
-    vocabulary, grams = _echo_model(prompt)
-    words = document.words
-    drop: set[int] = set()
-    start = 0
-    while start < len(words):
-        # A run is a maximal stretch of words that all belong to the prompt.
-        if not all(t in vocabulary for t in _tokens(words[start].text)) or not _tokens(words[start].text):
-            start += 1
-            continue
-        end = start
-        run_tokens: list[str] = []
-        while end < len(words):
-            tokens = _tokens(words[end].text)
-            if not tokens or not all(t in vocabulary for t in tokens):
-                break
-            run_tokens.extend(tokens)
-            end += 1
-        if _is_prompt_echo(run_tokens, vocabulary, grams):
-            drop.update(range(start, end))
-        start = end
-    if not drop:
-        return document
-    print(f"Dropped {len(drop)} word(s) that only repeated the prompt.")
-    return replace(document, words=[w for i, w in enumerate(words) if i not in drop])
-
 
 MLX_MODEL_ALIASES = {
     "tiny": "mlx-community/whisper-tiny",
@@ -322,7 +128,6 @@ def mlx_launcher() -> list[str]:
 
 
 def build_command(options: TranscribeOptions, *, backend: str, model: str) -> list[str]:
-    prompt = effective_initial_prompt(options)
     if backend == "mlx-whisper":
         command = [
             *mlx_launcher(),
@@ -340,8 +145,8 @@ def build_command(options: TranscribeOptions, *, backend: str, model: str) -> li
         ]
         if options.language:
             command.extend(["--language", options.language])
-        if prompt:
-            command.extend(["--initial-prompt", prompt])
+        if options.initial_prompt:
+            command.extend(["--initial-prompt", options.initial_prompt])
         if options.refine_subtitles:
             command.extend(["--word-timestamps", "True"])
         if options.device:
@@ -370,8 +175,8 @@ def build_command(options: TranscribeOptions, *, backend: str, model: str) -> li
         command.extend(["--language", options.language])
     if options.device:
         command.extend(["--device", options.device])
-    if prompt:
-        command.extend(["--initial_prompt", prompt])
+    if options.initial_prompt:
+        command.extend(["--initial_prompt", options.initial_prompt])
     if options.refine_subtitles:
         command.extend(["--word_timestamps", "True"])
     return [*command, *options.extra_args]
@@ -552,17 +357,6 @@ def _run_whisper(
     completed = subprocess.run(command)
     if completed.returncode != 0:
         raise TranscribeError(f"Transcription failed with exit code {completed.returncode}.")
-    prompt = effective_initial_prompt(options)
-    for suffix in (".srt", ".txt"):
-        if options.output_format not in {suffix[1:], "all"}:
-            continue
-        sibling = output_path.with_suffix(suffix)
-        if not sibling.is_file():
-            continue
-        if prompt:
-            (_drop_prompt_echo_subtitles if suffix == ".srt" else _drop_prompt_echo_text)(sibling, prompt)
-        if suffix == ".srt" and sibling.is_file():
-            _correct_subtitle_spelling(sibling)
     return output_path
 
 
@@ -603,10 +397,6 @@ def _run_refined_transcription(
             if not isinstance(payload, Mapping):
                 raise RefineError("Whisper JSON root must be an object.")
             document = document_from_whisper_result(payload)
-            prompt = effective_initial_prompt(options)
-            if prompt:
-                document = _drop_prompt_echo_words(document, prompt)
-            document = _correct_word_spelling(document)
             word_path = options.output_dir / f"{options.input_path.stem}.words.json"
             result = refine_transcript(document)
             write_srt(output_path, result.cues)
