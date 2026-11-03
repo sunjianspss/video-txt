@@ -10,12 +10,16 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .clone import Reference
 from .diarize import DEFAULT_SPEAKER
 
-DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"
+DEFAULT_VOICE = "zh-CN-XiaoxiaoNeural"  # Fallback for explicitly selected engines.
 DEFAULT_SAY_VOICE = "Tingting"
+DEFAULT_NARRATOR = "mambo"
+MAMBO_VOICE_NAMES = ("mambo", "曼波")
+MAMBO_REFERENCE = Path(__file__).with_name("voice_samples") / "mambo.wav"
 # Second and later speakers get one of these, alternating between a female and
 # a male voice so a conversation stays easy to follow.
 SPEAKER_VOICE_POOL = (

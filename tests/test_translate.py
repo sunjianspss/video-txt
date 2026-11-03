@@ -6,30 +6,32 @@ import urllib.error
 
 import pytest
 
-from video_txt import translate as translate_module
-from video_txt.subtitles import SubtitleCue, parse_srt_text
-from video_txt.terminology import Term, Terminology
-from video_txt.translate import (
+from video_txt import model_client
+from video_txt.model_client import (
     ApiHttpError,
     ApiNetworkError,
-    ContextCue,
     JsonModeState,
-    PartialStore,
     ResponseFormatError,
-    TranslationConfig,
-    TranslationError,
-    _apply_translations,
     backoff_delay,
-    build_context,
-    build_messages,
-    build_partial_meta,
     is_retryable,
     loaded_local_model,
     parse_translation_json,
-    partial_path_for,
     post_chat_completion,
     request_items,
     strip_code_fence,
+)
+from video_txt.subtitles import SubtitleCue, parse_srt_text
+from video_txt.terminology import Term, Terminology
+from video_txt.translate import (
+    ContextCue,
+    PartialStore,
+    TranslationConfig,
+    TranslationError,
+    _apply_translations,
+    build_context,
+    build_messages,
+    build_partial_meta,
+    partial_path_for,
 )
 
 
@@ -257,7 +259,7 @@ def test_json_mode_rejection_falls_back_even_if_another_request_disabled_the_sha
             )
         return FakeResponse()
 
-    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(model_client.urllib.request, "urlopen", fake_urlopen)
 
     response = post_chat_completion(config=make_config(), messages=[], json_mode=state)
 
@@ -298,7 +300,7 @@ def test_a_200_response_with_invalid_json_is_retried(monkeypatch):
         calls += 1
         return FakeResponse()
 
-    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(model_client.urllib.request, "urlopen", fake_urlopen)
 
     result = request_items(
         ids=["1"],
@@ -328,7 +330,7 @@ def fake_model_listing(monkeypatch, entries: list[dict], seen: list[str] | None 
             seen.append(url)
         return FakeResponse()
 
-    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(model_client.urllib.request, "urlopen", fake_urlopen)
 
 
 def test_reasoning_effort_is_sent_only_when_it_is_not_auto(monkeypatch):
@@ -348,7 +350,7 @@ def test_reasoning_effort_is_sent_only_when_it_is_not_auto(monkeypatch):
         payloads.append(json.loads(request.data))
         return FakeResponse()
 
-    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(model_client.urllib.request, "urlopen", fake_urlopen)
 
     post_chat_completion(config=make_config(), messages=[], json_mode=JsonModeState())
     post_chat_completion(
@@ -376,7 +378,7 @@ def test_thinking_toggle_is_sent_only_when_a_provider_sets_it(monkeypatch):
         payloads.append(json.loads(request.data))
         return FakeResponse()
 
-    monkeypatch.setattr(translate_module.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(model_client.urllib.request, "urlopen", fake_urlopen)
 
     post_chat_completion(config=make_config(), messages=[], json_mode=JsonModeState())
     post_chat_completion(
@@ -403,10 +405,39 @@ def test_loaded_local_model_skips_embeddings_and_unloaded_models(monkeypatch):
     assert seen == ["http://localhost:1234/api/v0/models"]
 
 
-def test_loaded_local_model_reports_an_idle_server(monkeypatch):
-    fake_model_listing(monkeypatch, [{"id": "qwen3-8b", "type": "llm", "state": "not-loaded"}])
+def test_loaded_local_model_falls_back_to_the_only_downloaded_chat_model(monkeypatch, capsys):
+    # LM Studio unloaded it after its idle TTL; the first request loads it again.
+    fake_model_listing(
+        monkeypatch,
+        [
+            {"id": "text-embedding-qwen3", "type": "embeddings", "state": "loaded"},
+            {"id": "qwen/qwen3.5-35b-a3b", "type": "vlm", "state": "not-loaded"},
+        ],
+    )
 
-    with pytest.raises(TranslationError, match="no chat model loaded"):
+    assert loaded_local_model("http://localhost:1234/v1") == "qwen/qwen3.5-35b-a3b"
+    assert "will load it on the first request" in capsys.readouterr().err
+
+
+def test_loaded_local_model_will_not_guess_between_downloaded_models(monkeypatch):
+    fake_model_listing(
+        monkeypatch,
+        [
+            {"id": "qwen3-8b", "type": "llm", "state": "not-loaded"},
+            {"id": "qwen3-30b", "type": "llm", "state": "not-loaded"},
+        ],
+    )
+
+    with pytest.raises(TranslationError, match="several downloaded.*qwen3-8b, qwen3-30b"):
+        loaded_local_model("http://localhost:1234/v1")
+
+
+def test_loaded_local_model_reports_a_server_without_chat_models(monkeypatch):
+    fake_model_listing(
+        monkeypatch, [{"id": "text-embedding-nomic", "type": "embeddings", "state": "loaded"}]
+    )
+
+    with pytest.raises(TranslationError, match="no chat model loaded or downloaded"):
         loaded_local_model("http://localhost:1234/v1")
 
 
@@ -414,7 +445,7 @@ def test_loaded_local_model_reports_an_unreachable_server(monkeypatch):
     def refuse(url, **_kwargs):
         raise urllib.error.URLError("connection refused")
 
-    monkeypatch.setattr(translate_module.urllib.request, "urlopen", refuse)
+    monkeypatch.setattr(model_client.urllib.request, "urlopen", refuse)
 
     with pytest.raises(TranslationError, match="which model is loaded"):
         loaded_local_model("http://localhost:1234/v1")

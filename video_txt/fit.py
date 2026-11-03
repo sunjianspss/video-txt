@@ -17,13 +17,10 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .model_client import JsonModeState, request_items
 from .parallel import map_in_parallel
 from .subtitles import chunk_by_chars, join_text_parts
-from .translate import (
-    JsonModeState,
-    TranslationConfig,
-    request_items,
-)
+from .translation_config import TranslationConfig
 
 WHITESPACE_PATTERN = re.compile(r"\s+")
 LATIN_RUN_PATTERN = re.compile(r"[A-Za-z0-9]+")

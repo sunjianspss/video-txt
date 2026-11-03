@@ -1,106 +1,31 @@
 from __future__ import annotations
 
-import contextlib
 import hashlib
 import json
-import random
-import re
 import sys
 import threading
-import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
-from .constants import (
-    DEFAULT_BATCH_CHARS,
-    DEFAULT_CONCURRENCY,
-    DEFAULT_TARGET_LANGUAGE,
-    DEFAULT_TIMEOUT,
-)
+from .model_client import JsonModeState, cleanup_debug_dir, default_debug_dir, request_items
+from .model_client import ModelError as TranslationError
+from .model_client import loaded_local_model as loaded_local_model
 from .parallel import map_in_parallel
+from .reuse import PreviousTranslation, plan_reuse
 from .subtitles import SubtitleCue, chunk_cues, parse_srt, serialize_srt, write_srt
 from .terminology import (
-    Terminology,
     audit_translation,
     enforce_terminology,
     translation_audit_path_for,
     write_translation_audit_report,
 )
-
-RETRYABLE_STATUS = {408, 409, 425, 429}
-
-
-class TranslationError(RuntimeError):
-    pass
-
-
-class ApiHttpError(TranslationError):
-    def __init__(self, status: int, body: str, retry_after: float | None = None) -> None:
-        super().__init__(f"API request failed with HTTP {status}: {body}")
-        self.status = status
-        self.body = body
-        self.retry_after = retry_after
-
-    @property
-    def retryable(self) -> bool:
-        return self.status in RETRYABLE_STATUS or 500 <= self.status < 600
-
-
-class ApiNetworkError(TranslationError):
-    retryable = True
-
-
-class ResponseFormatError(TranslationError):
-    retryable = True
-
-
-@dataclass
-class TranslationConfig:
-    base_url: str
-    api_key: str
-    model: str
-    target_language: str = DEFAULT_TARGET_LANGUAGE
-    source_language: str | None = None
-    preserve_terms: list[str] = field(default_factory=list)
-    terminology: Terminology | None = None
-    note: str | None = None
-    # The lines are written to be spoken by a voice, not read off the screen.
-    spoken: bool = False
-    batch_chars: int = DEFAULT_BATCH_CHARS
-    retries: int = 2
-    concurrency: int = DEFAULT_CONCURRENCY
-    context_cues: int = 3
-    # Provider-specific thinking toggle. "auto" leaves the request untouched.
-    thinking: str = "auto"
-    # "auto" (or None) leaves reasoning_effort out of the request entirely.
-    reasoning_effort: str = "auto"
-    timeout: float = DEFAULT_TIMEOUT
-    backoff_base: float = 1.5
-    backoff_cap: float = 30.0
+from .translation_config import TranslationConfig as TranslationConfig
 
 
 @dataclass
 class ContextCue:
     source: str
     translation: str | None
-
-
-class JsonModeState:
-    def __init__(self) -> None:
-        self._supported = True
-        self._lock = threading.Lock()
-
-    @property
-    def supported(self) -> bool:
-        with self._lock:
-            return self._supported
-
-    def disable(self) -> None:
-        with self._lock:
-            self._supported = False
 
 
 class PartialStore:
@@ -164,25 +89,6 @@ class PartialStore:
 
 def partial_path_for(output_path: Path) -> Path:
     return output_path.with_name(f"{output_path.name}.partial.jsonl")
-
-
-def default_debug_dir(output_path: Path) -> Path:
-    return output_path.with_name(f"{output_path.stem}.debug")
-
-
-def cleanup_debug_dir(debug_dir: Path) -> int:
-    """Drop raw-response snapshots; after a fully successful run they only
-    describe failures the retries already recovered from."""
-    if not debug_dir.is_dir():
-        return 0
-    removed = 0
-    for path in debug_dir.glob("*-raw-response.txt"):
-        path.unlink(missing_ok=True)
-        removed += 1
-    # A directory that will not empty holds files we did not write; leave it alone.
-    with contextlib.suppress(OSError):
-        debug_dir.rmdir()
-    return removed
 
 
 def build_partial_meta(cues: list[SubtitleCue], config: TranslationConfig) -> dict[str, object]:
@@ -258,8 +164,7 @@ def build_messages(
         "rules": rules,
         "preserve_terms": config.preserve_terms,
         "terminology": [
-            {"source": term.source, "target": term.target}
-            for term in config.terminology.terms
+            {"source": term.source, "target": term.target} for term in config.terminology.terms
         ]
         if config.terminology
         else [],
@@ -281,292 +186,6 @@ def build_messages(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
-
-
-def strip_code_fence(text: str) -> str:
-    stripped = text.strip()
-    if stripped.startswith("```"):
-        stripped = re.sub(r"^```[a-zA-Z0-9_-]*\n", "", stripped)
-        stripped = re.sub(r"\n```$", "", stripped)
-    return stripped.strip()
-
-
-def extract_message_content(response_data: dict) -> str:
-    try:
-        content = response_data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise ResponseFormatError(f"Unexpected API response shape: {response_data}") from exc
-
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        text_parts = [
-            item["text"]
-            for item in content
-            if isinstance(item, dict)
-            and item.get("type") in {"text", "output_text"}
-            and item.get("text")
-        ]
-        if text_parts:
-            return "\n".join(text_parts)
-
-    raise ResponseFormatError(f"Unable to read message content from API response: {response_data}")
-
-
-def parse_translation_json(raw_content: str) -> dict[str, str]:
-    cleaned = strip_code_fence(raw_content)
-    try:
-        parsed = json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        raise ResponseFormatError(f"API did not return valid JSON: {exc}") from exc
-
-    if isinstance(parsed, list):
-        items = parsed
-    elif isinstance(parsed, dict):
-        items = parsed.get("items")
-    else:
-        raise ResponseFormatError("API JSON must be an object or list.")
-    if not isinstance(items, list):
-        raise ResponseFormatError("API did not return an 'items' list.")
-
-    translations: dict[str, str] = {}
-    for item in items:
-        if not isinstance(item, dict):
-            raise ResponseFormatError("API returned a non-object item in the translation list.")
-        item_id = str(item.get("id", "")).strip()
-        text = item.get("text")
-        if not item_id:
-            raise ResponseFormatError("API returned an item without an id.")
-        if not isinstance(text, str):
-            raise ResponseFormatError(f"API returned a non-string translation for id {item_id}.")
-        if not text.strip():
-            raise ResponseFormatError(f"API returned an empty translation for id {item_id}.")
-        if item_id in translations:
-            raise ResponseFormatError(f"API returned a duplicate id: {item_id}.")
-        translations[item_id] = text
-    return translations
-
-
-def safe_debug_label(value: str) -> str:
-    label = re.sub(r"[^A-Za-z0-9_.-]+", "-", value.strip())
-    return label[:48].strip("-") or "unknown"
-
-
-def write_raw_response_debug(
-    *,
-    debug_dir: Path,
-    batch_number: int | None,
-    attempt: int,
-    expected_ids: list[str],
-    raw_content: str,
-    error: Exception,
-) -> Path:
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    batch_label = f"batch-{batch_number:03d}" if batch_number is not None else "batch-unknown"
-    cue_range = (
-        safe_debug_label(expected_ids[0])
-        if len(expected_ids) == 1
-        else f"{safe_debug_label(expected_ids[0])}-{safe_debug_label(expected_ids[-1])}"
-    )
-    filename = (
-        f"{timestamp}-{time.time_ns()}-{batch_label}-"
-        f"attempt-{attempt:02d}-cues-{cue_range}-raw-response.txt"
-    )
-    path = debug_dir / filename
-    path.write_text(
-        "\n".join(
-            [
-                f"error: {type(error).__name__}: {error}",
-                f"batch_number: {batch_number if batch_number is not None else 'unknown'}",
-                f"attempt: {attempt}",
-                f"expected_ids: {', '.join(expected_ids)}",
-                "",
-                "---- raw API message content ----",
-                raw_content,
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
-    return path
-
-
-def loaded_local_model(base_url: str, *, timeout: float = 10.0) -> str:
-    """The chat model LM Studio currently has in memory.
-
-    Local models are named after the file they were downloaded as, which nobody
-    wants to retype, so ask the server instead. This uses LM Studio's own model
-    listing rather than the OpenAI-compatible one: that one also lists models
-    that are merely downloaded, and embedding models among them, so its first
-    entry is often something that cannot translate a word.
-    """
-    host = base_url.rstrip("/").removesuffix("/v1")
-    url = host + "/api/v0/models"
-    try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-        raise TranslationError(f"Could not ask {url} which model is loaded: {exc}") from exc
-
-    loaded = [
-        entry.get("id")
-        for entry in payload.get("data") or []
-        if entry.get("id")
-        and entry.get("state") == "loaded"
-        and entry.get("type") in {"llm", "vlm"}
-    ]
-    if not loaded:
-        raise TranslationError(f"{host} has no chat model loaded.")
-    return loaded[0]
-
-
-def post_chat_completion(
-    *,
-    config: TranslationConfig,
-    messages: list[dict[str, str]],
-    json_mode: JsonModeState,
-) -> dict:
-    payload: dict[str, object] = {
-        "model": config.model,
-        "temperature": 0,
-        "messages": messages,
-    }
-    if config.thinking and config.thinking != "auto":
-        payload["thinking"] = {"type": config.thinking}
-    if config.reasoning_effort and config.reasoning_effort != "auto":
-        payload["reasoning_effort"] = config.reasoning_effort
-    using_json_mode = json_mode.supported
-    if using_json_mode:
-        payload["response_format"] = {"type": "json_object"}
-
-    request = urllib.request.Request(
-        config.base_url.rstrip("/") + "/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {config.api_key}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=config.timeout) as response:
-            try:
-                return json.loads(response.read().decode("utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ResponseFormatError(
-                    f"API returned an invalid JSON response body: {exc}"
-                ) from exc
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        if using_json_mode and exc.code == 400 and "response_format" in body:
-            json_mode.disable()
-            print("API rejected response_format; falling back to plain JSON prompting.")
-            return post_chat_completion(config=config, messages=messages, json_mode=json_mode)
-        retry_after = exc.headers.get("Retry-After") if exc.headers else None
-        try:
-            retry_seconds = float(retry_after) if retry_after else None
-        except ValueError:
-            retry_seconds = None
-        raise ApiHttpError(exc.code, body, retry_seconds) from exc
-    except urllib.error.URLError as exc:
-        raise ApiNetworkError(f"Network error while calling the translation API: {exc}") from exc
-    except TimeoutError as exc:
-        raise ApiNetworkError(f"Timed out while calling the translation API: {exc}") from exc
-
-
-def backoff_delay(attempt: int, config: TranslationConfig, error: Exception) -> float:
-    if isinstance(error, ApiHttpError) and error.retry_after:
-        return min(error.retry_after, config.backoff_cap)
-    delay = config.backoff_base * (2 ** (attempt - 1))
-    return min(delay, config.backoff_cap) * (0.75 + random.random() * 0.5)
-
-
-def is_retryable(error: Exception) -> bool:
-    if isinstance(error, ApiHttpError):
-        return error.retryable
-    return isinstance(error, (ApiNetworkError, ResponseFormatError))
-
-
-def request_items(
-    *,
-    ids: list[str],
-    build_request: Callable[[list[str]], list[dict[str, str]]],
-    config: TranslationConfig,
-    json_mode: JsonModeState,
-    debug_dir: Path | None,
-    batch_number: int | None = None,
-) -> dict[str, str]:
-    """Ask the model for one text per id, retrying and splitting until the ids line up."""
-    messages = build_request(ids)
-
-    last_error: Exception | None = None
-    for attempt in range(1, config.retries + 2):
-        raw_content = ""
-        try:
-            response_data = post_chat_completion(
-                config=config, messages=messages, json_mode=json_mode
-            )
-            raw_content = extract_message_content(response_data)
-            answers = parse_translation_json(raw_content)
-            missing = [item_id for item_id in ids if item_id not in answers]
-            extra = [item_id for item_id in answers if item_id not in ids]
-            if missing or extra:
-                raise ResponseFormatError(
-                    "Translated batch ids did not match the input. "
-                    f"Missing: {missing}; extra: {extra}"
-                )
-            return {item_id: answers[item_id] for item_id in ids}
-        except Exception as exc:  # noqa: BLE001
-            last_error = exc
-            if isinstance(exc, ResponseFormatError) and debug_dir is not None and raw_content:
-                debug_path = write_raw_response_debug(
-                    debug_dir=debug_dir,
-                    batch_number=batch_number,
-                    attempt=attempt,
-                    expected_ids=ids,
-                    raw_content=raw_content,
-                    error=exc,
-                )
-                print(f"Saved invalid API response to: {debug_path}", file=sys.stderr)
-                last_error = ResponseFormatError(f"{exc} Raw response saved to: {debug_path}")
-            if not is_retryable(exc):
-                break
-            if isinstance(exc, ResponseFormatError) and len(ids) > 1:
-                # Not bad luck: temperature is 0, so asking the same question again
-                # gets the same wrong answer back. Smaller questions are the way out,
-                # and the split below is right there. A single id has nothing to split,
-                # so that one keeps its retries.
-                break
-            if attempt <= config.retries:
-                time.sleep(backoff_delay(attempt, config, exc))
-
-    if last_error is None:
-        raise TranslationError(f"The API returned neither a translation nor an error for {ids}.")
-    if len(ids) > 1 and isinstance(last_error, ResponseFormatError):
-        midpoint = len(ids) // 2
-        left, right = ids[:midpoint], ids[midpoint:]
-        print(
-            "Batch validation failed; retrying with smaller chunks "
-            f"({len(left)} + {len(right)} subtitle blocks)."
-        )
-        merged: dict[str, str] = {}
-        for half in (left, right):
-            merged.update(
-                request_items(
-                    ids=half,
-                    build_request=build_request,
-                    config=config,
-                    json_mode=json_mode,
-                    debug_dir=debug_dir,
-                    batch_number=batch_number,
-                )
-            )
-        return merged
-
-    raise last_error
 
 
 def translate_batch(
@@ -621,17 +240,24 @@ def translate_cues(
     *,
     debug_dir: Path | None = None,
     partial_store: PartialStore | None = None,
+    reused: dict[str, str] | None = None,
 ) -> list[SubtitleCue]:
     pending = [
         (str(position), cue) for position, cue in enumerate(cues, start=1) if not cue.is_empty
     ]
     translations: dict[str, str] = {}
 
+    # Lines an earlier translation already covers. They also give the batches
+    # around them their context, the same way finished batches do.
+    if reused:
+        translations.update(reused)
+
     if partial_store is not None:
-        translations.update(partial_store.load())
-        reused = sum(1 for cue_id, _ in pending if cue_id in translations)
-        if reused:
-            print(f"Resuming: {reused}/{len(pending)} subtitle blocks already translated.")
+        stored = partial_store.load()
+        translations.update(stored)
+        resumed = sum(1 for cue_id, _ in pending if cue_id in stored)
+        if resumed:
+            print(f"Resuming: {resumed}/{len(pending)} subtitle blocks already translated.")
 
     todo = [(cue_id, cue) for cue_id, cue in pending if cue_id not in translations]
     if not todo:
@@ -697,16 +323,29 @@ def translate_subtitle_file(
     resume: bool = True,
     dry_run: bool = False,
     overwrite_audit: bool = False,
+    previous: PreviousTranslation | None = None,
 ) -> Path:
     cues = parse_srt(input_path)
     translatable = [cue for cue in cues if not cue.is_empty]
-    batches = chunk_cues(translatable, config.batch_chars)
+    plan = plan_reuse(cues, previous) if previous is not None else None
+    reused = plan.by_position if plan is not None else {}
+    outstanding = [
+        cue
+        for position, cue in enumerate(cues, start=1)
+        if not cue.is_empty and str(position) not in reused
+    ]
+    batches = chunk_cues(outstanding, config.batch_chars)
 
     print(f"Input: {input_path}")
     print(f"Output: {output_path}")
     print(f"Target language: {config.target_language}")
     print(f"Model: {config.model}")
     print(f"Subtitle blocks: {len(cues)} ({len(translatable)} with text)")
+    if plan is not None:
+        print(
+            f"Reusing: {plan.reused} unchanged block(s) from {plan.previous.translation}, "
+            f"{plan.fresh} left to translate"
+        )
     print(f"Batches: {len(batches)} (about {config.batch_chars} chars each)")
     print(f"Concurrency: {max(1, config.concurrency)}")
     if config.reasoning_effort and config.reasoning_effort != "auto":
@@ -734,11 +373,10 @@ def translate_subtitle_file(
         config,
         debug_dir=debug_dir or auto_debug_dir,
         partial_store=store,
+        reused=reused,
     )
     enforcement = (
-        enforce_terminology(cues, translated, config.terminology)
-        if config.terminology
-        else None
+        enforce_terminology(cues, translated, config.terminology) if config.terminology else None
     )
     if enforcement is not None:
         translated = enforcement.cues
@@ -768,8 +406,7 @@ def translate_subtitle_file(
     )
     if audit.has_errors:
         raise TranslationError(
-            f"Translation audit found {audit.summary['error']} error(s). "
-            f"Review: {report_path}"
+            f"Translation audit found {audit.summary['error']} error(s). Review: {report_path}"
         )
     return output_path
 
