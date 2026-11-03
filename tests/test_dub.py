@@ -796,7 +796,7 @@ def test_dub_mux_command_replaces_the_audio_track_by_default():
         keep_bgm=False,
     )
     assert "-filter_complex" not in command
-    assert command[command.index("-map") + 1] == "0:v:0"
+    assert command[command.index("-map") + 1] == "0:v:0?"
     assert "1:a:0" in command
     assert command[command.index("-c:a") + 1] == "aac"
     assert "-shortest" in command

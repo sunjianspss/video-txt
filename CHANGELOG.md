@@ -12,6 +12,25 @@
 
 ## Unreleased（计划中的 v0.7.1）
 
+### 变更：视频来源摘要使用 Codex
+
+- `sync-notes` 的来源摘要改用已登录的 Codex CLI，默认模型 `gpt-6.1-sol`；使用临时目录、只读沙箱及最终回复文件。
+- 摘要契约版本升为 2，保留现有出处校验、缓存恢复与人工修改保护。
+
+### 变更：IndexTTS 合成改用单束搜索
+
+- 克隆引擎 `index-tts`（含默认曼波）固定 `num_beams=1`。实测 12.5 秒长句从 152 秒降到 40 秒，
+  交换区写入由约 80 GB 降到约 14 GB；音色与语气设置不变，听感请试听确认。已缓存的片段继续复用。
+
+### 新增：画面文字翻译与烧录
+
+- 新增 `screen scan / translate / validate / render`，采集英文页面、聊天、看板和幻灯片，
+  校对计划后和口述 SRT 合并时间轴，复用既有翻译器与硬字幕烧录器。
+- 保存 OCR 位置、置信度、文字变化版本及截图指纹；扫描可恢复，不覆盖已编辑的计划。
+- 校验未校对字幕、证据过期、时间越界与冲突；内容超过两行会报错，阅读过快会提示。
+- 新增 `video-txt.screen-plan` v1，已有 `run / dub / project` 行为不变。
+  见 [流程设计](docs/screen-text-workflow.md)。
+
 ### 已修复
 
 - `--provider lmstudio` 不写 `--model` 时，LM Studio 把闲置模型卸载后不再直接报「no chat model loaded」退出：

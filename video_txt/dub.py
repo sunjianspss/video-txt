@@ -702,13 +702,13 @@ def build_dub_mux_command(
                 "[bg][vo]amix=inputs=2:duration=longest:normalize=0[mix];"
                 f"[mix]{LOUDNORM_FILTER}[aout]",
                 "-map",
-                "0:v:0",
+                "0:v:0?",
                 "-map",
                 "[aout]",
             ]
         )
     else:
-        command.extend(["-map", "0:v:0", "-map", "1:a:0", "-filter:a", LOUDNORM_FILTER])
+        command.extend(["-map", "0:v:0?", "-map", "1:a:0", "-filter:a", LOUDNORM_FILTER])
 
     if options.soft_subtitle:
         subtitle_input = 3 if bgm_path is not None else 2

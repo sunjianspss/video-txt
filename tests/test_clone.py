@@ -517,3 +517,29 @@ def test_indextts_passes_the_delivery_clip_only_when_the_job_has_one(tmp_path):
     )
 
     assert calls == [{"emo": None, "alpha": 1.0}, {"emo": "/drawl.wav", "alpha": 0.8}]
+
+
+def test_indextts_searches_one_beam_whether_infer_names_it_or_takes_kwargs(tmp_path):
+    seen: list[dict] = []
+
+    class Named:
+        def infer(self, spk_audio_prompt, text, output_path, num_beams=3):
+            seen.append({"num_beams": num_beams})
+
+    class Kwargs:
+        def infer(self, spk_audio_prompt, text, output_path, **generation_kwargs):
+            seen.append(generation_kwargs)
+
+    class Neither:
+        def infer(self, spk_audio_prompt, text, output_path):
+            seen.append({})
+
+    for model_class in (Named, Kwargs, Neither):
+        engine = object.__new__(clone_worker.IndexTTSEngine)
+        engine.model = model_class()
+        engine.infer_parameters = inspect.signature(model_class.infer).parameters
+        engine.lang = "ZH"
+        engine.speed = 1.0
+        engine.synthesize({"reference_audio": "/ref.wav", "text": "你好"}, tmp_path / "a.wav")
+
+    assert seen == [{"num_beams": 1}, {"num_beams": 1}, {}]

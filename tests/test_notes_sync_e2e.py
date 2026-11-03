@@ -48,15 +48,18 @@ def test_cli_queue_publishes_cited_summary_and_reports_bad_alignment(tmp_path):
     source, translated = media / "clip.en.srt", media / "clip.zh.srt"
     source.write_text("1\n00:00:01,000 --> 00:00:07,000\nThis button is blue.\n")
     translated.write_text("1\n00:00:01,000 --> 00:00:07,000\n这个按钮是蓝色的。\n")
-    fake = bin_dir / "claude"
+    fake = bin_dir / "codex"
     fake.write_text(
         f"#!{sys.executable}\n"
         + r"""import json, re, sys
-assert sys.argv[sys.argv.index('--tools') + 1] == ''
-assert '--strict-mcp-config' in sys.argv and '--no-session-persistence' in sys.argv
-assert sys.argv[sys.argv.index('--setting-sources') + 1] == ''
+assert sys.argv[1] == 'exec'
+assert '--ignore-user-config' in sys.argv and '--ephemeral' in sys.argv
+assert sys.argv[sys.argv.index('--sandbox') + 1] == 'read-only'
+assert 'shell_tool' in sys.argv and 'apply_patch_freeform' in sys.argv
 blocks = list(dict.fromkeys(re.findall(r"\^(p-[a-f0-9]+)", sys.stdin.read())))
-print(json.dumps({"question": "讨论什么？", "overview": "这个按钮的颜色。",
+from pathlib import Path
+reply = Path(sys.argv[sys.argv.index("--output-last-message") + 1])
+reply.write_text(json.dumps({"question": "讨论什么？", "overview": "这个按钮的颜色。",
  "claims": [{"text": "这个按钮是蓝色的。", "block": b} for b in blocks],
  "analysis": ["不能泛化。"], "questions": ["颜色需核实。"], "related": []}))
 """

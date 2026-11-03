@@ -14,7 +14,7 @@ from pathlib import Path
 from .artifacts import write_json
 from .notes import NotesError, digest, md_text, stamp, verify_revision
 
-SUMMARY_VERSION = 1
+SUMMARY_VERSION = 2
 LONG_SOURCE_CHARS = 60_000
 INDEXES = {
     "ClaudeAI": "index.md",
@@ -90,45 +90,44 @@ def validate_summary(
     return data
 
 
-def invoke_claude(prompt: str, model: str, cwd: Path) -> dict:
-    executable = shutil.which("claude") or str(Path.home() / ".local/bin/claude")
+def invoke_codex(prompt: str, model: str, cwd: Path) -> dict:
+    executable = shutil.which("codex") or str(Path.home() / ".local/bin/codex")
     if not Path(executable).is_file():
-        raise NotesError("找不到 Claude CLI，来源稿已保留，可安装或登录后重试摘要")
-    command = [
-        executable,
-        "-p",
-        "--tools",
-        "",
-        "--strict-mcp-config",
-        "--setting-sources",
-        "",
-        "--no-session-persistence",
-        "--output-format",
-        "text",
-        "--model",
-        model,
-    ]
-    # A clean work directory has no project instructions; stdin contains data only.
-    with tempfile.TemporaryDirectory(prefix="summary-", dir=cwd) as working:
+        raise NotesError("找不到 Codex CLI，来源稿已保留，可安装或登录后重试摘要")
+    if not model or re.match(r"^(sonnet|opus|haiku|claude)(?:$|[-.])", model, re.I):
+        model = "gpt-6.1-sol"
+    # A clean work directory avoids project instructions; the model only receives stdin.
+    with tempfile.TemporaryDirectory(prefix="video-summary-codex-") as working:
+        reply = Path(working) / "reply.txt"
+        command = [
+            executable, "exec", "--ignore-user-config", "--model", model,
+            "-c", 'model_reasoning_effort="medium"', "-c", 'web_search="disabled"',
+            "--disable", "shell_tool", "--disable", "apply_patch_freeform",
+            "--sandbox", "read-only", "--skip-git-repo-check", "--ephemeral", "--json",
+            "--output-last-message", str(reply), "-",
+        ]
         result = subprocess.run(
             command, input=prompt, text=True, capture_output=True, timeout=600, cwd=working
         )
-    if result.returncode:
-        raise NotesError(f"Claude 摘要失败：{result.stderr.strip()[-300:]}")
-    # Keep the latest raw reply: validation can reject it, and a retry costs a full model call.
+        if result.returncode:
+            raise NotesError(f"Codex 摘要失败：{(result.stderr or result.stdout).strip()[-300:]}")
+        output = reply.read_text(encoding="utf-8") if reply.is_file() else ""
+    # Keep the latest final reply even when validation rejects its JSON.
     raw = cwd / "summaries" / "last-raw.txt"
     raw.parent.mkdir(parents=True, exist_ok=True)
-    raw.write_text(result.stdout, encoding="utf-8")
-    match = re.search(r"\{.*\}", result.stdout, re.S)
+    raw.write_text(output, encoding="utf-8")
+    match = re.search(r"\{.*\}", output, re.S)
     if not match:
-        raise NotesError("Claude 未返回有效摘要 JSON")
+        raise NotesError("Codex 未返回有效摘要 JSON")
     try:
         return json.loads(match[0])
     except ValueError as exc:
-        raise NotesError("Claude 返回的摘要 JSON 无法解析") from exc
+        raise NotesError("Codex 返回的摘要 JSON 无法解析") from exc
 
 
 def generate_summary(vault: Path, job: dict, model: str, state_dir: Path) -> dict:
+    if not model or re.match(r"^(sonnet|opus|haiku|claude)(?:$|[-.])", model, re.I):
+        model = "gpt-6.1-sol"
     original = vault / job["documents"][0]
     manifest = verify_revision(original.parent, job["revision"])
     source = original.read_text(encoding="utf-8")
@@ -167,7 +166,7 @@ def generate_summary(vault: Path, job: dict, model: str, state_dir: Path) -> dic
         f"以下是来源资料：\n{source}\n以上来源资料结束。现在按约定输出 JSON。"
     )
 
-    summary = validate_summary(invoke_claude(prompt, model, state_dir), blocks, related, maximum)
+    summary = validate_summary(invoke_codex(prompt, model, state_dir), blocks, related, maximum)
     payload = {
         "version": SUMMARY_VERSION,
         "model": model,

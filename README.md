@@ -51,6 +51,41 @@ uv run video-txt run '/绝对路径/你的视频.mp4' --provider lmstudio --mux-
 去掉 `--mux-mode hard` 就是软字幕版,输出 `你的视频.zh-subbed.mp4`,字幕可以在播放器里开关。
 想先看看会执行什么、不真跑,加 `--dry-run`。
 
+## 视频页面文字翻译与硬字幕
+
+产品演示、手机聊天、看板、幻灯片上的英文并不在音轨里。此类视频使用 `screen` 分支，
+和现有口述字幕共用翻译、术语表与烧录模块：
+
+```bash
+uv run --python 3.12 video-txt screen scan '/绝对路径/演示.mp4'
+# 查看 演示.screen/review.html 和截图，校正 plan.json 中的 source 与时间范围
+uv run --python 3.12 video-txt screen translate '/绝对路径/演示.screen/plan.json' --provider lmstudio
+# 校对 plan.translated.json，逐条将 status 改为 ready，或注明原因后 omit
+uv run --python 3.12 video-txt screen validate '/绝对路径/演示.screen/plan.translated.json'
+uv run --python 3.12 video-txt screen render '/绝对路径/演示.screen/plan.translated.json'
+```
+
+本机 OCR 使用 `tesseract`，烧录使用带字幕支持的 `ffmpeg-full`，已安装时直接复用；
+缺少时安装 `brew install tesseract ffmpeg-full`。默认每秒取样，超过 600 张要求调整
+`--from / --to / --interval / --max-frames`，不会默默截断视频；时间单位为秒。
+
+Agent 也可直接在计划中翻译；`ready` 表示校对完成，不是额外的用户审批。
+`translation_full` 保留全文，实际字幕使用 `translation`；需要精简时在 `note` 说明。
+转场范围由截图取样推定，烧录前核对原片，不能把取样点当成精确切点。
+
+有口述时，先用既有 `transcribe / translate / revise` 生成配对字幕，再一起烧录：
+
+```bash
+uv run --python 3.12 video-txt screen render '/绝对路径/演示.screen/plan.translated.json' \
+  --speech-source '/绝对路径/口述.srt' --speech-translation '/绝对路径/口述.zh.srt' \
+  -o '/绝对路径/演示.screen.zh-burned.mp4'
+```
+
+默认另存硬字幕 MP4，保留原声和原时长；旁边的 `.screen-render.json` 保存本次输入指纹、
+合并 SRT 内容与告警。重叠时间轴、空译文、未校对条目、截图或源视频变更会阻止烧录。
+已有 `run / dub / project` 行为不变；当前 `screen-plan` 不由 `project run` 调度。
+恢复规则、文件契约与 Claude Duet 实例的经验见 [完整设计](docs/screen-text-workflow.md)。
+
 ## 长视频项目配置（v0.6）
 
 同一部长片需要反复精修时，用项目文件固定音轨、Whisper、翻译、术语表、字幕样式、配音和输出路径：
@@ -947,12 +982,12 @@ uv run --python 3.12 video-txt export-notes '/绝对路径/访谈.mp4' \
 ```
 
 插件每 2 分钟检查一次，文件连续稳定 120 秒后，每次处理一个项目：
-检查字幕 → 原文/中文 Markdown → Claude 来源摘要 → 已有相关页面、索引和日志的引用。
+检查字幕 → 原文/中文 Markdown → Codex 来源摘要 → 已有相关页面、索引和日志的引用。
 第一次扫描只登记已有视频；打开左侧电影图标「视频资料」，在「历史项目」选择分类并
 点击「加入队列」。原有视频后来收到第一对字幕，也会视为新任务。
 
 - 原文/译文在 `<分类>/raw/videos/`，摘要在 `<分类>/wiki/sources/视频：…（版本）.md`。
-- 摘要使用现有 Claude CLI 登录和 Sonnet 模型，消耗相应额度；插件设置可改模型、目录、
+- 摘要使用现有 Codex CLI 登录，默认模型为 `gpt-6.1-sol`；插件设置可改模型、目录、
   扫描间隔或暂停。摘要标为待复核，文章仍按选题另行生成。
 - 摘要每条观点必须链接到真实来源段落，不能把口述数字或产品信息当成已核实事实。
 - 缺字幕会等待；多组候选或不对齐的字幕会停止。不同名、独立时间轴或滚动字幕先用
@@ -961,7 +996,7 @@ uv run --python 3.12 video-txt export-notes '/绝对路径/访谈.mp4' \
   已经人工改过的笔记不会被覆盖。字幕变化会保留新版本，并列出仍引用旧版的笔记。
 - 这里自动化的是已有字幕的入库，不会自行开始全片转写、翻译、配音或发布文章。
 
-无需 Obsidian 调度时，也可手动执行一轮（需要本机 Claude CLI 已登录）：
+无需 Obsidian 调度时，也可手动执行一轮（需要本机 Codex CLI 已登录）：
 
 ```bash
 uv run --no-sync --python 3.12 video-txt sync-notes \

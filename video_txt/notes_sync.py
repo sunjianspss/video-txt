@@ -201,9 +201,16 @@ def scan(vault: Path, source_dir: Path, state: dict, now: float) -> None:
             job["status"] = "queued"
         if not ready and job["enabled"]:
             job["status"] = "waiting"
-    for job in jobs.values():
-        if not Path(job["options"]["video"]).is_file():
-            job.update(status="missing", issue="视频文件不在原路径，已暂停此项目")
+    for job_id, job in list(jobs.items()):
+        video = Path(job["options"]["video"])
+        if video.is_file():
+            continue
+        if not job.get("revision") and not video.with_name(f".{video.name}.icloud").exists():
+            # Never exported, so nothing in the vault points at it: a rename or delete
+            # simply retires the record; the renamed file is registered as new above.
+            del jobs[job_id]
+            continue
+        job.update(status="missing", issue="视频文件不在原路径（改名或移动了？）；来源稿仍在知识库")
     state.update(initialized=True, last_scan=now)
 
 
@@ -251,7 +258,7 @@ def synchronize(
     job_id: str | None = None,
     category: str | None = None,
     min_age: float = 120,
-    model: str = "sonnet",
+    model: str = "gpt-6.1-sol",
 ) -> dict:
     vault, source_dir, state_dir = vault.resolve(), source_dir.resolve(), state_dir.resolve()
     if not vault.is_dir() or not source_dir.is_dir():
@@ -350,7 +357,7 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=120,
         help="Seconds since the last observed input change before processing.",
     )
-    parser.add_argument("--model", default="sonnet")
+    parser.add_argument("--model", default="gpt-6.1-sol")
 
 
 def command(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:

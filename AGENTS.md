@@ -8,6 +8,12 @@ CLI 入口是 `video-txt`，实现位于 `video_txt/cli.py`。
 - 用户提出加中文字幕、硬编码/烧录字幕、翻译 `.srt`、视频转文字、中文配音、局部重识别或字幕质检等需求时，使用 `$video-txt` Skill。
 - 不要绕过项目 CLI 自行拼接 FFmpeg、Whisper 或翻译命令。
 - 按 `$video-txt` Skill 判断源语言、字幕封装方式、翻译提供商、已有字幕复用和长任务执行方式。
+- 视频包含英文页面、手机聊天、看板、幻灯片等画面文字时，使用 `video-txt screen`：
+  `scan` 留存截图与 OCR → 校正原文 → `translate` 或 Agent 翻译 → 校对计划 → `validate` → `render`。
+  完整设计见 `docs/screen-text-workflow.md`，不要再写一次性取图与烧录脚本。
+- 画面字幕的原文、完整译文、显示译文和时间轴在 `plan.json` 修改。
+  `status=ready` 表示 Agent 或人工已核对证据，不要求用户再次批准已授权的翻译任务。
+  口述字幕按现有流程处理，作为配对 SRT 传入 `screen render`；时间重叠先解决冲突。
 
 ## 翻译整季前
 

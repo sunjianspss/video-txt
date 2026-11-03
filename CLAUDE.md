@@ -13,4 +13,7 @@
 - 要翻整季/系列片时：先 `video-txt draft-terms <全季 .srt> -o 术语表.json` 起草术语表、
   填完 `target` 再开翻。换季复用旧表加 `--against 旧表.json`。
 - 改代码后按 `.claude/skills/verify/SKILL.md` 真跑一遍，不要只跑单测。
+- 视频有英文页面、聊天、看板或幻灯片时，走 `video-txt screen scan / translate / validate / render`，
+  不要仅用 Whisper。计划文件保存截图证据、校订和时间轴；和口述字幕统一烧录。
+  设计与操作见 [画面文字流程](docs/screen-text-workflow.md)。
 - 用法细节在 [README.md](README.md)，技术取舍的实测数据在 [NOTES.md](NOTES.md)。

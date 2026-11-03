@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 PROMPT_SAMPLE_RATE = 16000
+INDEX_NUM_BEAMS = 1
 
 
 class WorkerError(RuntimeError):
@@ -165,6 +166,13 @@ class IndexTTSEngine:
         self.lang = manifest.get("lang")
         self.speed = float(manifest.get("speed") or 1.0)
 
+    def accepts(self, name: str) -> bool:
+        """Whether infer takes this argument, by name or through **generation_kwargs."""
+        parameters = self.infer_parameters
+        return name in parameters or any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()
+        )
+
     @staticmethod
     def import_model() -> type:
         try:
@@ -194,6 +202,11 @@ class IndexTTSEngine:
             arguments["emo_alpha"] = float(job.get("emotion_alpha") or 1.0)
         # IndexTTS-2.5 requires the language; the IndexTTS-2 loader has no
         # such parameter and reads everything as Chinese or English.
+        # IndexTTS searches 3 beams by default. On Apple Silicon that balloons a
+        # long line's memory into swap: 12.5 s of speech took 152 s with 3 beams
+        # and 40 s with 1.
+        if self.accepts("num_beams"):
+            arguments["num_beams"] = INDEX_NUM_BEAMS
         if "lang" in self.infer_parameters:
             if not self.lang:
                 raise WorkerError(

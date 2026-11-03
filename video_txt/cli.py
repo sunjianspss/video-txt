@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import __version__, notes, notes_sync
+from . import __version__, notes, notes_sync, screen, screen_scan
 from .arguments import (
     build_audit_command,
     build_bilingual_command,
@@ -1181,6 +1181,59 @@ def command_mux(args: argparse.Namespace, parser: argparse.ArgumentParser) -> in
     return 0
 
 
+def command_screen(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    if args.screen_action == "scan":
+        video = args.video.expanduser().resolve()
+        screen_scan.scan_video(
+            video, args.output_dir or video.with_suffix(".screen"),
+            interval=args.interval, start=args.start, end=args.end,
+            ocr_language=args.ocr_language, max_frames=args.max_frames,
+            ffmpeg_path=args.ffmpeg_path, dry_run=args.dry_run,
+        )
+        return 0
+    plan = existing_file(parser, args.plan, "Screen plan")
+    if args.screen_action == "translate":
+        output = resolved(args.output) or plan.with_name(f"{plan.stem}.translated.json")
+        screen.load_plan(plan)
+        if args.reuse or args.reuse_translation:
+            parser.error("screen translate uses plan IDs; --reuse is only for SRT translation.")
+        if args.dry_run:
+            print(f"Would translate {plan} -> {output}; result remains a draft.")
+            return 0
+        config = build_translation_config(args, parser, require_key=True)
+        result = screen.translate_plan(plan, output, config)
+        print(f"Translation draft: {result}. Review the screenshots before status=ready.")
+        return 0
+    speech_source = (
+        existing_file(parser, args.speech_source, "Speech source") if args.speech_source else None
+    )
+    speech_translation = (
+        existing_file(parser, args.speech_translation, "Speech translation")
+        if args.speech_translation else None
+    )
+    if args.screen_action == "validate":
+        _, _, target, warnings = screen.compile_plan(
+            plan, speech_source=speech_source, speech_translation=speech_translation
+        )
+        for warning in warnings:
+            print(f"Warning: {warning}")
+        print(f"Ready: {len(target)} captions; no overlaps; screenshots and source verified.")
+        return 0
+    validate_hard_subtitle_options(parser, args)
+    if args.mux_mode != "hard":
+        parser.error("screen render burns captions; use --mux-mode hard.")
+    _, video = screen.load_plan(plan)
+    output = resolved(args.video_output) or video.with_name(f"{video.stem}.screen.zh-burned.mp4")
+    options = build_mux_options(args, video=video, subtitle=plan, video_output=output)
+    result = screen.render_plan(
+        plan, options, speech_source=speech_source,
+        speech_translation=speech_translation, dry_run=args.dry_run,
+    )
+    if not args.dry_run:
+        print(f"Done: {result}")
+    return 0
+
+
 def build_workflow(args: WorkflowConfig, parser: argparse.ArgumentParser) -> Workflow:
     if args.workflow == "dub":
         validate_fit_options(parser, args)
@@ -1401,6 +1454,12 @@ class Command:
 
 COMMANDS = (
     Command(
+        "screen",
+        "OCR, translate, review and burn screen text together with speech captions.",
+        screen.add_arguments,
+        command_screen,
+    ),
+    Command(
         "sync-notes",
         "Discover subtitle pairs and run one queued Obsidian import with a cited summary.",
         notes_sync.add_arguments,
@@ -1519,6 +1578,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.handler(args, parser)
     except (
+        screen.ScreenError,
         notes.NotesError,
         CloneError,
         CredentialError,

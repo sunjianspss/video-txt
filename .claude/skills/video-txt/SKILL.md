@@ -20,6 +20,8 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 
 ## 从意图到命令
 
+先判断文字在哪：英文页面、聊天、软件界面、看板、幻灯片用下方的画面流程；Whisper 只识别音轨。
+
 | 用户想要 | 跑什么 | 出什么 |
 | --- | --- | --- |
 | 中文硬字幕成片（"硬编码字幕""烧进去"） | `run "$V" --provider lmstudio --mux-mode hard` | `视频.zh-burned.mp4` |
@@ -41,6 +43,33 @@ uv run --python 3.12 video-txt <子命令> '/绝对路径/视频.mp4' --provider
 | 同一部长片要反复精修 | `project init` → `project status` → `project run` | `project.video-txt.json` |
 
 同名 `.srt` 就在视频旁边时会**自动复用**，不必加 `--subtitle`。
+
+## 画面文字与口述一起烧录
+
+1. `video-txt screen scan "$V"`，默认输出 `<视频>.screen/`，保存截图、取样时间、
+   OCR 位置/置信度、文字变化版本、`review.html` 与草稿 `plan.json`。短片用 1 秒间隔；
+   快速滚动或数字变化处用 `--from 秒 --to 秒 --interval 0.25 -o 新目录` 补采样。
+2. 看原图，校正 `source` 与时间范围，合并重复内容。动态数值采用稳定画面：Claude Duet 的
+   订阅数从3,048变成3,100，不能拿过渡帧当最终值。模糊内容不猜，标 `status: "omit"`
+   并写 `note`，保留证据。OCR 不自动把条目标为 ready。
+3. `screen translate plan.json --provider lmstudio` 输出新 `plan.translated.json`，
+   复用当前模型、术语表与翻译检查。Agent 也可直接填写计划。`translation_full` 保留全文，
+   `translation` 用于视频显示；原速字幕需精简时在 `note` 记录，不能用摘要冒充完整翻译。
+4. 校对译文、数字与时间后写 `status: "ready"`。**Agent 可以完成校对；已授权任务无需再向用户审批。**
+   最多两行，过长时拆分或压缩，渲染器不会截字。新增条目保留稳定 ID 和 `evidence` 中
+   截图路径、SHA256、取样时间。后续改译文只改计划，不改生成的 SRT。
+5. 口述按原有流程生成配对 SRT；配乐处的重复识别不是台词。明确讲话区间时，MLX 可传
+   `--whisper-arg=--clip-timestamps --whisper-arg=60,91` 并加 `--refine-subtitles`。
+   MLX 防重复参数是 `--condition-on-previous-text`，OpenAI Whisper 才是下划线写法。
+6. `screen validate plan.translated.json`，再 `screen render plan.translated.json`。
+   有口述时两条命令都加 `--speech-source 原文.srt --speech-translation 译文.srt`。
+   重叠必须在计划或口述源中修正，不会自动删除其中一类字幕。默认硬字幕、底部浅黑带、
+   原声流复制、原时长；样式沿用 `--hard-subtitle-*`。
+7. 完整解码成片，抽查浅底、密集页、动态数字、人物与片尾，并核对原声与时长。
+   `.screen-render.json` 保存本次字幕与输入指纹。不要只以字幕文件存在作为完成证据。
+
+同参数重扫复用完成样本，不覆盖编辑过的计划；换源或采样参数用新目录。
+修改计划后重新 render，无需重新 OCR。完整设计见 [画面文字流程](../../../docs/screen-text-workflow.md)。
 
 ## 跑之前必须判断的六件事
 

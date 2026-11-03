@@ -33,7 +33,7 @@ def sync(tmp_path, monkeypatch):
             "related": [],
         }
 
-    monkeypatch.setattr(notes_summary, "invoke_claude", model)
+    monkeypatch.setattr(notes_summary, "invoke_codex", model)
 
     def clip(name="interview", captions=True):
         video = media / f"{name}.mp4"
@@ -97,12 +97,12 @@ def test_old_video_receiving_first_captions_gets_classified_and_auto_queued(sync
 def test_failed_summary_is_reported_no_automatic_retry_and_source_is_preserved(sync, monkeypatch):
     sync.run("scan")
     sync.clip()
-    original = notes_summary.invoke_claude
+    original = notes_summary.invoke_codex
 
     def fail(*args):
         raise notes.NotesError("fixture: Claude unavailable")
 
-    monkeypatch.setattr(notes_summary, "invoke_claude", fail)
+    monkeypatch.setattr(notes_summary, "invoke_codex", fail)
     report = sync.run(min_age=0)
     job_id = next(iter(sync.jobs()))
     assert report["failed"] == [job_id]
@@ -110,7 +110,7 @@ def test_failed_summary_is_reported_no_automatic_retry_and_source_is_preserved(s
     assert job["status"] == "error"
     sources = {p: p.read_bytes() for p in sync.vault.rglob("raw/**/*.md")}
     assert len(sources) == 2
-    monkeypatch.setattr(notes_summary, "invoke_claude", original)
+    monkeypatch.setattr(notes_summary, "invoke_codex", original)
     assert sync.run(min_age=0)["processed"] == []
     sync.run("retry", job_id=job_id)
     assert sync.run(min_age=0)["processed"] == [job_id]
@@ -263,7 +263,7 @@ def test_overlong_reply_costs_one_model_call_and_publishes(sync, monkeypatch):
         block = re.findall(r"\^(p-[a-f0-9]+)", prompt)[0]
         return _reply([{"text": "观点", "block": block}] * 12)
 
-    monkeypatch.setattr(notes_summary, "invoke_claude", model)
+    monkeypatch.setattr(notes_summary, "invoke_codex", model)
     monkeypatch.setattr(notes_summary, "max_claims", lambda _: 10)
     report = sync.run(min_age=0)
     assert len(calls) == 1 and len(report["processed"]) == 1 and report["failed"] == []
@@ -271,13 +271,15 @@ def test_overlong_reply_costs_one_model_call_and_publishes(sync, monkeypatch):
 
 def test_raw_reply_is_kept_even_when_it_is_not_valid_json(tmp_path, monkeypatch):
     monkeypatch.setattr(notes_summary.shutil, "which", lambda _: __file__)
-    monkeypatch.setattr(
-        notes_summary.subprocess,
-        "run",
-        lambda *a, **k: SimpleNamespace(returncode=0, stdout="not json at all", stderr=""),
-    )
+    def reply(command, **kwargs):
+        from pathlib import Path
+
+        Path(command[command.index("--output-last-message") + 1]).write_text("not json at all")
+        return SimpleNamespace(returncode=0, stdout="runtime events", stderr="")
+
+    monkeypatch.setattr(notes_summary.subprocess, "run", reply)
     with pytest.raises(notes.NotesError, match="未返回有效摘要"):
-        notes_summary.invoke_claude("prompt", "sonnet", tmp_path)
+        notes_summary.invoke_codex("prompt", "sonnet", tmp_path)
     assert (tmp_path / "summaries" / "last-raw.txt").read_text() == "not json at all"
 
 
@@ -295,3 +297,24 @@ def test_long_source_prompt_asks_for_the_larger_range(sync, monkeypatch):
     sync.clip()
     sync.run(min_age=0)
     assert "3–15 条核心观点" in sync.calls[0]
+
+
+def test_renamed_video_without_export_retires_old_record_and_registers_new_name(sync):
+    old = sync.clip("before", captions=False)
+    sync.run()
+    old.rename(sync.media / "after.mp4")
+    sync.run("scan")
+    titles = [j["title"] for j in sync.jobs().values()]
+    assert titles == ["after"]
+
+
+def test_missing_video_that_was_exported_stays_flagged(sync):
+    video = sync.clip()
+    sync.run()
+    job_id = next(iter(sync.jobs()))
+    sync.run("enqueue", job_id=job_id)
+    sync.now[0] += 121
+    sync.run()
+    video.rename(sync.media / "renamed.mp4")
+    sync.run("scan")
+    assert sync.jobs()[job_id]["status"] == "missing"
